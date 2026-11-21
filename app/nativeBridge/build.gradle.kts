@@ -78,6 +78,8 @@ val buildRustDesktop by tasks.registering(Exec::class) {
     environment("PATH", resolvePathWithCargo())
     commandLine(resolveCargoExecutable(), "build", "--release", "-p", "salt-ffi")
 
+    outputs.dir(generatedDesktopNativeResDir)
+
     doLast {
         val libName = desktopNativeLibFilename()
         val builtLib = file("$rustRootDir/target/release/$libName")
@@ -99,6 +101,7 @@ val generateUniFFIBindings by tasks.registering(Exec::class) {
 
     val libPath = file("$rustRootDir/target/release/${desktopNativeLibFilename()}").absolutePath
     val outDir = generatedUniffiDir.get().asFile
+    outputs.dir(generatedUniffiDir)
     doFirst {
         outDir.mkdirs()
     }
@@ -117,6 +120,12 @@ val generateUniFFIBindings by tasks.registering(Exec::class) {
         "--out-dir",
         outDir.absolutePath,
     )
+    doLast {
+        val generated = outDir.walkTopDown().any { it.isFile && it.extension == "kt" && it.length() > 0L }
+        require(generated) {
+            "uniffi-bindgen produced no Kotlin bindings in ${outDir.absolutePath} from $libPath (check ELF .symtab availability)"
+        }
+    }
 }
 
 val buildRustAndroidArm64 by tasks.registering(Exec::class) {
@@ -124,6 +133,8 @@ val buildRustAndroidArm64 by tasks.registering(Exec::class) {
     description = "Cross-compile saltnote_ffi for Android ARM64 (arm64-v8a) via cargo-ndk"
     workingDir = rustRootDir
     environment("PATH", resolvePathWithCargo())
+    // Strip symbol table on Android target to keep release APK <= 35MB while host build preserves .symtab for uniffi-bindgen
+    environment("CARGO_PROFILE_RELEASE_STRIP", "symbols")
     resolveAndroidNdkHome()?.let { environment("ANDROID_NDK_HOME", it) }
 
     doFirst {
@@ -201,6 +212,8 @@ tasks.withType<Test>().configureEach {
 
 tasks.matching {
     it.name.contains("compileKotlin", ignoreCase = true) ||
+        it.name.contains("compileAndroid", ignoreCase = true) ||
+        it.name.contains("extractAndroid", ignoreCase = true) ||
         it.name.contains("processResources", ignoreCase = true)
 }.configureEach {
     dependsOn(generateUniFFIBindings)

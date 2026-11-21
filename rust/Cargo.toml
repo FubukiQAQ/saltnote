@@ -15,4 +15,4 @@ members = [
 opt-level = "z"
 lto = "thin"
 codegen-units = 1
-strip = true
+strip = "debuginfo"
