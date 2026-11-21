@@ -1,0 +1,26 @@
+[package]
+name = "salt-ffi"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[lib]
+name = "saltnote_ffi"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+once_cell = "1.20"
+parking_lot = "0.12"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+salt-canvas = { path = "../salt-canvas" }
+salt-crdt = { path = "../salt-crdt" }
+salt-intel = { path = "../salt-intel" }
+salt-router = { path = "../salt-router" }
+salt-sync = { path = "../salt-sync" }
+salt-types = { path = "../salt-types" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+uniffi = { version = "0.28.3", features = ["tokio"] }

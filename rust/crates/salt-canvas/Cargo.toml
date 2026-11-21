@@ -1,0 +1,14 @@
+[package]
+name = "salt-canvas"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+rstar = "0.12"
+salt-types = { path = "../salt-types" }
+serde = { version = "1.0", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1.0"

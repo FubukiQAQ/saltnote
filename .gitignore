@@ -1,0 +1,29 @@
+# Rust
+/target
+rust/target
+**/*.rs.bk
+
+# Gradle & Android
+.gradle/
+**/build/
+local.properties
+*.iml
+.idea/
+.DS_Store
+captures/
+*.hprof
+*.apk
+*.aab
+*.ap_
+
+# Generated native libraries & UniFFI bindings
+app/nativeBridge/src/commonMain/kotlin/uniffi/
+app/nativeBridge/src/desktopMain/resources/
+app/nativeBridge/src/androidMain/jniLibs/
+app/composeApp/src/desktopMain/resources/saltnote_ffi.*
+app/composeApp/src/androidMain/jniLibs/
+app/androidApp/src/main/jniLibs/
+
+# Local test vaults & logs
+.saltnote/local/
+*.log

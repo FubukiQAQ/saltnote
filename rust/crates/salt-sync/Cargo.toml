@@ -1,0 +1,23 @@
+[package]
+name = "salt-sync"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[dependencies]
+hex = "0.4"
+mdns-sd = "0.11"
+opendal = { version = "0.51", default-features = false, features = ["services-webdav", "executors-tokio"] }
+parking_lot = "0.12"
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "ring"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+salt-crdt = { path = "../salt-crdt" }
+salt-router = { path = "../salt-router" }
+salt-types = { path = "../salt-types" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+socket2 = "0.5"
+tokio = { version = "1", features = ["full"] }

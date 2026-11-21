@@ -1,0 +1,15 @@
+[package]
+name = "salt-crdt"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[dependencies]
+chrono = "0.4"
+loro = "1.10"
+parking_lot = "0.12"
+salt-types = { path = "../salt-types" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+tokio = { version = "1", features = ["sync", "time"] }

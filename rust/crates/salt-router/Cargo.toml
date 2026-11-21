@@ -1,0 +1,16 @@
+[package]
+name = "salt-router"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[dependencies]
+base64 = "0.22"
+futures-util = "0.3"
+image = { version = "0.25", default-features = false, features = ["png", "webp"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "json", "stream"] }
+salt-types = { path = "../salt-types" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
+tokio-util = "0.7"

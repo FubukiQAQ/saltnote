@@ -1,0 +1,1744 @@
+use chrono::{TimeZone, Utc};
+use loro::{ExportMode, LoroDoc, LoroList, LoroValue, UpdateOptions, VersionVector};
+use parking_lot::RwLock;
+use salt_types::{
+    default_halo_presets, new_ulid, now_utc_ms, sha256_hex,
+    validate_router_config_no_plaintext_keys, CanvasImageNode, CanvasSnapshot, DeltaEntry,
+    DeltaStroke, DeviceManifest, DeviceState, FlashCard, HaloAnnotation, HaloPreset, PageMeta,
+    PageMode, PageSnapshot, PageSummary, ReviewLog, RouterConfig, SaltError, SaltResult,
+    StrokeTransform, WebDavConfig,
+};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashMap};
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::sync::broadcast;
+
+/// Physical Vault directory layout strictly matching Alpha MVP Section 2.2.
+#[derive(Debug, Clone)]
+pub struct VaultPaths {
+    pub root: PathBuf,
+}
+
+impl VaultPaths {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+
+    pub fn pages_dir(&self) -> PathBuf {
+        self.root.join("pages")
+    }
+
+    pub fn assets_dir(&self) -> PathBuf {
+        self.root.join("assets")
+    }
+
+    pub fn saltnote_dir(&self) -> PathBuf {
+        self.root.join(".saltnote")
+    }
+
+    pub fn config_dir(&self) -> PathBuf {
+        self.saltnote_dir().join("config")
+    }
+
+    pub fn router_config_path(&self) -> PathBuf {
+        self.config_dir().join("router.json")
+    }
+
+    pub fn halo_presets_path(&self) -> PathBuf {
+        self.config_dir().join("halo_presets.json")
+    }
+
+    pub fn webdav_config_path(&self) -> PathBuf {
+        self.config_dir().join("webdav.json")
+    }
+
+    pub fn sync_dir(&self) -> PathBuf {
+        self.saltnote_dir().join("sync")
+    }
+
+    pub fn manifests_dir(&self) -> PathBuf {
+        self.sync_dir().join("manifests")
+    }
+
+    pub fn deltas_dir(&self) -> PathBuf {
+        self.sync_dir().join("deltas")
+    }
+
+    pub fn device_deltas_dir(&self, device_id: &str) -> PathBuf {
+        self.deltas_dir().join(device_id)
+    }
+
+    pub fn manifest_path(&self, device_id: &str) -> PathBuf {
+        self.manifests_dir().join(format!("{device_id}.json"))
+    }
+
+    pub fn local_dir(&self) -> PathBuf {
+        self.saltnote_dir().join("local")
+    }
+
+    pub fn sqlite_path(&self) -> PathBuf {
+        self.local_dir().join("index.sqlite")
+    }
+
+    pub fn slices_cache_dir(&self) -> PathBuf {
+        self.local_dir().join("cache").join("slices")
+    }
+
+    pub fn wal_path(&self) -> PathBuf {
+        self.local_dir().join("wal.bin")
+    }
+
+    pub fn device_state_path(&self) -> PathBuf {
+        self.local_dir().join("device_state.json")
+    }
+
+    pub fn ensure_structure(&self) -> SaltResult<()> {
+        for dir in [
+            self.pages_dir(),
+            self.assets_dir(),
+            self.config_dir(),
+            self.manifests_dir(),
+            self.deltas_dir(),
+            self.local_dir(),
+            self.slices_cache_dir(),
+        ] {
+            fs::create_dir_all(&dir)
+                .map_err(|e| SaltError::Io(format!("Failed to create dir {}: {e}", dir.display())))?;
+        }
+        Ok(())
+    }
+}
+
+/// Wire packet stored in `.saltnote/sync/deltas/{device_id}/{ts}_{seq}.delta` and exchanged over P2P.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeltaPacket {
+    pub page_id: String,
+    pub device_id: String,
+    pub seq: u64,
+    pub created_at_utc: i64,
+    pub loro_bytes: Vec<u8>,
+}
+
+/// Events emitted on every local edit or remote CRDT import to drive `salt-intel` (FTS5 + FSRS).
+#[derive(Debug, Clone)]
+pub enum DocChangeEvent {
+    PageUpdated {
+        page_id: String,
+        meta: PageMeta,
+        body_markdown: String,
+    },
+    CardsUpdated {
+        page_id: String,
+        cards: Vec<FlashCard>,
+        review_logs: Vec<ReviewLog>,
+    },
+}
+
+struct PageEntry {
+    doc: LoroDoc,
+    exported_vv: VersionVector,
+    dirty_since_export: bool,
+    markdown_file: Option<String>,
+}
+
+/// Thread-safe Loro CRDT Vault manager with local crash-safe WAL, `.md` projection,
+/// single-writer `.delta` export, and remote delta import.
+pub struct VaultStore {
+    paths: VaultPaths,
+    peer_id: u64,
+    device_state: RwLock<DeviceState>,
+    pages: RwLock<HashMap<String, PageEntry>>,
+    events_tx: broadcast::Sender<DocChangeEvent>,
+    sync_revision: AtomicU64,
+}
+
+impl VaultStore {
+    pub fn open(root: impl Into<PathBuf>, device_name: Option<String>) -> SaltResult<Self> {
+        let paths = VaultPaths::new(root);
+        paths.ensure_structure()?;
+
+        // Initialize default config files if absent
+        if !paths.router_config_path().exists() {
+            let cfg = RouterConfig::default();
+            let json = serde_json::to_string_pretty(&cfg)
+                .map_err(|e| SaltError::Io(e.to_string()))?;
+            fs::write(paths.router_config_path(), json)
+                .map_err(|e| SaltError::Io(e.to_string()))?;
+        }
+        if !paths.halo_presets_path().exists() {
+            let presets = default_halo_presets();
+            let json = serde_json::to_string_pretty(&presets)
+                .map_err(|e| SaltError::Io(e.to_string()))?;
+            fs::write(paths.halo_presets_path(), json)
+                .map_err(|e| SaltError::Io(e.to_string()))?;
+        }
+        if !paths.webdav_config_path().exists() {
+            let cfg = WebDavConfig::default();
+            let json = serde_json::to_string_pretty(&cfg)
+                .map_err(|e| SaltError::Io(e.to_string()))?;
+            fs::write(paths.webdav_config_path(), json)
+                .map_err(|e| SaltError::Io(e.to_string()))?;
+        }
+
+        let device_state = if paths.device_state_path().exists() {
+            let raw = fs::read_to_string(paths.device_state_path())
+                .map_err(|e| SaltError::Io(e.to_string()))?;
+            serde_json::from_str::<DeviceState>(&raw)
+                .map_err(|e| SaltError::Io(format!("Invalid device_state.json: {e}")))?
+        } else {
+            let state = DeviceState {
+                device_id: new_ulid(),
+                device_name: device_name.unwrap_or_else(|| "SaltNote-Device".into()),
+                last_seq: 0,
+                peer_watermarks: BTreeMap::new(),
+            };
+            let json = serde_json::to_string_pretty(&state)
+                .map_err(|e| SaltError::Io(e.to_string()))?;
+            fs::write(paths.device_state_path(), json)
+                .map_err(|e| SaltError::Io(e.to_string()))?;
+            state
+        };
+
+        fs::create_dir_all(paths.device_deltas_dir(&device_state.device_id))
+            .map_err(|e| SaltError::Io(e.to_string()))?;
+
+        let peer_id = derive_peer_id(&device_state.device_id);
+        let (events_tx, _) = broadcast::channel(256);
+
+        let store = Self {
+            paths,
+            peer_id,
+            device_state: RwLock::new(device_state),
+            pages: RwLock::new(HashMap::new()),
+            events_tx,
+            sync_revision: AtomicU64::new(0),
+        };
+
+        store.replay_all_deltas_from_disk()?;
+        store.replay_wal_from_disk()?;
+        Ok(store)
+    }
+
+    pub fn paths(&self) -> &VaultPaths {
+        &self.paths
+    }
+
+    pub fn device_state(&self) -> DeviceState {
+        self.device_state.read().clone()
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<DocChangeEvent> {
+        self.events_tx.subscribe()
+    }
+
+    pub fn sync_revision(&self) -> u64 {
+        self.sync_revision.load(Ordering::Acquire)
+    }
+
+    pub fn bump_sync_revision(&self) -> u64 {
+        self.sync_revision.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    // ------------------------------------------------------------------------
+    // Config Load / Save
+    // ------------------------------------------------------------------------
+
+    pub fn load_router_config(&self) -> SaltResult<RouterConfig> {
+        let raw = fs::read_to_string(self.paths.router_config_path())
+            .map_err(|e| SaltError::Io(e.to_string()))?;
+        let parsed: RouterConfig =
+            serde_json::from_str(&raw).map_err(|e| SaltError::Io(e.to_string()))?;
+        let sanitized = sanitize_router_config(&parsed);
+        if let Ok(clean_json) = serde_json::to_string_pretty(&sanitized) {
+            if clean_json.trim() != raw.trim() {
+                let _ = atomic_write(&self.paths.router_config_path(), clean_json.as_bytes());
+            }
+        }
+        Ok(sanitized)
+    }
+
+    pub fn save_router_config(&self, cfg: &RouterConfig) -> SaltResult<()> {
+        let sanitized = sanitize_router_config(cfg);
+        validate_router_config_no_plaintext_keys(&sanitized)?;
+        let json =
+            serde_json::to_string_pretty(&sanitized).map_err(|e| SaltError::Io(e.to_string()))?;
+        atomic_write(&self.paths.router_config_path(), json.as_bytes())
+    }
+
+    pub fn load_halo_presets(&self) -> SaltResult<Vec<HaloPreset>> {
+        let raw = fs::read_to_string(self.paths.halo_presets_path())
+            .map_err(|e| SaltError::Io(e.to_string()))?;
+        serde_json::from_str(&raw).map_err(|e| SaltError::Io(e.to_string()))
+    }
+
+    pub fn load_webdav_config(&self) -> SaltResult<WebDavConfig> {
+        let raw = fs::read_to_string(self.paths.webdav_config_path())
+            .map_err(|e| SaltError::Io(e.to_string()))?;
+        serde_json::from_str(&raw).map_err(|e| SaltError::Io(e.to_string()))
+    }
+
+    pub fn save_webdav_config(&self, cfg: &WebDavConfig) -> SaltResult<()> {
+        if !cfg.password_key_ref.is_empty() && !cfg.password_key_ref.starts_with("vault://") {
+            return Err(SaltError::InvalidInput(
+                "WebDAV password_key_ref must be a 'vault://' handle".into(),
+            ));
+        }
+        let json =
+            serde_json::to_string_pretty(cfg).map_err(|e| SaltError::Io(e.to_string()))?;
+        atomic_write(&self.paths.webdav_config_path(), json.as_bytes())
+    }
+
+    // ------------------------------------------------------------------------
+    // Page CRUD & Dual-Mode Mutations
+    // ------------------------------------------------------------------------
+
+    pub fn create_page(
+        &self,
+        title: impl Into<String>,
+        mode: PageMode,
+        is_private: bool,
+        tags: Vec<String>,
+        initial_markdown: impl Into<String>,
+    ) -> SaltResult<PageMeta> {
+        let page_id = new_ulid();
+        let now = now_utc_ms();
+        let meta = PageMeta {
+            page_id: page_id.clone(),
+            title: title.into(),
+            mode,
+            is_private,
+            tags,
+            created_at_utc: now,
+            updated_at_utc: now,
+        };
+        let initial_body = initial_markdown.into();
+
+        let doc = self.new_loro_doc();
+        let pre_vv = doc.oplog_vv();
+        write_meta_to_doc(&doc, &meta)?;
+        if !initial_body.is_empty() {
+            let body = doc.get_text("body");
+            body.insert(0, &initial_body)
+                .map_err(|e| SaltError::Crdt(e.to_string()))?;
+        }
+        doc.commit();
+
+        let update_bytes = doc
+            .export(ExportMode::updates(&pre_vv))
+            .map_err(|e| SaltError::Crdt(e.to_string()))?;
+        self.append_wal(&page_id, &update_bytes)?;
+
+        let md_file = self.project_markdown_file(&meta, &initial_body, None)?;
+        {
+            let mut pages = self.pages.write();
+            pages.insert(
+                page_id.clone(),
+                PageEntry {
+                    doc,
+                    exported_vv: VersionVector::new(),
+                    dirty_since_export: true,
+                    markdown_file: Some(md_file),
+                },
+            );
+        }
+
+        let _ = self.events_tx.send(DocChangeEvent::PageUpdated {
+            page_id,
+            meta: meta.clone(),
+            body_markdown: initial_body,
+        });
+        Ok(meta)
+    }
+
+    /// Ensures a welcoming offline starter page exists for first-launch zero-config UX.
+    pub fn ensure_welcome_page(&self) -> SaltResult<PageMeta> {
+        let existing = self.list_pages();
+        if let Some(first) = existing.first() {
+            return Ok(first.meta.clone());
+        }
+        let body = r#"# 欢迎使用 SaltNote Alpha
+
+SaltNote 是一款**永久免费开源、本地优先（Local-First）、零后端依赖**的双模手账与学习笔记应用。
+
+## 快速上手
+
+1. **双模记录**：点击顶部切换 **画布模式** 与 **文档模式**，支持压感笔迹、荧光笔、橡皮擦、图片插入与行内嵌入画布块。
+2. **随手圈（Salt Halo）**：
+   - 🟡 **琥珀黄**：圈选重点，自动概念扩充与类比。
+   - 🔵 **冰川蓝**：一键提炼 1–3 张 FSRS 闪卡入库复习。
+   - ⚪ **矿石灰**：截取高清 WebP 局部切片，将手写板书清洗为整洁 Markdown。
+3. **隐私底线**：点击右上角 `#private` 锁标，即可硬阻断该页向任何公网 AI 发包，仅允许本机或局域网 Ollama。
+
+```salt-canvas
+{"canvas_id":"inline-welcome","height":220}
+```
+"#;
+        self.create_page(
+            "欢迎使用 SaltNote",
+            PageMode::Study,
+            false,
+            vec!["引导".into(), "SaltNote".into()],
+            body,
+        )
+    }
+
+    pub fn update_page_meta(
+        &self,
+        page_id: &str,
+        title: Option<String>,
+        mode: Option<PageMode>,
+        is_private: Option<bool>,
+        tags: Option<Vec<String>>,
+    ) -> SaltResult<PageMeta> {
+        let (meta, body_str, old_file) = {
+            let mut pages = self.pages.write();
+            let entry = pages
+                .get_mut(page_id)
+                .ok_or_else(|| SaltError::PageNotFound(page_id.to_string()))?;
+            let mut meta = read_meta_from_doc(&entry.doc, page_id)?;
+            if let Some(t) = title {
+                meta.title = t;
+            }
+            if let Some(m) = mode {
+                meta.mode = m;
+            }
+            if let Some(p) = is_private {
+                meta.is_private = p;
+            }
+            if let Some(tg) = tags {
+                meta.tags = tg;
+            }
+            meta.updated_at_utc = now_utc_ms();
+
+            let pre_vv = entry.doc.oplog_vv();
+            write_meta_to_doc(&entry.doc, &meta)?;
+            entry.doc.commit();
+            let bytes = entry
+                .doc
+                .export(ExportMode::updates(&pre_vv))
+                .map_err(|e| SaltError::Crdt(e.to_string()))?;
+            self.append_wal(page_id, &bytes)?;
+            entry.dirty_since_export = true;
+            let body_str = entry.doc.get_text("body").to_string();
+            (meta, body_str, entry.markdown_file.clone())
+        };
+
+        let new_file = self.project_markdown_file(&meta, &body_str, old_file.as_deref())?;
+        if let Some(entry) = self.pages.write().get_mut(page_id) {
+            entry.markdown_file = Some(new_file);
+        }
+        let _ = self.events_tx.send(DocChangeEvent::PageUpdated {
+            page_id: page_id.to_string(),
+            meta: meta.clone(),
+            body_markdown: body_str,
+        });
+        Ok(meta)
+    }
+
+    pub fn update_page_body(&self, page_id: &str, new_markdown: &str) -> SaltResult<()> {
+        let (meta, body_str, existing_file) = {
+            let mut pages = self.pages.write();
+            let entry = pages
+                .get_mut(page_id)
+                .ok_or_else(|| SaltError::PageNotFound(page_id.to_string()))?;
+            let pre_vv = entry.doc.oplog_vv();
+            let body = entry.doc.get_text("body");
+            body.update(new_markdown, UpdateOptions::default())
+                .map_err(|e| SaltError::Crdt(e.to_string()))?;
+            let mut meta = read_meta_from_doc(&entry.doc, page_id)?;
+            meta.updated_at_utc = now_utc_ms();
+            write_meta_to_doc(&entry.doc, &meta)?;
+            entry.doc.commit();
+
+            let bytes = entry
+                .doc
+                .export(ExportMode::updates(&pre_vv))
+                .map_err(|e| SaltError::Crdt(e.to_string()))?;
+            self.append_wal(page_id, &bytes)?;
+            entry.dirty_since_export = true;
+            (meta, body.to_string(), entry.markdown_file.clone())
+        };
+
+        let md_file = self.project_markdown_file(&meta, &body_str, existing_file.as_deref())?;
+        if let Some(entry) = self.pages.write().get_mut(page_id) {
+            entry.markdown_file = Some(md_file);
+        }
+        let _ = self.events_tx.send(DocChangeEvent::PageUpdated {
+            page_id: page_id.to_string(),
+            meta,
+            body_markdown: body_str,
+        });
+        Ok(())
+    }
+
+    /// Appends a stroke into `canvas[canvas_id].strokes` and writes crash-safe WAL.
+    pub fn add_stroke(
+        &self,
+        page_id: &str,
+        canvas_id: &str,
+        stroke: &DeltaStroke,
+    ) -> SaltResult<()> {
+        let mut pages = self.pages.write();
+        let entry = pages
+            .get_mut(page_id)
+            .ok_or_else(|| SaltError::PageNotFound(page_id.to_string()))?;
+        let pre_vv = entry.doc.oplog_vv();
+
+        let canvases = entry.doc.get_map("canvas");
+        let c_map = canvases
+            .ensure_mergeable_map(canvas_id)
+            .map_err(|e| SaltError::Crdt(e.to_string()))?;
+        let strokes_map = c_map
+            .ensure_mergeable_map("strokes")
+            .map_err(|e| SaltError::Crdt(e.to_string()))?;
+        let encoded =
+            serde_json::to_string(stroke).map_err(|e| SaltError::Crdt(e.to_string()))?;
+        strokes_map
+            .insert(&stroke.stroke_id, encoded)
+            .map_err(|e| SaltError::Crdt(e.to_string()))?;
+
+        touch_updated_at(&entry.doc)?;
+        entry.doc.commit();
+
+        let bytes = entry
+            .doc
+            .export(ExportMode::updates(&pre_vv))
+            .map_err(|e| SaltError::Crdt(e.to_string()))?;
+        self.append_wal(page_id, &bytes)?;
+        entry.dirty_since_export = true;
+        Ok(())
+    }
+
+    /// Applies transform or tombstone delete to a stroke inside `canvas[canvas_id].transforms`.
+    pub fn upsert_stroke_transform(
+        &self,
+        page_id: &str,
+        canvas_id: &str,
+        transform: &StrokeTransform,
+    ) -> SaltResult<()> {
+        let mut pages = self.pages.write();
+        let entry = pages
+            .get_mut(page_id)
+            .ok_or_else(|| SaltError::PageNotFound(page_id.to_string()))?;
+        let pre_vv = entry.doc.oplog_vv();
+
+        let canvases = entry.doc.get_map("canvas");
+        let c_map = canvases
+            .ensure_mergeable_map(canvas_id)
+            .map_err(|e| SaltError::Crdt(e.to_string()))?;
+        let tr_map = c_map
+            .ensure_mergeable_map("transforms")
+            .map_err(|e| SaltError::Crdt(e.to_string()))?;
+        let encoded =
+            serde_json::to_string(transform).map_err(|e| SaltError::Crdt(e.to_string()))?;
+        tr_map
+            .insert(&transform.stroke_id, encoded)
+            .map_err(|e| SaltError::Crdt(e.to_string()))?;
+
+        touch_updated_at(&entry.doc)?;
+        entry.doc.commit();
+
+        let bytes = entry
+            .doc
+            .export(ExportMode::updates(&pre_vv))
+            .map_err(|e| SaltError::Crdt(e.to_string()))?;
+        self.append_wal(page_id, &bytes)?;
+        entry.dirty_since_export = true;
+        Ok(())
+    }
+
+    pub fn upsert_canvas_image(
+        &self,
+        page_id: &str,
+        canvas_id: &str,
+        node: &CanvasImageNode,
+    ) -> SaltResult<()> {
+        let mut pages = self.pages.write();
+        let entry = pages
+            .get_mut(page_id)
+            .ok_or_else(|| SaltError::PageNotFound(page_id.to_string()))?;
+        let pre_vv = entry.doc.oplog_vv();
+
+        let canvases = entry.doc.get_map("canvas");
+        let c_map = canvases
+            .ensure_mergeable_map(canvas_id)
+            .map_err(|e| SaltError::Crdt(e.to_string()))?;
+        let img_map = c_map
+            .ensure_mergeable_map("images")
+            .map_err(|e| SaltError::Crdt(e.to_string()))?;
+        let encoded = serde_json::to_string(node).map_err(|e| SaltError::Crdt(e.to_string()))?;
+        img_map
+            .insert(&node.image_id, encoded)
+            .map_err(|e| SaltError::Crdt(e.to_string()))?;
+
+        touch_updated_at(&entry.doc)?;
+        entry.doc.commit();
+
+        let bytes = entry
+            .doc
+            .export(ExportMode::updates(&pre_vv))
+            .map_err(|e| SaltError::Crdt(e.to_string()))?;
+        self.append_wal(page_id, &bytes)?;
+        entry.dirty_since_export = true;
+        Ok(())
+    }
+
+    /// Writes immutable WebP asset into `assets/{sha[:2]}/{sha[:16]}.webp` if not present.
+    pub fn store_asset_bytes(&self, rel_path: &str, bytes: &[u8]) -> SaltResult<PathBuf> {
+        let abs = self.paths.root.join(rel_path);
+        if let Some(parent) = abs.parent() {
+            fs::create_dir_all(parent).map_err(|e| SaltError::Io(e.to_string()))?;
+        }
+        if !abs.exists() {
+            atomic_write(&abs, bytes)?;
+        }
+        Ok(abs)
+    }
+
+    pub fn upsert_halo(&self, halo: &HaloAnnotation) -> SaltResult<()> {
+        let mut pages = self.pages.write();
+        let entry = pages
+            .get_mut(&halo.page_id)
+            .ok_or_else(|| SaltError::PageNotFound(halo.page_id.clone()))?;
+        let pre_vv = entry.doc.oplog_vv();
+
+        let halos = entry.doc.get_map("halos");
+        let encoded = serde_json::to_string(halo).map_err(|e| SaltError::Crdt(e.to_string()))?;
+        halos
+            .insert(&halo.halo_id, encoded)
+            .map_err(|e| SaltError::Crdt(e.to_string()))?;
+        touch_updated_at(&entry.doc)?;
+        entry.doc.commit();
+
+        let bytes = entry
+            .doc
+            .export(ExportMode::updates(&pre_vv))
+            .map_err(|e| SaltError::Crdt(e.to_string()))?;
+        self.append_wal(&halo.page_id, &bytes)?;
+        entry.dirty_since_export = true;
+        Ok(())
+    }
+
+    /// Fuses a Salt Halo crystal's Markdown answer into the page body and marks the halo fused.
+    pub fn fuse_halo_into_body(&self, page_id: &str, halo_id: &str) -> SaltResult<String> {
+        let snap = self.get_page_snapshot(page_id)?;
+        let mut halo = snap
+            .halos
+            .into_iter()
+            .find(|h| h.halo_id == halo_id)
+            .ok_or_else(|| SaltError::InvalidInput(format!("Halo {halo_id} not found")))?;
+
+        let fused_block = format!(
+            "\n\n> **Salt Halo ({})**\n>\n{}\n",
+            halo.preset_id,
+            halo.response_markdown
+                .lines()
+                .map(|l| format!("> {l}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let updated_body = format!("{}{}", snap.body_markdown.trim_end(), fused_block);
+        self.update_page_body(page_id, &updated_body)?;
+
+        halo.fused = true;
+        halo.collapsed = true;
+        self.upsert_halo(&halo)?;
+        Ok(updated_body)
+    }
+
+    pub fn upsert_card(&self, card: &FlashCard) -> SaltResult<()> {
+        let (cards, logs) = {
+            let mut pages = self.pages.write();
+            let entry = pages
+                .get_mut(&card.page_id)
+                .ok_or_else(|| SaltError::PageNotFound(card.page_id.clone()))?;
+            let pre_vv = entry.doc.oplog_vv();
+
+            let cards_map = entry.doc.get_map("cards");
+            let encoded =
+                serde_json::to_string(card).map_err(|e| SaltError::Crdt(e.to_string()))?;
+            cards_map
+                .insert(&card.card_id, encoded)
+                .map_err(|e| SaltError::Crdt(e.to_string()))?;
+            touch_updated_at(&entry.doc)?;
+            entry.doc.commit();
+
+            let bytes = entry
+                .doc
+                .export(ExportMode::updates(&pre_vv))
+                .map_err(|e| SaltError::Crdt(e.to_string()))?;
+            self.append_wal(&card.page_id, &bytes)?;
+            entry.dirty_since_export = true;
+            (
+                read_cards_from_doc(&entry.doc),
+                read_review_logs_from_doc(&entry.doc),
+            )
+        };
+        let _ = self.events_tx.send(DocChangeEvent::CardsUpdated {
+            page_id: card.page_id.clone(),
+            cards,
+            review_logs: logs,
+        });
+        Ok(())
+    }
+
+    pub fn append_review_log(&self, page_id: &str, log: &ReviewLog) -> SaltResult<()> {
+        let (cards, logs) = {
+            let mut pages = self.pages.write();
+            let entry = pages
+                .get_mut(page_id)
+                .ok_or_else(|| SaltError::PageNotFound(page_id.to_string()))?;
+            let pre_vv = entry.doc.oplog_vv();
+
+            let list: LoroList = entry.doc.get_list("fsrs_logs");
+            let encoded =
+                serde_json::to_string(log).map_err(|e| SaltError::Crdt(e.to_string()))?;
+            list.push(encoded)
+                .map_err(|e| SaltError::Crdt(e.to_string()))?;
+            touch_updated_at(&entry.doc)?;
+            entry.doc.commit();
+
+            let bytes = entry
+                .doc
+                .export(ExportMode::updates(&pre_vv))
+                .map_err(|e| SaltError::Crdt(e.to_string()))?;
+            self.append_wal(page_id, &bytes)?;
+            entry.dirty_since_export = true;
+            (
+                read_cards_from_doc(&entry.doc),
+                read_review_logs_from_doc(&entry.doc),
+            )
+        };
+        let _ = self.events_tx.send(DocChangeEvent::CardsUpdated {
+            page_id: page_id.to_string(),
+            cards,
+            review_logs: logs,
+        });
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------------
+    // Reads & Queries
+    // ------------------------------------------------------------------------
+
+    pub fn list_pages(&self) -> Vec<PageSummary> {
+        let pages = self.pages.read();
+        let mut out = Vec::with_capacity(pages.len());
+        for (page_id, entry) in pages.iter() {
+            if let Ok(meta) = read_meta_from_doc(&entry.doc, page_id) {
+                let body = entry.doc.get_text("body").to_string();
+                let snippet: String = body
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with("```"))
+                    .take(2)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let canvases = read_canvases_from_doc(&entry.doc);
+                let stroke_count: u32 = canvases
+                    .iter()
+                    .map(|c| {
+                        let deleted: std::collections::HashSet<&str> = c
+                            .transforms
+                            .iter()
+                            .filter(|t| t.deleted)
+                            .map(|t| t.stroke_id.as_str())
+                            .collect();
+                        c.strokes
+                            .iter()
+                            .filter(|s| !deleted.contains(s.stroke_id.as_str()))
+                            .count() as u32
+                    })
+                    .sum();
+                let card_count = read_cards_from_doc(&entry.doc)
+                    .iter()
+                    .filter(|c| !c.archived)
+                    .count() as u32;
+                out.push(PageSummary {
+                    meta,
+                    snippet: snippet.chars().take(120).collect(),
+                    stroke_count,
+                    card_count,
+                    markdown_file: entry.markdown_file.clone().unwrap_or_default(),
+                });
+            }
+        }
+        out.sort_by(|a, b| b.meta.updated_at_utc.cmp(&a.meta.updated_at_utc));
+        out
+    }
+
+    pub fn get_page_snapshot(&self, page_id: &str) -> SaltResult<PageSnapshot> {
+        let pages = self.pages.read();
+        let entry = pages
+            .get(page_id)
+            .ok_or_else(|| SaltError::PageNotFound(page_id.to_string()))?;
+        let meta = read_meta_from_doc(&entry.doc, page_id)?;
+        let body_markdown = entry.doc.get_text("body").to_string();
+        let canvases = read_canvases_from_doc(&entry.doc);
+        let halos = read_halos_from_doc(&entry.doc);
+        let cards = read_cards_from_doc(&entry.doc);
+        Ok(PageSnapshot {
+            meta,
+            body_markdown,
+            canvases,
+            halos,
+            cards,
+        })
+    }
+
+    pub fn get_all_cards_and_logs(&self) -> (Vec<FlashCard>, Vec<ReviewLog>) {
+        let pages = self.pages.read();
+        let mut all_cards = Vec::new();
+        let mut all_logs = Vec::new();
+        for entry in pages.values() {
+            all_cards.extend(read_cards_from_doc(&entry.doc));
+            all_logs.extend(read_review_logs_from_doc(&entry.doc));
+        }
+        (all_cards, all_logs)
+    }
+
+    /// Canonical SHA-256 hash over normalized Loro document state for bit-level convergence verification.
+    pub fn compute_page_state_hash(&self, page_id: &str) -> SaltResult<String> {
+        let snap = self.get_page_snapshot(page_id)?;
+        let logs = {
+            let pages = self.pages.read();
+            let entry = pages
+                .get(page_id)
+                .ok_or_else(|| SaltError::PageNotFound(page_id.to_string()))?;
+            read_review_logs_from_doc(&entry.doc)
+        };
+        let mut normalized = CanonicalPageState::from_snapshot(snap, logs);
+        normalized.sort_deterministically();
+        let bytes = serde_json::to_vec(&normalized).map_err(|e| SaltError::Crdt(e.to_string()))?;
+        Ok(sha256_hex(&bytes))
+    }
+
+    // ------------------------------------------------------------------------
+    // Delta Export, Manifest Maintenance & Remote Delta Import
+    // ------------------------------------------------------------------------
+
+    /// Flushes all dirty pages into append-only `{ts}_{seq}.delta` files under
+    /// `.saltnote/sync/deltas/{my_device_id}/` and updates `{my_device_id}.json` manifest.
+    pub fn flush_all_dirty_deltas(&self) -> SaltResult<Vec<DeltaEntry>> {
+        let dirty_ids: Vec<String> = {
+            let pages = self.pages.read();
+            pages
+                .iter()
+                .filter(|(_, e)| e.dirty_since_export)
+                .map(|(k, _)| k.clone())
+                .collect()
+        };
+        let mut created = Vec::new();
+        for pid in dirty_ids {
+            if let Some(entry) = self.flush_page_delta(&pid)? {
+                created.push(entry);
+            }
+        }
+        Ok(created)
+    }
+
+    pub fn flush_page_delta(&self, page_id: &str) -> SaltResult<Option<DeltaEntry>> {
+        let (loro_bytes, new_vv) = {
+            let pages = self.pages.read();
+            let Some(entry) = pages.get(page_id) else {
+                return Err(SaltError::PageNotFound(page_id.to_string()));
+            };
+            if !entry.dirty_since_export {
+                return Ok(None);
+            }
+            let current_vv = entry.doc.oplog_vv();
+            let bytes = if entry.exported_vv.is_empty() {
+                entry
+                    .doc
+                    .export(ExportMode::Snapshot)
+                    .map_err(|e| SaltError::Crdt(e.to_string()))?
+            } else {
+                entry
+                    .doc
+                    .export(ExportMode::updates(&entry.exported_vv))
+                    .map_err(|e| SaltError::Crdt(e.to_string()))?
+            };
+            (bytes, current_vv)
+        };
+
+        let now = now_utc_ms();
+        let (device_id, device_name, seq) = {
+            let mut st = self.device_state.write();
+            st.last_seq += 1;
+            (st.device_id.clone(), st.device_name.clone(), st.last_seq)
+        };
+
+        let packet = DeltaPacket {
+            page_id: page_id.to_string(),
+            device_id: device_id.clone(),
+            seq,
+            created_at_utc: now,
+            loro_bytes,
+        };
+        let payload = serde_json::to_vec(&packet).map_err(|e| SaltError::Crdt(e.to_string()))?;
+        let hash = sha256_hex(&payload);
+        let filename = format!("{now}_{seq:08}.delta");
+        let delta_path = self.paths.device_deltas_dir(&device_id).join(&filename);
+        fs::create_dir_all(self.paths.device_deltas_dir(&device_id))
+            .map_err(|e| SaltError::Io(e.to_string()))?;
+        atomic_write(&delta_path, &payload)?;
+
+        let delta_entry = DeltaEntry {
+            seq,
+            filename,
+            sha256: hash,
+            size_bytes: payload.len() as u64,
+            page_id: page_id.to_string(),
+            created_at_utc: now,
+        };
+
+        // Update local manifest
+        let mut manifest = self.load_manifest(&device_id)?.unwrap_or(DeviceManifest {
+            device_id: device_id.clone(),
+            device_name,
+            latest_seq: 0,
+            updated_at_utc: now,
+            deltas: Vec::new(),
+        });
+        manifest.latest_seq = seq;
+        manifest.updated_at_utc = now;
+        manifest.deltas.push(delta_entry.clone());
+        let manifest_json =
+            serde_json::to_string_pretty(&manifest).map_err(|e| SaltError::Io(e.to_string()))?;
+        atomic_write(&self.paths.manifest_path(&device_id), manifest_json.as_bytes())?;
+
+        // Persist updated device_state.json
+        let state_json = serde_json::to_string_pretty(&*self.device_state.read())
+            .map_err(|e| SaltError::Io(e.to_string()))?;
+        atomic_write(&self.paths.device_state_path(), state_json.as_bytes())?;
+
+        if let Some(entry) = self.pages.write().get_mut(page_id) {
+            entry.exported_vv = new_vv;
+            entry.dirty_since_export = false;
+        }
+
+        Ok(Some(delta_entry))
+    }
+
+    pub fn load_manifest(&self, device_id: &str) -> SaltResult<Option<DeviceManifest>> {
+        let p = self.paths.manifest_path(device_id);
+        if !p.exists() {
+            return Ok(None);
+        }
+        let raw = fs::read_to_string(p).map_err(|e| SaltError::Io(e.to_string()))?;
+        let m = serde_json::from_str(&raw).map_err(|e| SaltError::Io(e.to_string()))?;
+        Ok(Some(m))
+    }
+
+    /// Exports full snapshots for all pages (used for P2P QUIC sync handshake).
+    pub fn export_all_page_packets(&self) -> SaltResult<Vec<DeltaPacket>> {
+        let dev = self.device_state();
+        let pages = self.pages.read();
+        let mut packets = Vec::with_capacity(pages.len());
+        for (idx, (page_id, entry)) in pages.iter().enumerate() {
+            let loro_bytes = entry
+                .doc
+                .export(ExportMode::Snapshot)
+                .map_err(|e| SaltError::Crdt(e.to_string()))?;
+            packets.push(DeltaPacket {
+                page_id: page_id.clone(),
+                device_id: dev.device_id.clone(),
+                seq: dev.last_seq + idx as u64 + 1,
+                created_at_utc: now_utc_ms(),
+                loro_bytes,
+            });
+        }
+        Ok(packets)
+    }
+
+    /// Exports all immutable WebP assets under `assets/` for complete P2P synchronization.
+    pub fn export_all_assets(&self) -> SaltResult<Vec<(String, Vec<u8>)>> {
+        let assets_root = self.paths.assets_dir();
+        if !assets_root.exists() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        collect_asset_blobs(&assets_root, "assets", &mut out)?;
+        Ok(out)
+    }
+
+    /// Imports a remote `.delta` payload, merges into Loro CRDT, persists into local peer delta dir,
+    /// refreshes `.md` view, and broadcasts `DocChangeEvent` to `salt-intel`.
+    pub fn import_delta_packet_bytes(&self, payload: &[u8]) -> SaltResult<String> {
+        let packet: DeltaPacket = serde_json::from_slice(payload)
+            .map_err(|e| SaltError::Sync(format!("Corrupt delta packet: {e}")))?;
+
+        let (meta, body, cards, logs, old_file) = {
+            let mut pages = self.pages.write();
+            let entry = pages
+                .entry(packet.page_id.clone())
+                .or_insert_with(|| PageEntry {
+                    doc: self.new_loro_doc(),
+                    exported_vv: VersionVector::new(),
+                    dirty_since_export: false,
+                    markdown_file: None,
+                });
+            entry
+                .doc
+                .import(&packet.loro_bytes)
+                .map_err(|e| SaltError::Crdt(format!("Loro import failed: {e}")))?;
+            let meta = read_meta_from_doc(&entry.doc, &packet.page_id)?;
+            let body = entry.doc.get_text("body").to_string();
+            let cards = read_cards_from_doc(&entry.doc);
+            let logs = read_review_logs_from_doc(&entry.doc);
+            (meta, body, cards, logs, entry.markdown_file.clone())
+        };
+
+        // Record remote delta locally with collision-free hash suffix so cold restarts reproduce full state
+        let peer_dir = self.paths.device_deltas_dir(&packet.device_id);
+        fs::create_dir_all(&peer_dir).map_err(|e| SaltError::Io(e.to_string()))?;
+        let short_hash = &sha256_hex(payload)[..10];
+        let fname = format!("{}_{:08}_{}.delta", packet.created_at_utc, packet.seq, short_hash);
+        let p = peer_dir.join(fname);
+        if !p.exists() {
+            atomic_write(&p, payload)?;
+        }
+
+        let md_file = self.project_markdown_file(&meta, &body, old_file.as_deref())?;
+        if let Some(entry) = self.pages.write().get_mut(&packet.page_id) {
+            entry.markdown_file = Some(md_file);
+        }
+
+        self.bump_sync_revision();
+
+        let _ = self.events_tx.send(DocChangeEvent::PageUpdated {
+            page_id: packet.page_id.clone(),
+            meta,
+            body_markdown: body,
+        });
+        let _ = self.events_tx.send(DocChangeEvent::CardsUpdated {
+            page_id: packet.page_id.clone(),
+            cards,
+            review_logs: logs,
+        });
+        Ok(packet.page_id)
+    }
+
+    pub fn update_peer_watermark(&self, peer_device_id: &str, seq: u64) -> SaltResult<()> {
+        let json = {
+            let mut st = self.device_state.write();
+            let cur = st
+                .peer_watermarks
+                .entry(peer_device_id.to_string())
+                .or_insert(0);
+            if seq > *cur {
+                *cur = seq;
+            }
+            serde_json::to_string_pretty(&*st).map_err(|e| SaltError::Io(e.to_string()))?
+        };
+        atomic_write(&self.paths.device_state_path(), json.as_bytes())
+    }
+
+    /// Exports all `.md` files and `assets/` into a standalone standard Markdown backup folder.
+    pub fn export_markdown_backup(&self, target_dir: impl AsRef<Path>) -> SaltResult<u32> {
+        let target = target_dir.as_ref();
+        let target_pages = target.join("pages");
+        let target_assets = target.join("assets");
+        fs::create_dir_all(&target_pages).map_err(|e| SaltError::Io(e.to_string()))?;
+        fs::create_dir_all(&target_assets).map_err(|e| SaltError::Io(e.to_string()))?;
+
+        let mut count = 0u32;
+        for summary in self.list_pages() {
+            let snap = self.get_page_snapshot(&summary.meta.page_id)?;
+            let content = render_markdown_with_frontmatter(&snap.meta, &snap.body_markdown);
+            let filename = format_markdown_filename(&snap.meta);
+            fs::write(target_pages.join(filename), content)
+                .map_err(|e| SaltError::Io(e.to_string()))?;
+            count += 1;
+        }
+
+        if self.paths.assets_dir().exists() {
+            copy_dir_recursive(&self.paths.assets_dir(), &target_assets)?;
+        }
+        Ok(count)
+    }
+
+    // ------------------------------------------------------------------------
+    // Internal Helpers: WAL, Startup Replay, Markdown Projection
+    // ------------------------------------------------------------------------
+
+    fn new_loro_doc(&self) -> LoroDoc {
+        let doc = LoroDoc::new();
+        let _ = doc.set_peer_id(self.peer_id);
+        doc
+    }
+
+    fn append_wal(&self, page_id: &str, loro_update: &[u8]) -> SaltResult<()> {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.paths.wal_path())
+            .map_err(|e| SaltError::Io(format!("WAL open failed: {e}")))?;
+
+        let pid_bytes = page_id.as_bytes();
+        let pid_len = pid_bytes.len() as u16;
+        let data_len = loro_update.len() as u32;
+        file.write_all(&pid_len.to_le_bytes())
+            .and_then(|_| file.write_all(pid_bytes))
+            .and_then(|_| file.write_all(&data_len.to_le_bytes()))
+            .and_then(|_| file.write_all(loro_update))
+            .and_then(|_| file.flush())
+            .map_err(|e| SaltError::Io(format!("WAL write failed: {e}")))?;
+        Ok(())
+    }
+
+    fn replay_all_deltas_from_disk(&self) -> SaltResult<()> {
+        let deltas_root = self.paths.deltas_dir();
+        if !deltas_root.exists() {
+            return Ok(());
+        }
+        let mut delta_files = Vec::new();
+        for dev_entry in fs::read_dir(&deltas_root).map_err(|e| SaltError::Io(e.to_string()))? {
+            let dev_entry = dev_entry.map_err(|e| SaltError::Io(e.to_string()))?;
+            if dev_entry.path().is_dir() {
+                for f in
+                    fs::read_dir(dev_entry.path()).map_err(|e| SaltError::Io(e.to_string()))?
+                {
+                    let f = f.map_err(|e| SaltError::Io(e.to_string()))?;
+                    let path = f.path();
+                    if path.extension().and_then(|s| s.to_str()) == Some("delta") {
+                        delta_files.push(path);
+                    }
+                }
+            }
+        }
+        delta_files.sort();
+
+        let mut pages = self.pages.write();
+        for path in delta_files {
+            if let Ok(raw) = fs::read(&path) {
+                if let Ok(packet) = serde_json::from_slice::<DeltaPacket>(&raw) {
+                    let entry = pages
+                        .entry(packet.page_id.clone())
+                        .or_insert_with(|| PageEntry {
+                            doc: self.new_loro_doc(),
+                            exported_vv: VersionVector::new(),
+                            dirty_since_export: false,
+                            markdown_file: None,
+                        });
+                    let _ = entry.doc.import(&packet.loro_bytes);
+                    entry.exported_vv = entry.doc.oplog_vv();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn replay_wal_from_disk(&self) -> SaltResult<()> {
+        let wal_path = self.paths.wal_path();
+        if !wal_path.exists() {
+            return Ok(());
+        }
+        let bytes = fs::read(&wal_path).map_err(|e| SaltError::Io(e.to_string()))?;
+        let mut pos = 0usize;
+        let mut pages = self.pages.write();
+        while pos + 2 <= bytes.len() {
+            let pid_len = u16::from_le_bytes([bytes[pos], bytes[pos + 1]]) as usize;
+            pos += 2;
+            if pos + pid_len + 4 > bytes.len() {
+                break;
+            }
+            let Ok(page_id) = std::str::from_utf8(&bytes[pos..pos + pid_len]) else {
+                break;
+            };
+            pos += pid_len;
+            let data_len = u32::from_le_bytes([
+                bytes[pos],
+                bytes[pos + 1],
+                bytes[pos + 2],
+                bytes[pos + 3],
+            ]) as usize;
+            pos += 4;
+            if pos + data_len > bytes.len() {
+                break;
+            }
+            let chunk = &bytes[pos..pos + data_len];
+            pos += data_len;
+
+            let entry = pages
+                .entry(page_id.to_string())
+                .or_insert_with(|| PageEntry {
+                    doc: self.new_loro_doc(),
+                    exported_vv: VersionVector::new(),
+                    dirty_since_export: true,
+                    markdown_file: None,
+                });
+            let _ = entry.doc.import(chunk);
+            if entry.doc.oplog_vv() != entry.exported_vv {
+                entry.dirty_since_export = true;
+            }
+        }
+
+        // Refresh projected markdown filenames for recovered docs
+        for (pid, entry) in pages.iter_mut() {
+            if let Ok(meta) = read_meta_from_doc(&entry.doc, pid) {
+                let fname = format_markdown_filename(&meta);
+                entry.markdown_file = Some(fname);
+            }
+        }
+        Ok(())
+    }
+
+    fn project_markdown_file(
+        &self,
+        meta: &PageMeta,
+        body: &str,
+        previous_filename: Option<&str>,
+    ) -> SaltResult<String> {
+        let filename = format_markdown_filename(meta);
+        if let Some(prev) = previous_filename {
+            if prev != filename && !prev.is_empty() {
+                let _ = fs::remove_file(self.paths.pages_dir().join(prev));
+            }
+        }
+        let rendered = render_markdown_with_frontmatter(meta, body);
+        atomic_write(&self.paths.pages_dir().join(&filename), rendered.as_bytes())?;
+        Ok(filename)
+    }
+}
+
+// ============================================================================
+// Loro Container Serialization Helpers
+// ============================================================================
+
+fn write_meta_to_doc(doc: &LoroDoc, meta: &PageMeta) -> SaltResult<()> {
+    let map = doc.get_map("meta");
+    map.insert("page_id", meta.page_id.as_str())
+        .map_err(|e| SaltError::Crdt(e.to_string()))?;
+    map.insert("title", meta.title.as_str())
+        .map_err(|e| SaltError::Crdt(e.to_string()))?;
+    let mode_str = match meta.mode {
+        PageMode::Journal => "journal",
+        PageMode::Study => "study",
+    };
+    map.insert("mode", mode_str)
+        .map_err(|e| SaltError::Crdt(e.to_string()))?;
+    map.insert("is_private", meta.is_private)
+        .map_err(|e| SaltError::Crdt(e.to_string()))?;
+    let tags_json =
+        serde_json::to_string(&meta.tags).map_err(|e| SaltError::Crdt(e.to_string()))?;
+    map.insert("tags", tags_json)
+        .map_err(|e| SaltError::Crdt(e.to_string()))?;
+    map.insert("created_at_utc", meta.created_at_utc)
+        .map_err(|e| SaltError::Crdt(e.to_string()))?;
+    map.insert("updated_at_utc", meta.updated_at_utc)
+        .map_err(|e| SaltError::Crdt(e.to_string()))?;
+    Ok(())
+}
+
+fn touch_updated_at(doc: &LoroDoc) -> SaltResult<()> {
+    let map = doc.get_map("meta");
+    map.insert("updated_at_utc", now_utc_ms())
+        .map_err(|e| SaltError::Crdt(e.to_string()))
+}
+
+fn read_meta_from_doc(doc: &LoroDoc, fallback_id: &str) -> SaltResult<PageMeta> {
+    let val = doc.get_map("meta").get_deep_value();
+    let LoroValue::Map(m) = val else {
+        return Err(SaltError::Crdt("Invalid meta container".into()));
+    };
+    let get_str = |k: &str| -> Option<String> {
+        match m.get(k) {
+            Some(LoroValue::String(s)) => Some(s.to_string()),
+            _ => None,
+        }
+    };
+    let get_i64 = |k: &str| -> i64 {
+        match m.get(k) {
+            Some(LoroValue::I64(n)) => *n,
+            _ => 0,
+        }
+    };
+    let get_bool = |k: &str| -> bool {
+        match m.get(k) {
+            Some(LoroValue::Bool(b)) => *b,
+            _ => false,
+        }
+    };
+    let mode = match get_str("mode").as_deref() {
+        Some("journal") => PageMode::Journal,
+        _ => PageMode::Study,
+    };
+    let tags = get_str("tags")
+        .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+        .unwrap_or_default();
+
+    Ok(PageMeta {
+        page_id: get_str("page_id").unwrap_or_else(|| fallback_id.to_string()),
+        title: get_str("title").unwrap_or_else(|| "未命名笔记".into()),
+        mode,
+        is_private: get_bool("is_private"),
+        tags,
+        created_at_utc: get_i64("created_at_utc"),
+        updated_at_utc: get_i64("updated_at_utc"),
+    })
+}
+
+fn read_canvases_from_doc(doc: &LoroDoc) -> Vec<CanvasSnapshot> {
+    let val = doc.get_map("canvas").get_deep_value();
+    let LoroValue::Map(root_map) = val else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (canvas_id, c_val) in root_map.iter() {
+        let LoroValue::Map(c_map) = c_val else {
+            continue;
+        };
+        let mut strokes = Vec::new();
+        if let Some(LoroValue::Map(sm)) = c_map.get("strokes") {
+            for v in sm.values() {
+                if let LoroValue::String(s) = v {
+                    if let Ok(st) = serde_json::from_str::<DeltaStroke>(s) {
+                        strokes.push(st);
+                    }
+                }
+            }
+        }
+        let mut transforms = Vec::new();
+        if let Some(LoroValue::Map(tm)) = c_map.get("transforms") {
+            for v in tm.values() {
+                if let LoroValue::String(s) = v {
+                    if let Ok(tr) = serde_json::from_str::<StrokeTransform>(s) {
+                        transforms.push(tr);
+                    }
+                }
+            }
+        }
+        let mut images = Vec::new();
+        if let Some(LoroValue::Map(im)) = c_map.get("images") {
+            for v in im.values() {
+                if let LoroValue::String(s) = v {
+                    if let Ok(node) = serde_json::from_str::<CanvasImageNode>(s) {
+                        images.push(node);
+                    }
+                }
+            }
+        }
+        strokes.sort_by(|a, b| a.created_at_utc.cmp(&b.created_at_utc).then(a.stroke_id.cmp(&b.stroke_id)));
+        transforms.sort_by(|a, b| a.stroke_id.cmp(&b.stroke_id));
+        images.sort_by(|a, b| a.image_id.cmp(&b.image_id));
+        out.push(CanvasSnapshot {
+            canvas_id: canvas_id.clone(),
+            strokes,
+            transforms,
+            images,
+        });
+    }
+    out.sort_by(|a, b| a.canvas_id.cmp(&b.canvas_id));
+    out
+}
+
+fn read_halos_from_doc(doc: &LoroDoc) -> Vec<HaloAnnotation> {
+    let val = doc.get_map("halos").get_deep_value();
+    let LoroValue::Map(m) = val else {
+        return Vec::new();
+    };
+    let mut out: Vec<HaloAnnotation> = m
+        .values()
+        .filter_map(|v| match v {
+            LoroValue::String(s) => serde_json::from_str(s).ok(),
+            _ => None,
+        })
+        .collect();
+    out.sort_by(|a, b| a.created_at_utc.cmp(&b.created_at_utc).then(a.halo_id.cmp(&b.halo_id)));
+    out
+}
+
+fn read_cards_from_doc(doc: &LoroDoc) -> Vec<FlashCard> {
+    let val = doc.get_map("cards").get_deep_value();
+    let LoroValue::Map(m) = val else {
+        return Vec::new();
+    };
+    let mut out: Vec<FlashCard> = m
+        .values()
+        .filter_map(|v| match v {
+            LoroValue::String(s) => serde_json::from_str(s).ok(),
+            _ => None,
+        })
+        .collect();
+    out.sort_by(|a, b| a.created_at_utc.cmp(&b.created_at_utc).then(a.card_id.cmp(&b.card_id)));
+    out
+}
+
+fn read_review_logs_from_doc(doc: &LoroDoc) -> Vec<ReviewLog> {
+    let val = doc.get_list("fsrs_logs").get_deep_value();
+    let LoroValue::List(list) = val else {
+        return Vec::new();
+    };
+    let mut out: Vec<ReviewLog> = list
+        .iter()
+        .filter_map(|v| match v {
+            LoroValue::String(s) => serde_json::from_str(s).ok(),
+            _ => None,
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        a.reviewed_at_utc
+            .cmp(&b.reviewed_at_utc)
+            .then(a.log_id.cmp(&b.log_id))
+    });
+    out
+}
+
+#[derive(Serialize)]
+struct CanonicalPageState {
+    meta: PageMeta,
+    body_markdown: String,
+    canvases: Vec<CanvasSnapshot>,
+    halos: Vec<HaloAnnotation>,
+    cards: Vec<FlashCard>,
+    review_logs: Vec<ReviewLog>,
+}
+
+impl CanonicalPageState {
+    fn from_snapshot(snap: PageSnapshot, review_logs: Vec<ReviewLog>) -> Self {
+        Self {
+            meta: snap.meta,
+            body_markdown: snap.body_markdown,
+            canvases: snap.canvases,
+            halos: snap.halos,
+            cards: snap.cards,
+            review_logs,
+        }
+    }
+
+    fn sort_deterministically(&mut self) {
+        self.meta.tags.sort();
+        self.canvases.sort_by(|a, b| a.canvas_id.cmp(&b.canvas_id));
+        for c in &mut self.canvases {
+            c.strokes.sort_by(|a, b| a.stroke_id.cmp(&b.stroke_id));
+            c.transforms.sort_by(|a, b| a.stroke_id.cmp(&b.stroke_id));
+            c.images.sort_by(|a, b| a.image_id.cmp(&b.image_id));
+        }
+        self.halos.sort_by(|a, b| a.halo_id.cmp(&b.halo_id));
+        self.cards.sort_by(|a, b| a.card_id.cmp(&b.card_id));
+        self.review_logs.sort_by(|a, b| {
+            a.reviewed_at_utc
+                .cmp(&b.reviewed_at_utc)
+                .then(a.log_id.cmp(&b.log_id))
+        });
+    }
+}
+
+fn format_markdown_filename(meta: &PageMeta) -> String {
+    let dt = Utc
+        .timestamp_millis_opt(meta.created_at_utc)
+        .single()
+        .unwrap_or_else(Utc::now);
+    let date_prefix = dt.format("%Y-%m-%d").to_string();
+    let safe_title: String = meta
+        .title
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            _ => c,
+        })
+        .collect();
+    let trimmed = safe_title.trim();
+    let base = if trimmed.is_empty() {
+        meta.page_id.as_str()
+    } else {
+        trimmed
+    };
+    let short_id = &meta.page_id[..meta.page_id.len().min(6)];
+    format!("{date_prefix}_{base}_{short_id}.md")
+}
+
+fn render_markdown_with_frontmatter(meta: &PageMeta, body: &str) -> String {
+    let mode_str = match meta.mode {
+        PageMode::Journal => "journal",
+        PageMode::Study => "study",
+    };
+    let tags_yaml = meta
+        .tags
+        .iter()
+        .map(|t| format!("\"{}\"", t.replace('"', "\\\"")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "---\nsalt_page_id: \"{}\"\ntitle: \"{}\"\nmode: {}\nprivate: {}\ntags: [{}]\n---\n\n{}",
+        meta.page_id,
+        meta.title.replace('"', "\\\""),
+        mode_str,
+        meta.is_private,
+        tags_yaml,
+        body
+    )
+}
+
+fn derive_peer_id(device_id: &str) -> u64 {
+    let digest = Sha256::digest(device_id.as_bytes());
+    let mut arr = [0u8; 8];
+    arr.copy_from_slice(&digest[..8]);
+    let v = u64::from_le_bytes(arr);
+    if v == 0 { 1 } else { v }
+}
+
+fn sanitize_router_config(cfg: &RouterConfig) -> RouterConfig {
+    let mut sanitized = cfg.clone();
+    for p in &mut sanitized.providers {
+        let first_line = p
+            .base_url
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or("");
+        p.base_url = first_line
+            .split_whitespace()
+            .take_while(|tok| !tok.starts_with("sk-"))
+            .collect::<Vec<_>>()
+            .join("")
+            .chars()
+            .filter(|c| !c.is_control() && !c.is_whitespace())
+            .collect::<String>()
+            .trim_end_matches('/')
+            .to_string();
+        p.model = p
+            .model
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or("")
+            .chars()
+            .filter(|c| !c.is_control())
+            .collect::<String>()
+            .trim()
+            .to_string();
+        p.api_key_ref = p.api_key_ref.trim().to_string();
+    }
+    sanitized
+}
+
+fn atomic_write(path: &Path, bytes: &[u8]) -> SaltResult<()> {
+    let unique_tmp = path.with_file_name(format!(
+        ".{}.{}.tmp",
+        path.file_name().and_then(|s| s.to_str()).unwrap_or("file"),
+        new_ulid()
+    ));
+    fs::write(&unique_tmp, bytes).map_err(|e| SaltError::Io(e.to_string()))?;
+    if fs::rename(&unique_tmp, path).is_err() {
+        // Windows fallback when destination is briefly scanned or already exists
+        let _ = fs::remove_file(&unique_tmp);
+        fs::write(path, bytes).map_err(|e| SaltError::Io(e.to_string()))?;
+    }
+    Ok(())
+}
+
+fn collect_asset_blobs(dir: &Path, prefix: &str, out: &mut Vec<(String, Vec<u8>)>) -> SaltResult<()> {
+    for entry in fs::read_dir(dir).map_err(|e| SaltError::Io(e.to_string()))? {
+        let entry = entry.map_err(|e| SaltError::Io(e.to_string()))?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.ends_with(".tmp") {
+            continue;
+        }
+        let rel = format!("{prefix}/{name}");
+        let ty = entry.file_type().map_err(|e| SaltError::Io(e.to_string()))?;
+        if ty.is_dir() {
+            collect_asset_blobs(&entry.path(), &rel, out)?;
+        } else if let Ok(bytes) = fs::read(entry.path()) {
+            out.push((rel, bytes));
+        }
+    }
+    Ok(())
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> SaltResult<()> {
+    fs::create_dir_all(dst).map_err(|e| SaltError::Io(e.to_string()))?;
+    for entry in fs::read_dir(src).map_err(|e| SaltError::Io(e.to_string()))? {
+        let entry = entry.map_err(|e| SaltError::Io(e.to_string()))?;
+        let ty = entry.file_type().map_err(|e| SaltError::Io(e.to_string()))?;
+        let dst_path = dst.join(entry.file_name());
+        if ty.is_dir() {
+            copy_dir_recursive(&entry.path(), &dst_path)?;
+        } else {
+            fs::copy(entry.path(), dst_path).map_err(|e| SaltError::Io(e.to_string()))?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use salt_types::{BrushKind, RectF};
+
+    fn make_dummy_stroke(id: &str, x: f32) -> DeltaStroke {
+        DeltaStroke {
+            stroke_id: id.into(),
+            brush: BrushKind::Pen,
+            color_argb: 0xFF112233,
+            base_width: 2.5,
+            origin_x: x,
+            origin_y: 50.0,
+            quant_scale: 4.0,
+            dx: vec![0, 4, 4],
+            dy: vec![0, 2, 2],
+            pressure_q: vec![128, 160, 140],
+            dt_ms: vec![0, 4, 4],
+            bbox: RectF {
+                min_x: x,
+                min_y: 48.0,
+                max_x: x + 4.0,
+                max_y: 54.0,
+            },
+            created_at_utc: now_utc_ms(),
+        }
+    }
+
+    #[test]
+    fn wal_crash_recovery_preserves_text_and_strokes() {
+        let tmp = std::env::temp_dir().join(format!("saltnote_wal_test_{}", new_ulid()));
+        let page_id = {
+            let store = VaultStore::open(&tmp, Some("DeviceA".into())).unwrap();
+            let meta = store
+                .create_page("Crash Test", PageMode::Study, false, vec![], "Hello WAL")
+                .unwrap();
+            store
+                .add_stroke(&meta.page_id, "main", &make_dummy_stroke("s1", 10.0))
+                .unwrap();
+            // Intentionally drop without calling flush_all_dirty_deltas (simulates sudden kill)
+            meta.page_id
+        };
+
+        let reopened = VaultStore::open(&tmp, Some("DeviceA".into())).unwrap();
+        let snap = reopened.get_page_snapshot(&page_id).unwrap();
+        assert_eq!(snap.body_markdown, "Hello WAL");
+        assert_eq!(snap.canvases[0].strokes.len(), 1);
+        assert_eq!(snap.canvases[0].strokes[0].stroke_id, "s1");
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// MVP Section 6.2 Test 1: 3-device offline concurrent CRDT edit convergence test.
+    #[test]
+    fn three_device_offline_concurrent_edits_converge_bit_identically() {
+        let base = std::env::temp_dir().join(format!("saltnote_3dev_{}", new_ulid()));
+        let d1 = VaultStore::open(base.join("d1"), Some("Tablet".into())).unwrap();
+        let d2 = VaultStore::open(base.join("d2"), Some("Laptop".into())).unwrap();
+        let d3 = VaultStore::open(base.join("d3"), Some("Desktop".into())).unwrap();
+
+        // Seed common base document from d1 -> d2, d3
+        let meta = d1
+            .create_page(
+                "Physics Lecture",
+                PageMode::Study,
+                false,
+                vec!["physics".into()],
+                "# Physics\n\nParagraph A\n\nParagraph B\n\nParagraph C\n",
+            )
+            .unwrap();
+        d1.add_stroke(&meta.page_id, "main", &make_dummy_stroke("shared-stroke", 5.0))
+            .unwrap();
+        let seed_entries = d1.flush_all_dirty_deltas().unwrap();
+        let seed_bytes = fs::read(
+            d1.paths()
+                .device_deltas_dir(&d1.device_state().device_id)
+                .join(&seed_entries[0].filename),
+        )
+        .unwrap();
+        d2.import_delta_packet_bytes(&seed_bytes).unwrap();
+        d3.import_delta_packet_bytes(&seed_bytes).unwrap();
+
+        // All 3 devices go offline and concurrently edit Markdown, add strokes, and drag shared-stroke
+        d1.update_page_body(
+            &meta.page_id,
+            "# Physics\n\nParagraph A (edited by Tablet)\n\nParagraph B\n\nParagraph C\n",
+        )
+        .unwrap();
+        d1.add_stroke(&meta.page_id, "main", &make_dummy_stroke("stroke-d1", 100.0))
+            .unwrap();
+        d1.upsert_stroke_transform(
+            &meta.page_id,
+            "main",
+            &StrokeTransform {
+                stroke_id: "shared-stroke".into(),
+                tx: 12.0,
+                ty: 5.0,
+                scale_x: 1.0,
+                scale_y: 1.0,
+                deleted: false,
+                updated_at_utc: 1001,
+            },
+        )
+        .unwrap();
+
+        d2.update_page_body(
+            &meta.page_id,
+            "# Physics\n\nParagraph A\n\nParagraph B (edited by Laptop)\n\nParagraph C\n",
+        )
+        .unwrap();
+        d2.add_stroke(&meta.page_id, "main", &make_dummy_stroke("stroke-d2", 200.0))
+            .unwrap();
+        d2.upsert_stroke_transform(
+            &meta.page_id,
+            "main",
+            &StrokeTransform {
+                stroke_id: "shared-stroke".into(),
+                tx: 30.0,
+                ty: -10.0,
+                scale_x: 1.0,
+                scale_y: 1.0,
+                deleted: false,
+                updated_at_utc: 1002,
+            },
+        )
+        .unwrap();
+
+        d3.update_page_body(
+            &meta.page_id,
+            "# Physics\n\nParagraph A\n\nParagraph B\n\nParagraph C (edited by Desktop)\n",
+        )
+        .unwrap();
+        d3.add_stroke(&meta.page_id, "main", &make_dummy_stroke("stroke-d3", 300.0))
+            .unwrap();
+
+        // Collect all deltas and deliver in DIFFERENT permutations to d1, d2, d3
+        let read_all = |s: &VaultStore| -> Vec<Vec<u8>> {
+            let entries = s.flush_all_dirty_deltas().unwrap();
+            let dir = s.paths().device_deltas_dir(&s.device_state().device_id);
+            entries
+                .into_iter()
+                .map(|e| fs::read(dir.join(e.filename)).unwrap())
+                .collect()
+        };
+        let p1 = read_all(&d1);
+        let p2 = read_all(&d2);
+        let p3 = read_all(&d3);
+
+        // d1 receives p2 then p3
+        for b in p2.iter().chain(p3.iter()) {
+            d1.import_delta_packet_bytes(b).unwrap();
+        }
+        // d2 receives p3 then p1
+        for b in p3.iter().chain(p1.iter()) {
+            d2.import_delta_packet_bytes(b).unwrap();
+        }
+        // d3 receives p1 then p2
+        for b in p1.iter().chain(p2.iter()) {
+            d3.import_delta_packet_bytes(b).unwrap();
+        }
+
+        let h1 = d1.compute_page_state_hash(&meta.page_id).unwrap();
+        let h2 = d2.compute_page_state_hash(&meta.page_id).unwrap();
+        let h3 = d3.compute_page_state_hash(&meta.page_id).unwrap();
+        assert_eq!(h1, h2, "d1 and d2 state hashes must be bit-identical");
+        assert_eq!(h2, h3, "d2 and d3 state hashes must be bit-identical");
+
+        let snap = d1.get_page_snapshot(&meta.page_id).unwrap();
+        assert_eq!(snap.canvases[0].strokes.len(), 4);
+        assert!(snap.body_markdown.contains("Tablet"));
+        assert!(snap.body_markdown.contains("Laptop"));
+        assert!(snap.body_markdown.contains("Desktop"));
+
+        let _ = fs::remove_dir_all(&base);
+    }
+}
