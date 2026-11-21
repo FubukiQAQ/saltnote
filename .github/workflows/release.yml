@@ -1,0 +1,145 @@
+name: SaltNote Alpha Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-desktop:
+    name: Build Desktop (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: linux-x64
+          - os: windows-latest
+            artifact: windows-x64
+          - os: macos-latest
+            artifact: macos-arm64
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build Desktop UniFFI & Distributable
+        run: ./gradlew :app:nativeBridge:buildRustDesktop :app:nativeBridge:generateUniFFIBindings :app:nativeBridge:desktopTest :app:composeApp:createDistributable --console=plain
+      - name: Package Windows ZIP
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Path "app/composeApp/build/compose/binaries/main/app/*" -DestinationPath "dist/SaltNote-${{ github.ref_name }}-${{ matrix.artifact }}.zip" -Force
+      - name: Package Linux tar.gz
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          mkdir -p dist
+          tar -C app/composeApp/build/compose/binaries/main/app -czf "dist/SaltNote-${{ github.ref_name }}-${{ matrix.artifact }}.tar.gz" .
+      - name: Package macOS ZIP
+        if: matrix.os == 'macos-latest'
+        run: |
+          mkdir -p dist
+          APP_DIR=$(find app/composeApp/build/compose/binaries/main/app -maxdepth 1 -mindepth 1 | head -n1)
+          ditto -c -k --keepParent "$APP_DIR" "dist/SaltNote-${{ github.ref_name }}-${{ matrix.artifact }}.zip"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: desktop-${{ matrix.artifact }}
+          path: dist/*
+          if-no-files-found: error
+
+  build-android:
+    name: Build Android ARM64 APKs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 21
+      - name: Setup Android SDK & NDK r27c
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools ndk;27.2.12479018'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+      - name: Build Android ARM64 .so & APKs
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/27.2.12479018
+        run: ./gradlew :app:nativeBridge:buildRustAndroidArm64 :app:androidApp:assembleDebug :app:androidApp:assembleRelease --console=plain
+      - name: Enforce Release APK Size <= 35MB & Stage APKs
+        run: |
+          REL_APK="app/androidApp/build/outputs/apk/release/androidApp-release-unsigned.apk"
+          DBG_APK="app/androidApp/build/outputs/apk/debug/androidApp-debug.apk"
+          SIZE_BYTES=$(stat -c%s "$REL_APK")
+          SIZE_MB=$(du -m "$REL_APK" | cut -f1)
+          echo "Built Release APK size: ${SIZE_MB} MB (${SIZE_BYTES} bytes)"
+          test "$SIZE_MB" -le 35
+          mkdir -p dist
+          cp "$DBG_APK" "dist/SaltNote-${{ github.ref_name }}-android-arm64-debug.apk"
+          cp "$REL_APK" "dist/SaltNote-${{ github.ref_name }}-android-arm64-release-unsigned.apk"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: android-arm64
+          path: dist/*.apk
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish GitHub Release
+    needs: [ build-desktop, build-android ]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Download build artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: release-assets
+          merge-multiple: true
+      - name: Generate SHA256 checksums
+        working-directory: release-assets
+        run: |
+          ls -lh
+          sha256sum SaltNote-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          NOTES_FILE="$(mktemp)"
+          cat <<'EOF' | sed 's/^ *|//' > "$NOTES_FILE"
+          |## SaltNote Alpha (v0.1-alpha)
+          |
+          |永久免费开源（Apache-2.0）、本地优先（Local-First）、零后端依赖、支持 BYOK 多模态 AI 与 Material Design 3 界面的跨平台双模手账与学习笔记应用。
+          |
+          |### 核心特性
+          |- **双模记录**：画布模式（压感笔迹、荧光笔、橡皮擦、图片插入）与文档模式（Markdown 渲染 + 行内嵌入画布块）无缝切换，基于 Loro CRDT 与 WAL 崩溃恢复持久化。
+          |- **随手圈（Salt Halo）**：琥珀黄（概念扩充）、冰川蓝（FSRS 闪卡提炼）、矿石灰（WebP/PNG 切片多模态 OCR），支持 `#private` 页面硬阻断公网 AI、仅允许本机或局域网 Ollama。
+          |- **零后端同步与检索复习**：OpenDAL WebDAV 增量同步、mDNS + QUIC / Ed25519 局域网 P2P 同步、SQLite FTS5 + 子串检索、FSRS-rs 间隔重复复习。
+          |
+          |### 产物说明
+          |- **Android (ARM64)**：
+          |  - `*-android-arm64-debug.apk`：调试签名安装包，可直接安装测试。
+          |  - `*-android-arm64-release-unsigned.apk`：Release 未签名包（<= 35 MB 体积门禁通过）。
+          |- **Desktop**：
+          |  - `*-windows-x64.zip`：解压后运行 `SaltNote/SaltNote.exe`。
+          |  - `*-linux-x64.tar.gz`：解压后运行 `SaltNote/bin/SaltNote`。
+          |  - `*-macos-arm64.zip`：解压后运行 `SaltNote.app`（Apple Silicon）。
+          EOF
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" release-assets/* --clobber
+            gh release edit "$TAG" --title "SaltNote Alpha ($TAG)" --notes-file "$NOTES_FILE" --prerelease
+          else
+            gh release create "$TAG" release-assets/* --title "SaltNote Alpha ($TAG)" --notes-file "$NOTES_FILE" --prerelease --target "$GITHUB_SHA"
+          fi
