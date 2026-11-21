@@ -10,7 +10,7 @@ jobs:
     name: Rust Core, Chaos & Privacy Audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Run Rust workspace tests (CRDT 3-device, WebDAV 429 chaos, FSRS dedup, Privacy guard)
         working-directory: rust
@@ -20,11 +20,12 @@ jobs:
     name: Desktop UniFFI & Compose Build
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         os: [ ubuntu-latest, windows-latest, macos-latest ]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: 21
@@ -36,26 +37,28 @@ jobs:
     name: Android ARM64 Cross-Compile & APK Size Gate
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: 21
-      - uses: android-actions/setup-android@v3
-      - name: Install Android NDK r27c
-        run: sdkmanager "ndk;27.2.12479018"
+      - name: Setup Android SDK & NDK r27c
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools ndk;27.2.12479018'
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android
       - name: Install cargo-ndk
         run: cargo install cargo-ndk --locked
-      - name: Build Android ARM64 .so & Debug APK
+      - name: Build Android ARM64 .so & APKs
         env:
           ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/27.2.12479018
-        run: ./gradlew :app:nativeBridge:buildRustAndroidArm64 :app:androidApp:assembleDebug --console=plain
-      - name: Enforce APK Size <= 35MB (MVP Section 6.1)
+        run: ./gradlew :app:nativeBridge:buildRustAndroidArm64 :app:androidApp:assembleDebug :app:androidApp:assembleRelease --console=plain
+      - name: Enforce Release APK Size <= 35MB (MVP Section 6.1)
         run: |
-          APK="app/androidApp/build/outputs/apk/debug/androidApp-debug.apk"
+          APK="app/androidApp/build/outputs/apk/release/androidApp-release-unsigned.apk"
+          SIZE_BYTES=$(stat -c%s "$APK")
           SIZE_MB=$(du -m "$APK" | cut -f1)
-          echo "Built APK size: ${SIZE_MB} MB"
+          echo "Built Release APK size: ${SIZE_MB} MB (${SIZE_BYTES} bytes)"
           test "$SIZE_MB" -le 35

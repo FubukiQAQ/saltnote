@@ -29,20 +29,23 @@ fun resolvePathWithCargo(): String {
 }
 
 fun resolveAndroidNdkHome(): String? {
-    System.getenv("ANDROID_NDK_HOME")?.takeIf { it.isNotBlank() }?.let { return it }
+    System.getenv("ANDROID_NDK_HOME")?.takeIf { it.isNotBlank() && file(it).isDirectory }?.let { return it }
+    val candidates = mutableListOf<String>()
     val localPropsFile = rootProject.file("local.properties")
     if (localPropsFile.exists()) {
         val props = Properties()
         localPropsFile.inputStream().use { props.load(it) }
-        val sdkDir = props.getProperty("sdk.dir")
-        if (!sdkDir.isNullOrBlank()) {
-            val ndkRoot = file("$sdkDir/ndk")
-            if (ndkRoot.isDirectory) {
-                val chosen = ndkRoot.listFiles()
-                    ?.filter { it.isDirectory && file("${it.absolutePath}/source.properties").exists() }
-                    ?.maxByOrNull { it.name }
-                if (chosen != null) return chosen.absolutePath
-            }
+        props.getProperty("sdk.dir")?.takeIf { it.isNotBlank() }?.let { candidates += it }
+    }
+    System.getenv("ANDROID_HOME")?.takeIf { it.isNotBlank() }?.let { candidates += it }
+    System.getenv("ANDROID_SDK_ROOT")?.takeIf { it.isNotBlank() }?.let { candidates += it }
+    for (sdkDir in candidates) {
+        val ndkRoot = file("$sdkDir/ndk")
+        if (ndkRoot.isDirectory) {
+            val chosen = ndkRoot.listFiles()
+                ?.filter { it.isDirectory && file("${it.absolutePath}/source.properties").exists() }
+                ?.maxByOrNull { it.name }
+            if (chosen != null) return chosen.absolutePath
         }
     }
     return null
