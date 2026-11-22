@@ -2,7 +2,7 @@ use chrono::{TimeZone, Utc};
 use loro::{ExportMode, LoroDoc, LoroList, LoroValue, UpdateOptions, VersionVector};
 use parking_lot::RwLock;
 use salt_types::{
-    default_halo_presets, new_ulid, now_utc_ms, sha256_hex,
+    default_halo_presets, new_ulid, now_utc_ms, parse_flashcard_drafts, sha256_hex,
     validate_router_config_no_plaintext_keys, CanvasImageNode, CanvasSnapshot, DeltaEntry,
     DeltaStroke, DeviceManifest, DeviceState, FlashCard, HaloAnnotation, HaloPreset, PageMeta,
     PageMode, PageSnapshot, PageSummary, ReviewLog, RouterConfig, SaltError, SaltResult,
@@ -130,6 +130,9 @@ pub enum DocChangeEvent {
         page_id: String,
         meta: PageMeta,
         body_markdown: String,
+    },
+    PageDeleted {
+        page_id: String,
     },
     CardsUpdated {
         page_id: String,
@@ -272,7 +275,26 @@ impl VaultStore {
     pub fn load_halo_presets(&self) -> SaltResult<Vec<HaloPreset>> {
         let raw = fs::read_to_string(self.paths.halo_presets_path())
             .map_err(|e| SaltError::Io(e.to_string()))?;
-        serde_json::from_str(&raw).map_err(|e| SaltError::Io(e.to_string()))
+        let mut presets: Vec<HaloPreset> =
+            serde_json::from_str(&raw).map_err(|e| SaltError::Io(e.to_string()))?;
+        let latest_defaults = default_halo_presets();
+        let mut migrated = false;
+        for preset in &mut presets {
+            if let Some(latest) = latest_defaults.iter().find(|d| d.preset_id == preset.preset_id) {
+                if is_legacy_default_prompt(&preset.preset_id, &preset.system_prompt)
+                    && preset.system_prompt != latest.system_prompt
+                {
+                    preset.system_prompt = latest.system_prompt.clone();
+                    migrated = true;
+                }
+            }
+        }
+        if migrated {
+            if let Ok(json) = serde_json::to_string_pretty(&presets) {
+                let _ = atomic_write(&self.paths.halo_presets_path(), json.as_bytes());
+            }
+        }
+        Ok(presets)
     }
 
     pub fn load_webdav_config(&self) -> SaltResult<WebDavConfig> {
@@ -314,6 +336,7 @@ impl VaultStore {
             tags,
             created_at_utc: now,
             updated_at_utc: now,
+            is_deleted: false,
         };
         let initial_body = initial_markdown.into();
 
@@ -475,6 +498,46 @@ SaltNote 是一款**永久免费开源、本地优先（Local-First）、零后�
         Ok(())
     }
 
+    /// Tombstone-deletes a page inside Loro CRDT so the deletion propagates cleanly across
+    /// WebDAV and LAN P2P peers without resurrecting deleted notes.
+    pub fn delete_page(&self, page_id: &str) -> SaltResult<()> {
+        let (meta, old_file) = {
+            let mut pages = self.pages.write();
+            let entry = pages
+                .get_mut(page_id)
+                .ok_or_else(|| SaltError::PageNotFound(page_id.to_string()))?;
+            let mut meta = read_meta_from_doc(&entry.doc, page_id)?;
+            meta.is_deleted = true;
+            meta.updated_at_utc = now_utc_ms();
+
+            let pre_vv = entry.doc.oplog_vv();
+            write_meta_to_doc(&entry.doc, &meta)?;
+            entry.doc.commit();
+
+            let bytes = entry
+                .doc
+                .export(ExportMode::updates(&pre_vv))
+                .map_err(|e| SaltError::Crdt(e.to_string()))?;
+            self.append_wal(page_id, &bytes)?;
+            entry.dirty_since_export = true;
+            let prev = entry.markdown_file.take();
+            (meta, prev)
+        };
+
+        if let Some(prev) = old_file {
+            if !prev.is_empty() {
+                let _ = fs::remove_file(self.paths.pages_dir().join(prev));
+            }
+        }
+        let fallback_md = format_markdown_filename(&meta);
+        let _ = fs::remove_file(self.paths.pages_dir().join(fallback_md));
+
+        let _ = self.events_tx.send(DocChangeEvent::PageDeleted {
+            page_id: page_id.to_string(),
+        });
+        Ok(())
+    }
+
     /// Appends a stroke into `canvas[canvas_id].strokes` and writes crash-safe WAL.
     pub fn add_stroke(
         &self,
@@ -587,6 +650,37 @@ SaltNote 是一款**永久免费开源、本地优先（Local-First）、零后�
         Ok(())
     }
 
+    /// Updates position/size or tombstone delete state of an existing `CanvasImageNode`.
+    pub fn update_canvas_image_transform(
+        &self,
+        page_id: &str,
+        canvas_id: &str,
+        image_id: &str,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        deleted: bool,
+    ) -> SaltResult<CanvasImageNode> {
+        let snap = self.get_page_snapshot(page_id)?;
+        let mut node = snap
+            .canvases
+            .into_iter()
+            .find(|c| c.canvas_id == canvas_id)
+            .and_then(|c| c.images.into_iter().find(|img| img.image_id == image_id))
+            .ok_or_else(|| {
+                SaltError::InvalidInput(format!("Image {image_id} not found on canvas {canvas_id}"))
+            })?;
+        node.x = x;
+        node.y = y;
+        node.width = width.max(24.0);
+        node.height = height.max(24.0);
+        node.deleted = deleted;
+        node.updated_at_utc = now_utc_ms();
+        self.upsert_canvas_image(page_id, canvas_id, &node)?;
+        Ok(node)
+    }
+
     /// Writes immutable WebP asset into `assets/{sha[:2]}/{sha[:16]}.webp` if not present.
     pub fn store_asset_bytes(&self, rel_path: &str, bytes: &[u8]) -> SaltResult<PathBuf> {
         let abs = self.paths.root.join(rel_path);
@@ -623,7 +717,52 @@ SaltNote 是一款**永久免费开源、本地优先（Local-First）、零后�
         Ok(())
     }
 
-    /// Fuses a Salt Halo crystal's Markdown answer into the page body and marks the halo fused.
+    /// Updates a Salt Halo pin's movable world-space coordinates in CRDT.
+    pub fn update_halo_pin(
+        &self,
+        page_id: &str,
+        halo_id: &str,
+        pin_x: f32,
+        pin_y: f32,
+    ) -> SaltResult<HaloAnnotation> {
+        let snap = self.get_page_snapshot(page_id)?;
+        let mut halo = snap
+            .halos
+            .into_iter()
+            .find(|h| h.halo_id == halo_id)
+            .ok_or_else(|| SaltError::InvalidInput(format!("Halo {halo_id} not found")))?;
+        halo.pin_x = Some(pin_x);
+        halo.pin_y = Some(pin_y);
+        self.upsert_halo(&halo)?;
+        Ok(halo)
+    }
+
+    /// Removes a Salt Halo annotation from the page's CRDT `halos` map so the deletion persists and syncs across devices.
+    pub fn delete_halo(&self, page_id: &str, halo_id: &str) -> SaltResult<()> {
+        let mut pages = self.pages.write();
+        let entry = pages
+            .get_mut(page_id)
+            .ok_or_else(|| SaltError::PageNotFound(page_id.to_string()))?;
+        let pre_vv = entry.doc.oplog_vv();
+
+        let halos = entry.doc.get_map("halos");
+        halos
+            .delete(halo_id)
+            .map_err(|e| SaltError::Crdt(e.to_string()))?;
+        touch_updated_at(&entry.doc)?;
+        entry.doc.commit();
+
+        let bytes = entry
+            .doc
+            .export(ExportMode::updates(&pre_vv))
+            .map_err(|e| SaltError::Crdt(e.to_string()))?;
+        self.append_wal(page_id, &bytes)?;
+        entry.dirty_since_export = true;
+        Ok(())
+    }
+
+    /// Fuses a Salt Halo crystal's answer into the page body using semantic Callout syntax
+    /// (converting glacier flashcard JSON into clean readable Markdown Q/A blocks) and marks the halo fused.
     pub fn fuse_halo_into_body(&self, page_id: &str, halo_id: &str) -> SaltResult<String> {
         let snap = self.get_page_snapshot(page_id)?;
         let mut halo = snap
@@ -632,15 +771,50 @@ SaltNote 是一款**永久免费开源、本地优先（Local-First）、零后�
             .find(|h| h.halo_id == halo_id)
             .ok_or_else(|| SaltError::InvalidInput(format!("Halo {halo_id} not found")))?;
 
-        let fused_block = format!(
-            "\n\n> **Salt Halo ({})**\n>\n{}\n",
-            halo.preset_id,
-            halo.response_markdown
-                .lines()
-                .map(|l| format!("> {l}"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
+        let header = match halo.preset_id.as_str() {
+            "builtin.amber_expand" => "[!salt-amber] 琥珀黄 · 概念扩充".to_string(),
+            "builtin.glacier_card" => "[!salt-glacier] 冰川蓝 · 提炼闪卡".to_string(),
+            "builtin.mineral_ocr" => "[!salt-mineral] 矿石灰 · 笔迹清洗 OCR".to_string(),
+            other => format!("[!salt-amber] Salt Halo ({other})"),
+        };
+
+        let formatted_content = if halo.preset_id == "builtin.glacier_card" {
+            let drafts = parse_flashcard_drafts(&halo.response_markdown);
+            if !drafts.is_empty() {
+                drafts
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| {
+                        format!(
+                            "**Q{}**：{}\n\n**A{}**：{}",
+                            i + 1,
+                            c.front.trim(),
+                            i + 1,
+                            c.back.trim()
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n\n---\n\n")
+            } else {
+                halo.response_markdown.trim().to_string()
+            }
+        } else {
+            halo.response_markdown.trim().to_string()
+        };
+
+        let quoted_body = formatted_content
+            .lines()
+            .map(|l| {
+                if l.trim().is_empty() {
+                    ">".to_string()
+                } else {
+                    format!("> {l}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let fused_block = format!("\n\n> {header}\n>\n{quoted_body}\n");
         let updated_body = format!("{}{}", snap.body_markdown.trim_end(), fused_block);
         self.update_page_body(page_id, &updated_body)?;
 
@@ -683,6 +857,39 @@ SaltNote 是一款**永久免费开源、本地优先（Local-First）、零后�
             cards,
             review_logs: logs,
         });
+        Ok(())
+    }
+
+    /// Updates front/back text of an existing flashcard while preserving its `card_id`, anchor, and FSRS review logs.
+    pub fn update_card(
+        &self,
+        page_id: &str,
+        card_id: &str,
+        front: impl Into<String>,
+        back: impl Into<String>,
+    ) -> SaltResult<FlashCard> {
+        let snap = self.get_page_snapshot(page_id)?;
+        let mut card = snap
+            .cards
+            .into_iter()
+            .find(|c| c.card_id == card_id)
+            .ok_or_else(|| SaltError::InvalidInput(format!("Flashcard {card_id} not found")))?;
+        card.front = front.into();
+        card.back = back.into();
+        self.upsert_card(&card)?;
+        Ok(card)
+    }
+
+    /// Tombstone-deletes (archives) a flashcard inside CRDT so the deletion syncs across devices.
+    pub fn delete_card(&self, page_id: &str, card_id: &str) -> SaltResult<()> {
+        let snap = self.get_page_snapshot(page_id)?;
+        let mut card = snap
+            .cards
+            .into_iter()
+            .find(|c| c.card_id == card_id)
+            .ok_or_else(|| SaltError::InvalidInput(format!("Flashcard {card_id} not found")))?;
+        card.archived = true;
+        self.upsert_card(&card)?;
         Ok(())
     }
 
@@ -730,6 +937,9 @@ SaltNote 是一款**永久免费开源、本地优先（Local-First）、零后�
         let mut out = Vec::with_capacity(pages.len());
         for (page_id, entry) in pages.iter() {
             if let Ok(meta) = read_meta_from_doc(&entry.doc, page_id) {
+                if meta.is_deleted {
+                    continue;
+                }
                 let body = entry.doc.get_text("body").to_string();
                 let snippet: String = body
                     .lines()
@@ -794,7 +1004,12 @@ SaltNote 是一款**永久免费开源、本地优先（Local-First）、零后�
         let pages = self.pages.read();
         let mut all_cards = Vec::new();
         let mut all_logs = Vec::new();
-        for entry in pages.values() {
+        for (page_id, entry) in pages.iter() {
+            if let Ok(meta) = read_meta_from_doc(&entry.doc, page_id) {
+                if meta.is_deleted {
+                    continue;
+                }
+            }
             all_cards.extend(read_cards_from_doc(&entry.doc));
             all_logs.extend(read_review_logs_from_doc(&entry.doc));
         }
@@ -955,6 +1170,93 @@ SaltNote 是一款**永久免费开源、本地优先（Local-First）、零后�
         Ok(packets)
     }
 
+    /// Exports encoded Loro `VersionVector` per page (including tombstones) for P2P V2 diff negotiation.
+    pub fn export_page_version_vectors(&self) -> BTreeMap<String, Vec<u8>> {
+        let pages = self.pages.read();
+        let mut out = BTreeMap::new();
+        for (page_id, entry) in pages.iter() {
+            out.insert(page_id.clone(), entry.doc.oplog_vv().encode());
+        }
+        out
+    }
+
+    /// Exports ONLY missing page snapshots or incremental Loro updates relative to a peer's version vectors.
+    pub fn export_diff_packets_against(
+        &self,
+        remote_vvs: &BTreeMap<String, Vec<u8>>,
+    ) -> SaltResult<Vec<DeltaPacket>> {
+        let dev = self.device_state();
+        let pages = self.pages.read();
+        let mut packets = Vec::new();
+        let mut idx = 0u64;
+
+        for (page_id, entry) in pages.iter() {
+            let local_vv = entry.doc.oplog_vv();
+            let loro_bytes = match remote_vvs
+                .get(page_id)
+                .and_then(|raw| VersionVector::decode(raw).ok())
+            {
+                Some(remote_vv) => {
+                    let has_missing_ops = local_vv
+                        .iter()
+                        .any(|(&peer, &local_cnt)| remote_vv.get(&peer).copied().unwrap_or(0) < local_cnt);
+                    if !has_missing_ops {
+                        continue;
+                    }
+                    entry
+                        .doc
+                        .export(ExportMode::updates(&remote_vv))
+                        .map_err(|e| SaltError::Crdt(e.to_string()))?
+                }
+                None => entry
+                    .doc
+                    .export(ExportMode::Snapshot)
+                    .map_err(|e| SaltError::Crdt(e.to_string()))?,
+            };
+            if loro_bytes.is_empty() {
+                continue;
+            }
+            idx += 1;
+            packets.push(DeltaPacket {
+                page_id: page_id.clone(),
+                device_id: dev.device_id.clone(),
+                seq: dev.last_seq + idx,
+                created_at_utc: now_utc_ms(),
+                loro_bytes,
+            });
+        }
+        Ok(packets)
+    }
+
+    /// Lists all immutable asset relative paths (`assets/xx/xxxx.webp`) without reading file bytes.
+    pub fn list_asset_rel_paths(&self) -> SaltResult<Vec<String>> {
+        let assets_root = self.paths.assets_dir();
+        if !assets_root.exists() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        collect_asset_paths(&assets_root, "assets", &mut out)?;
+        out.sort();
+        Ok(out)
+    }
+
+    /// Reads only the requested immutable asset blobs (skipping unsafe or missing paths).
+    pub fn read_assets_by_paths(&self, rel_paths: &[String]) -> SaltResult<Vec<(String, Vec<u8>)>> {
+        let mut out = Vec::new();
+        for rel in rel_paths {
+            if !rel.starts_with("assets/") || rel.contains("..") {
+                continue;
+            }
+            let full = self.paths.root.join(rel);
+            if full.is_file() {
+                if let Ok(bytes) = fs::read(&full) {
+                    out.push((rel.clone(), bytes));
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Exports all immutable WebP assets under `assets/` for complete P2P synchronization.
     pub fn export_all_assets(&self) -> SaltResult<Vec<(String, Vec<u8>)>> {
         let assets_root = self.paths.assets_dir();
@@ -1001,6 +1303,24 @@ SaltNote 是一款**永久免费开源、本地优先（Local-First）、零后�
         let p = peer_dir.join(fname);
         if !p.exists() {
             atomic_write(&p, payload)?;
+        }
+
+        if meta.is_deleted {
+            if let Some(prev) = old_file.as_deref() {
+                if !prev.is_empty() {
+                    let _ = fs::remove_file(self.paths.pages_dir().join(prev));
+                }
+            }
+            let fallback_md = format_markdown_filename(&meta);
+            let _ = fs::remove_file(self.paths.pages_dir().join(fallback_md));
+            if let Some(entry) = self.pages.write().get_mut(&packet.page_id) {
+                entry.markdown_file = None;
+            }
+            self.bump_sync_revision();
+            let _ = self.events_tx.send(DocChangeEvent::PageDeleted {
+                page_id: packet.page_id.clone(),
+            });
+            return Ok(packet.page_id);
         }
 
         let md_file = self.project_markdown_file(&meta, &body, old_file.as_deref())?;
@@ -1178,11 +1498,15 @@ SaltNote 是一款**永久免费开源、本地优先（Local-First）、零后�
             }
         }
 
-        // Refresh projected markdown filenames for recovered docs
+        // Refresh projected markdown filenames for recovered docs (skip deleted tombstones)
         for (pid, entry) in pages.iter_mut() {
             if let Ok(meta) = read_meta_from_doc(&entry.doc, pid) {
-                let fname = format_markdown_filename(&meta);
-                entry.markdown_file = Some(fname);
+                if meta.is_deleted {
+                    entry.markdown_file = None;
+                } else {
+                    let fname = format_markdown_filename(&meta);
+                    entry.markdown_file = Some(fname);
+                }
             }
         }
         Ok(())
@@ -1232,6 +1556,8 @@ fn write_meta_to_doc(doc: &LoroDoc, meta: &PageMeta) -> SaltResult<()> {
         .map_err(|e| SaltError::Crdt(e.to_string()))?;
     map.insert("updated_at_utc", meta.updated_at_utc)
         .map_err(|e| SaltError::Crdt(e.to_string()))?;
+    map.insert("is_deleted", meta.is_deleted)
+        .map_err(|e| SaltError::Crdt(e.to_string()))?;
     Ok(())
 }
 
@@ -1280,6 +1606,7 @@ fn read_meta_from_doc(doc: &LoroDoc, fallback_id: &str) -> SaltResult<PageMeta> 
         tags,
         created_at_utc: get_i64("created_at_utc"),
         updated_at_utc: get_i64("updated_at_utc"),
+        is_deleted: get_bool("is_deleted"),
     })
 }
 
@@ -1483,6 +1810,19 @@ fn derive_peer_id(device_id: &str) -> u64 {
     if v == 0 { 1 } else { v }
 }
 
+fn is_legacy_default_prompt(preset_id: &str, prompt: &str) -> bool {
+    let p = prompt.trim();
+    match preset_id {
+        "builtin.amber_expand" => p == "You are SaltNote's study assistant. Provide a crisp Markdown explanation, intuitive analogy, and key takeaways for the circled note region. Keep it structured and concise.",
+        "builtin.glacier_card" => p == "Extract 1 to 3 high-value spaced-repetition flashcards from the circled content. Respond ONLY with a JSON array of objects containing {\"front\": \"...\", \"back\": \"...\"}.",
+        "builtin.mineral_ocr" => {
+            p == "Transcribe the handwritten notes, formulas, diagrams, or whiteboard image accurately into clean Markdown. Preserve math expressions clearly in code/LaTeX blocks."
+                || p == "Transcribe the handwritten notes, formulas, diagrams, or whiteboard image accurately into clean Markdown. Render mathematical expressions using standard LaTeX delimiters ($...$ for inline math and $$...$$ on separate lines for display equations) rather than code blocks."
+        }
+        _ => false,
+    }
+}
+
 fn sanitize_router_config(cfg: &RouterConfig) -> RouterConfig {
     let mut sanitized = cfg.clone();
     for p in &mut sanitized.providers {
@@ -1529,6 +1869,24 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> SaltResult<()> {
         // Windows fallback when destination is briefly scanned or already exists
         let _ = fs::remove_file(&unique_tmp);
         fs::write(path, bytes).map_err(|e| SaltError::Io(e.to_string()))?;
+    }
+    Ok(())
+}
+
+fn collect_asset_paths(dir: &Path, prefix: &str, out: &mut Vec<String>) -> SaltResult<()> {
+    for entry in fs::read_dir(dir).map_err(|e| SaltError::Io(e.to_string()))? {
+        let entry = entry.map_err(|e| SaltError::Io(e.to_string()))?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.ends_with(".tmp") {
+            continue;
+        }
+        let rel = format!("{prefix}/{name}");
+        let ty = entry.file_type().map_err(|e| SaltError::Io(e.to_string()))?;
+        if ty.is_dir() {
+            collect_asset_paths(&entry.path(), &rel, out)?;
+        } else {
+            out.push(rel);
+        }
     }
     Ok(())
 }
@@ -1738,6 +2096,182 @@ mod tests {
         assert!(snap.body_markdown.contains("Tablet"));
         assert!(snap.body_markdown.contains("Laptop"));
         assert!(snap.body_markdown.contains("Desktop"));
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn page_tombstone_deletion_syncs_and_does_not_resurrect() {
+        let base = std::env::temp_dir().join(format!("saltnote_del_{}", new_ulid()));
+        let d1 = VaultStore::open(base.join("d1"), Some("Tablet".into())).unwrap();
+        let d2 = VaultStore::open(base.join("d2"), Some("Desktop".into())).unwrap();
+
+        let meta = d1
+            .create_page("Temp Note", PageMode::Study, false, vec!["tag1".into()], "Secret draft")
+            .unwrap();
+        let v2_vvs = d2.export_page_version_vectors();
+        for pkt in d1.export_diff_packets_against(&v2_vvs).unwrap() {
+            d2.import_delta_packet_bytes(&serde_json::to_vec(&pkt).unwrap())
+                .unwrap();
+        }
+        assert_eq!(d2.list_pages().len(), 1);
+
+        // Delete on d1, propagate diff to d2
+        d1.delete_page(&meta.page_id).unwrap();
+        assert!(d1.list_pages().is_empty());
+
+        let v2_vvs_after = d2.export_page_version_vectors();
+        let diff = d1.export_diff_packets_against(&v2_vvs_after).unwrap();
+        assert_eq!(diff.len(), 1);
+        for pkt in diff {
+            d2.import_delta_packet_bytes(&serde_json::to_vec(&pkt).unwrap())
+                .unwrap();
+        }
+        assert!(d2.list_pages().is_empty());
+        // Projected markdown file must also be removed on peer
+        let md_files: Vec<_> = fs::read_dir(d2.paths().pages_dir())
+            .unwrap()
+            .flatten()
+            .collect();
+        assert!(md_files.is_empty());
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn fuse_halo_formats_semantic_callouts_and_glacier_cards_without_raw_json() {
+        let base = std::env::temp_dir().join(format!("saltnote_fuse_{}", new_ulid()));
+        let store = VaultStore::open(&base, Some("Dev".into())).unwrap();
+        let meta = store
+            .create_page("Calculus", PageMode::Study, false, vec![], "# Calculus")
+            .unwrap();
+
+        let glacier = HaloAnnotation {
+            halo_id: "h-glacier".into(),
+            page_id: meta.page_id.clone(),
+            canvas_id: Some("main".into()),
+            preset_id: "builtin.glacier_card".into(),
+            anchor_bbox: None,
+            anchor_text_offset: None,
+            pin_x: None,
+            pin_y: None,
+            slice_cache_path: None,
+            context_excerpt: String::new(),
+            response_markdown: "```json\n[{\"front\":\"$\\\\frac{d}{dx} e^x = ?$\",\"back\":\"$e^x$\"}]\n```".into(),
+            collapsed: false,
+            fused: false,
+            created_at_utc: now_utc_ms(),
+        };
+        store.upsert_halo(&glacier).unwrap();
+        let body = store.fuse_halo_into_body(&meta.page_id, "h-glacier").unwrap();
+        assert!(body.contains("> [!salt-glacier] 冰川蓝 · 提炼闪卡"));
+        assert!(body.contains("> **Q1**："));
+        assert!(body.contains("> **A1**："));
+        assert!(!body.contains("\"front\""));
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn card_update_and_delete_preserve_logs_and_tombstone() {
+        let base = std::env::temp_dir().join(format!("saltnote_cards_{}", new_ulid()));
+        let store = VaultStore::open(&base, Some("Dev".into())).unwrap();
+        let meta = store
+            .create_page("Cards", PageMode::Study, false, vec![], "Body")
+            .unwrap();
+        let card = FlashCard {
+            card_id: "c1".into(),
+            page_id: meta.page_id.clone(),
+            anchor_halo_id: None,
+            front: "Old Q".into(),
+            back: "Old A".into(),
+            created_at_utc: now_utc_ms(),
+            archived: false,
+        };
+        store.upsert_card(&card).unwrap();
+        let updated = store
+            .update_card(&meta.page_id, "c1", "New Q", "New A")
+            .unwrap();
+        assert_eq!(updated.front, "New Q");
+        assert_eq!(updated.back, "New A");
+        assert!(!updated.archived);
+
+        store.delete_card(&meta.page_id, "c1").unwrap();
+        let snap = store.get_page_snapshot(&meta.page_id).unwrap();
+        assert!(snap.cards[0].archived);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn halo_pin_move_image_transform_and_ocr_prompt_migration_work() {
+        let base = std::env::temp_dir().join(format!("saltnote_pin_img_{}", new_ulid()));
+        // Seed legacy v0.1-alpha halo_presets.json before opening
+        let cfg_dir = base.join(".saltnote").join("config");
+        fs::create_dir_all(&cfg_dir).unwrap();
+        let legacy_presets = r##"[
+          {"preset_id":"builtin.amber_expand","name":"Amber","color_hex":"#F5C242","color_argb":4294296130,"vision_policy":"text_short_circuit_if_clean","output_mode":"markdown_expand","system_prompt":"You are SaltNote's study assistant. Provide a crisp Markdown explanation, intuitive analogy, and key takeaways for the circled note region. Keep it structured and concise."},
+          {"preset_id":"builtin.mineral_ocr","name":"OCR","color_hex":"#8D99AE","color_argb":4287470000,"vision_policy":"force_webp_slice","output_mode":"ocr_markdown","system_prompt":"Transcribe the handwritten notes, formulas, diagrams, or whiteboard image accurately into clean Markdown. Preserve math expressions clearly in code/LaTeX blocks."}
+        ]"##;
+        fs::write(cfg_dir.join("halo_presets.json"), legacy_presets).unwrap();
+
+        let store = VaultStore::open(&base, Some("Dev".into())).unwrap();
+        let migrated = store.load_halo_presets().unwrap();
+        let ocr = migrated
+            .iter()
+            .find(|p| p.preset_id == "builtin.mineral_ocr")
+            .unwrap();
+        assert!(ocr.system_prompt.contains("verbatim OCR transcriber"));
+
+        let meta = store
+            .create_page("Canvas Page", PageMode::Journal, false, vec![], "")
+            .unwrap();
+        let halo = HaloAnnotation {
+            halo_id: "h1".into(),
+            page_id: meta.page_id.clone(),
+            canvas_id: Some("main".into()),
+            preset_id: "builtin.amber_expand".into(),
+            anchor_bbox: Some(RectF {
+                min_x: 10.0,
+                min_y: 20.0,
+                max_x: 110.0,
+                max_y: 90.0,
+            }),
+            anchor_text_offset: None,
+            pin_x: Some(110.0),
+            pin_y: Some(20.0),
+            slice_cache_path: None,
+            context_excerpt: String::new(),
+            response_markdown: "Done".into(),
+            collapsed: false,
+            fused: false,
+            created_at_utc: now_utc_ms(),
+        };
+        store.upsert_halo(&halo).unwrap();
+        let moved = store.update_halo_pin(&meta.page_id, "h1", 240.5, 165.0).unwrap();
+        assert_eq!(moved.pin_x, Some(240.5));
+        assert_eq!(moved.pin_y, Some(165.0));
+        store.delete_halo(&meta.page_id, "h1").unwrap();
+        let snap_after_del = store.get_page_snapshot(&meta.page_id).unwrap();
+        assert!(snap_after_del.halos.is_empty());
+
+        let img = CanvasImageNode {
+            image_id: "img1".into(),
+            asset_hash: "abc".into(),
+            asset_rel_path: "assets/ab/abc.webp".into(),
+            x: 50.0,
+            y: 60.0,
+            width: 300.0,
+            height: 200.0,
+            deleted: false,
+            updated_at_utc: now_utc_ms(),
+        };
+        store.upsert_canvas_image(&meta.page_id, "main", &img).unwrap();
+        let tr = store
+            .update_canvas_image_transform(&meta.page_id, "main", "img1", 120.0, 140.0, 450.0, 300.0, false)
+            .unwrap();
+        assert_eq!(tr.x, 120.0);
+        assert_eq!(tr.width, 450.0);
 
         let _ = fs::remove_dir_all(&base);
     }

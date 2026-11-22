@@ -1,7 +1,12 @@
 package com.saltnote.ui.platform
 
+import android.Manifest
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
+import android.content.pm.PackageManager
 import android.graphics.BitmapFactory
+import android.graphics.Canvas as AndroidCanvas
 import android.graphics.DashPathEffect
 import android.graphics.Paint
 import android.graphics.Path
@@ -10,31 +15,76 @@ import android.graphics.PorterDuff
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.SystemClock
+import android.view.Choreographer
 import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
+import androidx.camera.core.CameraSelector
+import androidx.camera.core.ImageAnalysis
+import androidx.camera.core.Preview
+import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.view.PreviewView
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.core.content.ContextCompat
 import androidx.input.motionprediction.MotionEventPredictor
+import androidx.lifecycle.LifecycleOwner
+import com.google.zxing.BarcodeFormat
+import com.google.zxing.BinaryBitmap
+import com.google.zxing.DecodeHintType
+import com.google.zxing.MultiFormatReader
+import com.google.zxing.PlanarYUVLuminanceSource
+import com.google.zxing.common.HybridBinarizer
 import com.saltnote.bridge.StrokeSample
+import com.saltnote.ui.components.StrokeGeometry
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.hypot
 
 object AndroidPlatformContext {
     lateinit var appContext: Context
+    var lifecycleOwner: LifecycleOwner? = null
     var imagePickerBridge: (() -> ByteArray?)? = null
+    var cameraPermissionBridge: (((Boolean) -> Unit) -> Unit)? = null
+    var folderTreePickerBridge: (((android.net.Uri?) -> Unit) -> Unit)? = null
     private var multicastLock: WifiManager.MulticastLock? = null
+
+    fun isInitialized(): Boolean = ::appContext.isInitialized
 
     fun setMulticastLock(enabled: Boolean) {
         if (!::appContext.isInitialized) return
@@ -58,7 +108,49 @@ object AndroidPlatformContext {
     }
 }
 
+private const val SALT_ANDROID_PREFS = "saltnote_android_prefs"
+private const val KEY_LAST_VAULT_DIR = "last_vault_dir"
+
+actual fun systemLanguageTag(): String {
+    if (!AndroidPlatformContext.isInitialized()) return java.util.Locale.getDefault().toLanguageTag()
+    val locale = AndroidPlatformContext.appContext.resources.configuration.locales[0]
+        ?: java.util.Locale.getDefault()
+    return locale.toLanguageTag()
+}
+
+actual fun saveLastVaultDirectory(path: String) {
+    if (!AndroidPlatformContext.isInitialized()) return
+    AndroidPlatformContext.appContext
+        .getSharedPreferences(SALT_ANDROID_PREFS, Context.MODE_PRIVATE)
+        .edit()
+        .putString(KEY_LAST_VAULT_DIR, path.trim())
+        .apply()
+}
+
+private fun isPosixDirWritable(dir: File): Boolean {
+    if (!dir.exists() && !dir.mkdirs()) return false
+    if (!dir.isDirectory) return false
+    return runCatching {
+        val probe = File(dir, ".saltnote_probe_${System.nanoTime()}")
+        probe.writeText("ok")
+        probe.delete()
+        true
+    }.getOrDefault(false)
+}
+
 actual fun defaultVaultDirectory(): String {
+    if (AndroidPlatformContext.isInitialized()) {
+        val saved = AndroidPlatformContext.appContext
+            .getSharedPreferences(SALT_ANDROID_PREFS, Context.MODE_PRIVATE)
+            .getString(KEY_LAST_VAULT_DIR, null)
+            ?.trim()
+        if (!saved.isNullOrBlank()) {
+            val savedDir = File(saved)
+            if (isPosixDirWritable(savedDir)) {
+                return savedDir.absolutePath
+            }
+        }
+    }
     val base = AndroidPlatformContext.appContext.getExternalFilesDir(null)
         ?: AndroidPlatformContext.appContext.filesDir
     return File(base, "SaltNoteVault").apply { mkdirs() }.absolutePath
@@ -76,7 +168,193 @@ actual fun loadImageBitmapFromVault(vaultPath: String, relPath: String): ImageBi
 
 actual fun pickLocalImageBytes(): ByteArray? = AndroidPlatformContext.imagePickerBridge?.invoke()
 
-actual fun pickLocalFolderPath(title: String, initialPath: String): String? = initialPath
+private fun resolvePosixDirectoryFromTreeUri(treeUri: android.net.Uri): File? {
+    val docId = runCatching { android.provider.DocumentsContract.getTreeDocumentId(treeUri) }.getOrNull()
+        ?: return null
+    val parts = docId.split(":", limit = 2)
+    val volume = parts.getOrNull(0).orEmpty()
+    val rel = parts.getOrNull(1).orEmpty().trim('/')
+    return when {
+        volume == "raw" && rel.isNotBlank() -> File("/$rel").let { f -> if (f.exists()) f else File(docId.removePrefix("raw:")) }
+        volume == "primary" -> {
+            val root = android.os.Environment.getExternalStorageDirectory()
+            if (rel.isEmpty()) root else File(root, rel)
+        }
+        volume == "home" -> {
+            val docs = File(android.os.Environment.getExternalStorageDirectory(), "Documents")
+            if (rel.isEmpty()) docs else File(docs, rel)
+        }
+        volume.isNotBlank() -> {
+            val storageCandidate = File("/storage/$volume", rel)
+            if (storageCandidate.exists()) storageCandidate else null
+        }
+        else -> null
+    }
+}
+
+private fun safFallbackVaultDir(treeUri: android.net.Uri): File {
+    val appCtx = AndroidPlatformContext.appContext
+    val docId = runCatching { android.provider.DocumentsContract.getTreeDocumentId(treeUri) }.getOrDefault("Vault")
+    val rawName = docId.substringAfterLast('/').substringAfterLast(':').ifBlank { "Vault" }
+    val safeName = rawName.replace(Regex("[^a-zA-Z0-9._\\-\\u4e00-\\u9fff]"), "_").ifBlank { "Vault" }
+    val vaultsRoot = appCtx.getExternalFilesDir("Vaults") ?: File(appCtx.filesDir, "Vaults")
+    return File(vaultsRoot, safeName).apply { mkdirs() }
+}
+
+private fun findChildDocumentUri(
+    resolver: android.content.ContentResolver,
+    treeUri: android.net.Uri,
+    parentDocUri: android.net.Uri,
+    displayName: String,
+): Pair<android.net.Uri, String>? {
+    val parentDocId = android.provider.DocumentsContract.getDocumentId(parentDocUri)
+    val childrenUri = android.provider.DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, parentDocId)
+    val projection = arrayOf(
+        android.provider.DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+        android.provider.DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+        android.provider.DocumentsContract.Document.COLUMN_MIME_TYPE,
+    )
+    resolver.query(childrenUri, projection, null, null, null)?.use { cursor ->
+        val idCol = cursor.getColumnIndexOrThrow(android.provider.DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+        val nameCol = cursor.getColumnIndexOrThrow(android.provider.DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+        val mimeCol = cursor.getColumnIndexOrThrow(android.provider.DocumentsContract.Document.COLUMN_MIME_TYPE)
+        while (cursor.moveToNext()) {
+            if (cursor.getString(nameCol) == displayName) {
+                val docId = cursor.getString(idCol)
+                val mime = cursor.getString(mimeCol).orEmpty()
+                return android.provider.DocumentsContract.buildDocumentUriUsingTree(treeUri, docId) to mime
+            }
+        }
+    }
+    return null
+}
+
+private fun ensureSafSubdir(
+    resolver: android.content.ContentResolver,
+    treeUri: android.net.Uri,
+    parentDocUri: android.net.Uri,
+    name: String,
+): android.net.Uri {
+    val existing = findChildDocumentUri(resolver, treeUri, parentDocUri, name)
+    if (existing != null && existing.second == android.provider.DocumentsContract.Document.MIME_TYPE_DIR) {
+        return existing.first
+    }
+    return android.provider.DocumentsContract.createDocument(
+        resolver,
+        parentDocUri,
+        android.provider.DocumentsContract.Document.MIME_TYPE_DIR,
+        name,
+    ) ?: error("Failed to create folder: $name")
+}
+
+private fun mimeTypeForExportFile(fileName: String): String {
+    val lower = fileName.lowercase()
+    return when {
+        lower.endsWith(".md") -> "text/markdown"
+        lower.endsWith(".png") -> "image/png"
+        lower.endsWith(".jpg") || lower.endsWith(".jpeg") -> "image/jpeg"
+        lower.endsWith(".webp") -> "image/webp"
+        else -> "application/octet-stream"
+    }
+}
+
+private fun copyDirectoryToSafTree(
+    resolver: android.content.ContentResolver,
+    treeUri: android.net.Uri,
+    targetDirUri: android.net.Uri,
+    srcDir: File,
+) {
+    val children = srcDir.listFiles() ?: return
+    for (child in children) {
+        if (child.isDirectory) {
+            val subUri = ensureSafSubdir(resolver, treeUri, targetDirUri, child.name)
+            copyDirectoryToSafTree(resolver, treeUri, subUri, child)
+        } else if (child.isFile) {
+            val existing = findChildDocumentUri(resolver, treeUri, targetDirUri, child.name)
+            val docUri = if (existing != null && existing.second != android.provider.DocumentsContract.Document.MIME_TYPE_DIR) {
+                existing.first
+            } else {
+                android.provider.DocumentsContract.createDocument(
+                    resolver,
+                    targetDirUri,
+                    mimeTypeForExportFile(child.name),
+                    child.name,
+                ) ?: error("Failed to create file: ${child.name}")
+            }
+            resolver.openOutputStream(docUri, "wt")?.use { out ->
+                child.inputStream().use { inp -> inp.copyTo(out) }
+            } ?: resolver.openOutputStream(docUri, "w")?.use { out ->
+                child.inputStream().use { inp -> inp.copyTo(out) }
+            } ?: error("Failed to open output stream: ${child.name}")
+        }
+    }
+}
+
+actual fun pickVaultDirectory(
+    initialPath: String,
+    strings: com.saltnote.ui.i18n.SaltStrings,
+    onPicked: (String) -> Unit,
+    onMessage: (String) -> Unit,
+) {
+    val bridge = AndroidPlatformContext.folderTreePickerBridge
+    if (bridge == null) {
+        onMessage(strings.vaultSwitchFailedPrefix + "Picker unavailable")
+        return
+    }
+    bridge.invoke { treeUri ->
+        if (treeUri == null) return@invoke
+        runCatching {
+            val flags = android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                android.content.Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+            AndroidPlatformContext.appContext.contentResolver.takePersistableUriPermission(treeUri, flags)
+        }
+        val candidate = resolvePosixDirectoryFromTreeUri(treeUri)
+        val chosenDir = if (candidate != null && isPosixDirWritable(candidate)) {
+            candidate
+        } else {
+            safFallbackVaultDir(treeUri)
+        }
+        saveLastVaultDirectory(chosenDir.absolutePath)
+        onPicked(chosenDir.absolutePath)
+    }
+}
+
+actual fun exportMarkdownBackupWithPicker(
+    client: com.saltnote.bridge.SaltNoteClient,
+    initialPath: String,
+    strings: com.saltnote.ui.i18n.SaltStrings,
+    onResult: (String) -> Unit,
+) {
+    val bridge = AndroidPlatformContext.folderTreePickerBridge
+    if (bridge == null) {
+        onResult("${strings.backupFailedPrefix}Picker unavailable")
+        return
+    }
+    bridge.invoke { treeUri ->
+        if (treeUri == null) return@invoke
+        val appCtx = AndroidPlatformContext.appContext
+        runCatching {
+            val flags = android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                android.content.Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+            appCtx.contentResolver.takePersistableUriPermission(treeUri, flags)
+        }
+        val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
+        Thread {
+            val stagingDir = File(appCtx.cacheDir, "saltnote_md_export_${System.currentTimeMillis()}").apply { mkdirs() }
+            try {
+                val count = client.exportMarkdownBackup(stagingDir.absolutePath)
+                val treeDocId = android.provider.DocumentsContract.getTreeDocumentId(treeUri)
+                val rootDocUri = android.provider.DocumentsContract.buildDocumentUriUsingTree(treeUri, treeDocId)
+                copyDirectoryToSafTree(appCtx.contentResolver, treeUri, rootDocUri, stagingDir)
+                mainHandler.post { onResult("${strings.backupExportedToast} ($count)") }
+            } catch (e: Throwable) {
+                mainHandler.post { onResult("${strings.backupFailedPrefix}${e.message ?: ""}") }
+            } finally {
+                stagingDir.deleteRecursively()
+            }
+        }.start()
+    }
+}
 
 actual fun formatUtcTimestamp(utcMs: Long): String {
     if (utcMs <= 0L) return "-"
@@ -88,28 +366,264 @@ actual fun setLanMulticastLock(enabled: Boolean) {
     AndroidPlatformContext.setMulticastLock(enabled)
 }
 
+actual fun copyTextToClipboard(text: String) {
+    if (!AndroidPlatformContext.isInitialized()) return
+    runCatching {
+        val cm = AndroidPlatformContext.appContext.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+        cm?.setPrimaryClip(ClipData.newPlainText("SaltNote Pairing", text))
+    }
+}
+
+actual fun readTextFromClipboard(): String? {
+    if (!AndroidPlatformContext.isInitialized()) return null
+    return runCatching {
+        val cm = AndroidPlatformContext.appContext.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+        cm?.primaryClip?.getItemAt(0)?.coerceToText(AndroidPlatformContext.appContext)?.toString()
+    }.getOrNull()
+}
+
+actual fun supportsLiveCameraQrScan(): Boolean = true
+
+@Composable
+actual fun PlatformQrScannerDialog(
+    onScanned: (String) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val ctx = AndroidPlatformContext.appContext
+    var hasPermission by remember {
+        mutableStateOf(
+            ContextCompat.checkSelfPermission(ctx, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED,
+        )
+    }
+    var cameraError by remember { mutableStateOf<String?>(null) }
+    val latestOnScanned by rememberUpdatedState(onScanned)
+
+    val strings = com.saltnote.ui.i18n.LocalSaltStrings.current
+    LaunchedEffect(Unit) {
+        if (!hasPermission) {
+            AndroidPlatformContext.cameraPermissionBridge?.invoke { granted ->
+                hasPermission = granted
+                if (!granted) {
+                    cameraError = strings.cameraPermissionMissing
+                }
+            }
+        }
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(strings.cameraScanTitle) },
+        text = {
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                if (hasPermission && AndroidPlatformContext.lifecycleOwner != null) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(280.dp)
+                            .clip(RoundedCornerShape(14.dp)),
+                    ) {
+                        CameraXQrPreview(
+                            lifecycleOwner = AndroidPlatformContext.lifecycleOwner!!,
+                            onQrDecoded = { text -> latestOnScanned(text) },
+                            onCameraError = { err -> cameraError = err },
+                            modifier = Modifier.fillMaxSize(),
+                        )
+                        Surface(
+                            color = Color.Black.copy(alpha = 0.45f),
+                            shape = RoundedCornerShape(12.dp),
+                            modifier = Modifier
+                                .align(Alignment.BottomCenter)
+                                .padding(10.dp),
+                        ) {
+                            Text(
+                                text = strings.cameraScanHint,
+                                style = MaterialTheme.typography.labelMedium,
+                                color = Color.White,
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
+                            )
+                        }
+                    }
+                } else {
+                    Text(
+                        text = cameraError ?: strings.cameraPermissionPrompt,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    if (!hasPermission) {
+                        FilledTonalButton(
+                            onClick = {
+                                AndroidPlatformContext.cameraPermissionBridge?.invoke { granted ->
+                                    hasPermission = granted
+                                }
+                            },
+                        ) { Text(strings.grantCameraPermission) }
+                    }
+                }
+
+                if (cameraError != null && hasPermission) {
+                    Text(
+                        text = cameraError!!,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.End,
+                ) {
+                    TextButton(
+                        onClick = {
+                            val clip = readTextFromClipboard()?.trim()
+                            if (!clip.isNullOrBlank()) {
+                                latestOnScanned(clip)
+                            } else {
+                                cameraError = strings.clipboardNoPairingUri
+                            }
+                        },
+                    ) { Text(strings.pasteFromClipboard) }
+                }
+            }
+        },
+        confirmButton = {
+            Button(onClick = onDismiss) { Text(strings.close) }
+        },
+    )
+}
+
+@Composable
+private fun CameraXQrPreview(
+    lifecycleOwner: LifecycleOwner,
+    onQrDecoded: (String) -> Unit,
+    onCameraError: (String) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val analysisExecutor = remember { Executors.newSingleThreadExecutor() }
+    val delivered = remember { AtomicBoolean(false) }
+    val reader = remember {
+        MultiFormatReader().apply {
+            setHints(mapOf(DecodeHintType.POSSIBLE_FORMATS to listOf(BarcodeFormat.QR_CODE)))
+        }
+    }
+    var cameraProviderRef by remember { mutableStateOf<ProcessCameraProvider?>(null) }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            runCatching { cameraProviderRef?.unbindAll() }
+            analysisExecutor.shutdown()
+        }
+    }
+
+    AndroidView(
+        modifier = modifier,
+        factory = { ctx ->
+            val previewView = PreviewView(ctx).apply {
+                scaleType = PreviewView.ScaleType.FILL_CENTER
+            }
+            val future = ProcessCameraProvider.getInstance(ctx)
+            future.addListener(
+                {
+                    runCatching {
+                        val provider = future.get()
+                        cameraProviderRef = provider
+                        val preview = Preview.Builder().build().also {
+                            it.surfaceProvider = previewView.surfaceProvider
+                        }
+                        val analysis = ImageAnalysis.Builder()
+                            .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                            .build()
+                        analysis.setAnalyzer(analysisExecutor) { imageProxy ->
+                            try {
+                                if (delivered.get()) return@setAnalyzer
+                                val plane = imageProxy.planes.firstOrNull() ?: return@setAnalyzer
+                                val buf = plane.buffer
+                                val w = imageProxy.width
+                                val h = imageProxy.height
+                                val rem = buf.remaining()
+                                val bytes = ByteArray(maxOf(rem, plane.rowStride * h))
+                                buf.get(bytes, 0, rem)
+                                val source = PlanarYUVLuminanceSource(
+                                    bytes,
+                                    plane.rowStride,
+                                    h,
+                                    0,
+                                    0,
+                                    w.coerceAtMost(plane.rowStride),
+                                    h,
+                                    false,
+                                )
+                                val bitmap = BinaryBitmap(HybridBinarizer(source))
+                                val result = runCatching { reader.decodeWithState(bitmap) }.getOrNull()
+                                if (result != null && !result.text.isNullOrBlank()) {
+                                    if (delivered.compareAndSet(false, true)) {
+                                        ContextCompat.getMainExecutor(ctx).execute {
+                                            onQrDecoded(result.text)
+                                        }
+                                    }
+                                }
+                            } finally {
+                                reader.reset()
+                                imageProxy.close()
+                            }
+                        }
+
+                        provider.unbindAll()
+                        provider.bindToLifecycle(
+                            lifecycleOwner,
+                            CameraSelector.DEFAULT_BACK_CAMERA,
+                            preview,
+                            analysis,
+                        )
+                    }.onFailure { err ->
+                        onCameraError("无法启动相机：${err.message}")
+                    }
+                },
+                ContextCompat.getMainExecutor(ctx),
+            )
+            previewView
+        },
+    )
+}
+
+private data class AndroidWetPoint(
+    val x: Float,
+    val y: Float,
+    val pressure: Float,
+)
+
 /**
  * Low-latency Android native wet-ink SurfaceView with:
- * - Hardware palm rejection (`TOOL_TYPE_PALM`, oversized palm contacts, stylus hover & 1200ms stylus guard,
- *   plus explicit `stylusOnlyMode` toggle where fingers pan/scroll and only stylus draws ink)
- * - Hardware stylus eraser support (`TOOL_TYPE_ERASER` / `BUTTON_STYLUS_PRIMARY`)
- * - Parent scroll lock (`requestDisallowInterceptTouchEvent(true)`) so vertical strokes inside inline
- *   document canvases NEVER conflict with vertical page scrolling
- * - Smooth midpoint quadratic-Bezier wet ink matching dry ink 1:1 WYSIWYG
+ * - GPU hardware-accelerated SurfaceView canvas (`lockHardwareCanvas` with software fallback)
+ * - Exact 1:1 `StrokeGeometry` per-segment pressure-modulated quadratic Bezier rendering
+ *   matching Compose dry ink pixel-for-pixel (eliminating width, alpha, and tail jumps!)
+ * - 2-VSync Choreographer-aligned wet-buffer clear after synchronous optimistic dry-ink commit
+ *   (eliminating wet->dry lift blink!)
+ * - Hardware palm rejection & stylus eraser button support
  */
 private class SaltWetInkSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Callback {
     private val predictor: MotionEventPredictor = MotionEventPredictor.newInstance(this)
-    private val wetPath = Path()
+    private val segPath = Path()
+    private val unifiedPath = Path()
     private val wetPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
         strokeCap = Paint.Cap.ROUND
         strokeJoin = Paint.Join.ROUND
     }
+    private val dotPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+    }
     private val collected = ArrayList<StrokeSample>(128)
+    private val wetPoints = ArrayList<AndroidWetPoint>(128)
     private var surfaceReady = false
     private var lastEventTimeMs = 0L
-    private var lastScreenX = 0f
-    private var lastScreenY = 0f
+    private var smoothedPressure: Float? = null
+
+    // VSync-aligned deferred wet-buffer clear so dry ink is composited BEFORE wet clears
+    private var pendingClearFrames = 0
+    private var pendingClearCallback: Choreographer.FrameCallback? = null
 
     // Palm rejection & stylus tracking
     private var lastStylusActivityMs = 0L
@@ -150,6 +664,7 @@ private class SaltWetInkSurfaceView(context: Context) : SurfaceView(context), Su
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) = Unit
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {
+        cancelPendingClear()
         surfaceReady = false
     }
 
@@ -157,7 +672,6 @@ private class SaltWetInkSurfaceView(context: Context) : SurfaceView(context), Su
         val toolType = event.getToolType(0)
         if (toolType == MotionEvent.TOOL_TYPE_STYLUS || toolType == MotionEvent.TOOL_TYPE_ERASER) {
             lastStylusActivityMs = SystemClock.uptimeMillis()
-            // Cancel any stray finger/palm ink that started just before the pen approached the screen
             if (!activeStrokeIsStylus && collected.isNotEmpty()) {
                 abortActiveStroke()
             }
@@ -173,14 +687,12 @@ private class SaltWetInkSurfaceView(context: Context) : SurfaceView(context), Su
     private fun isLikelyPalm(event: MotionEvent, pointerIndex: Int = 0): Boolean {
         val tt = event.getToolType(pointerIndex)
         if (tt == MotionEvent.TOOL_TYPE_STYLUS || tt == MotionEvent.TOOL_TYPE_ERASER) return false
-        // OEM/framework palm tool type (5) or Android 13+ FLAG_CANCELED palm rejection signal
         if (tt == 5) return true
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
             (event.flags and MotionEvent.FLAG_CANCELED) != 0
         ) {
             return true
         }
-        // Reject broad palm/wrist contacts resting on the glass
         if (event.getTouchMajor(pointerIndex) > 48f || event.getSize(pointerIndex) > 0.14f) {
             return true
         }
@@ -190,7 +702,6 @@ private class SaltWetInkSurfaceView(context: Context) : SurfaceView(context), Su
     override fun onTouchEvent(event: MotionEvent): Boolean {
         val action = event.actionMasked
 
-        // Check if any pointer in this event is a stylus
         var stylusIndex = -1
         for (i in 0 until event.pointerCount) {
             if (isStylusTool(event, i)) {
@@ -200,7 +711,6 @@ private class SaltWetInkSurfaceView(context: Context) : SurfaceView(context), Su
             }
         }
 
-        // If stylus touches down while a finger/palm was touching, immediately discard finger/palm stroke
         if (stylusIndex >= 0 && !activeStrokeIsStylus && collected.isNotEmpty()) {
             abortActiveStroke()
         }
@@ -208,26 +718,20 @@ private class SaltWetInkSurfaceView(context: Context) : SurfaceView(context), Su
         val nowMs = SystemClock.uptimeMillis()
         val recentStylusGuard = (nowMs - lastStylusActivityMs) < 1_200L
 
-        // Reject explicit palm touches unconditionally
         if (stylusIndex < 0 && isLikelyPalm(event, 0)) {
             if (action == MotionEvent.ACTION_DOWN) abortActiveStroke()
             return !allowTouchScrollPassThrough
         }
 
-        // Stylus-only mode OR recent stylus hover/write guard for non-stylus touch
         if (stylusIndex < 0) {
-            // Finger touch when stylusOnlyMode is active or palm resting near stylus
             if (stylusOnlyMode || recentStylusGuard) {
                 if (allowTouchScrollPassThrough) {
-                    // Inside inline document canvas: let finger scroll the document cleanly!
                     parent?.requestDisallowInterceptTouchEvent(false)
                     return false
                 }
                 if (recentStylusGuard && event.pointerCount == 1) {
-                    // Resting palm / single accidental finger tap right after pen lift -> ignore completely
                     return true
                 }
-                // On full canvas with stylusOnlyMode: finger smoothly pans & pinch-zooms without leaving marks
                 parent?.requestDisallowInterceptTouchEvent(true)
                 if (event.pointerCount >= 2) {
                     handleTwoFingerPanZoom(event)
@@ -241,7 +745,6 @@ private class SaltWetInkSurfaceView(context: Context) : SurfaceView(context), Su
                 return true
             }
 
-            // Two-finger pinch/zoom/pan when not in stylus-only mode
             if (event.pointerCount >= 2) {
                 if (!allowTouchScrollPassThrough) {
                     parent?.requestDisallowInterceptTouchEvent(true)
@@ -261,7 +764,6 @@ private class SaltWetInkSurfaceView(context: Context) : SurfaceView(context), Su
             }
         }
 
-        // Active drawing / erasing / panning -> lock parent ScrollView so vertical strokes never scroll the page!
         val ptrIdx = if (stylusIndex >= 0) stylusIndex else 0
         val ptrId = event.getPointerId(ptrIdx)
 
@@ -271,13 +773,16 @@ private class SaltWetInkSurfaceView(context: Context) : SurfaceView(context), Su
             parent?.requestDisallowInterceptTouchEvent(false)
         }
 
-        // Support stylus tail eraser or primary stylus button as instant eraser
         val isHardwareEraser = stylusIndex >= 0 && (
             event.getToolType(ptrIdx) == MotionEvent.TOOL_TYPE_ERASER ||
                 (event.buttonState and MotionEvent.BUTTON_STYLUS_PRIMARY) != 0
             )
 
         predictor.record(event)
+
+        if (toolKind == "select") {
+            return false
+        }
 
         if (toolKind == "pan" && !isHardwareEraser) {
             handleSingleFingerPan(event)
@@ -365,17 +870,21 @@ private class SaltWetInkSurfaceView(context: Context) : SurfaceView(context), Su
                 if (activeStrokePointerId != MotionEvent.INVALID_POINTER_ID && activeStrokeIsStylus && !isStylus) {
                     return
                 }
+                // Cancel any deferred clear from previous stroke immediately for rapid writing
+                cancelPendingClear()
                 activeStrokePointerId = ptrId
                 activeStrokeIsStylus = isStylus
                 collected.clear()
-                wetPath.reset()
-                val sx = event.getX(ptrIdx)
-                val sy = event.getY(ptrIdx)
-                wetPath.moveTo(sx, sy)
-                lastScreenX = sx
-                lastScreenY = sy
+                wetPoints.clear()
+                smoothedPressure = null
                 lastEventTimeMs = event.eventTime
-                appendWorldSample(sx, sy, event.getPressure(ptrIdx), 0)
+                appendSampleIfAccepted(
+                    screenX = event.getX(ptrIdx),
+                    screenY = event.getY(ptrIdx),
+                    rawPressure = normalizeAndroidPressure(event.getPressure(ptrIdx), isStylus),
+                    dtMs = 0,
+                    forceAccept = true,
+                )
                 renderWetInk(predicted = null)
             }
             MotionEvent.ACTION_MOVE -> {
@@ -384,19 +893,18 @@ private class SaltWetInkSurfaceView(context: Context) : SurfaceView(context), Su
                 for (h in 0 until event.historySize) {
                     val hx = event.getHistoricalX(trackedIdx, h)
                     val hy = event.getHistoricalY(trackedIdx, h)
-                    val hp = event.getHistoricalPressure(trackedIdx, h)
+                    val hp = normalizeAndroidPressure(event.getHistoricalPressure(trackedIdx, h), activeStrokeIsStylus)
                     val ht = event.getHistoricalEventTime(h)
                     val dt = (ht - lastEventTimeMs).coerceAtLeast(1L).toInt()
                     lastEventTimeMs = ht
-                    addSmoothWetSegment(hx, hy)
-                    appendWorldSample(hx, hy, hp, dt)
+                    appendSampleIfAccepted(hx, hy, hp, dt)
                 }
                 val sx = event.getX(trackedIdx)
                 val sy = event.getY(trackedIdx)
+                val sp = normalizeAndroidPressure(event.getPressure(trackedIdx), activeStrokeIsStylus)
                 val dt = (event.eventTime - lastEventTimeMs).coerceAtLeast(1L).toInt()
                 lastEventTimeMs = event.eventTime
-                addSmoothWetSegment(sx, sy)
-                appendWorldSample(sx, sy, event.getPressure(trackedIdx), dt)
+                appendSampleIfAccepted(sx, sy, sp, dt)
 
                 val predicted = predictor.predict()
                 renderWetInk(predicted)
@@ -410,12 +918,31 @@ private class SaltWetInkSurfaceView(context: Context) : SurfaceView(context), Su
                 val trackedIdx = event.findPointerIndex(activeStrokePointerId).takeIf { it >= 0 } ?: ptrIdx
                 val sx = event.getX(trackedIdx)
                 val sy = event.getY(trackedIdx)
+                val sp = normalizeAndroidPressure(event.getPressure(trackedIdx), activeStrokeIsStylus)
                 val dt = (event.eventTime - lastEventTimeMs).coerceAtLeast(1L).toInt()
-                appendWorldSample(sx, sy, event.getPressure(trackedIdx), dt)
+                appendSampleIfAccepted(sx, sy, sp, dt)
+
+                // Re-render final locked contour (without predicted tail) BEFORE optimistic dry-ink commit
+                renderWetInk(predicted = null)
                 val finished = ArrayList(collected)
-                abortActiveStroke()
+
+                activeStrokePointerId = MotionEvent.INVALID_POINTER_ID
+                activeStrokeIsStylus = false
+                collected.clear()
+                wetPoints.clear()
+                smoothedPressure = null
+
                 if (finished.isNotEmpty()) {
+                    // Synchronously commit optimistic dry stroke into Compose state
                     onStrokeCompleted?.invoke(finished)
+                    // Clear wet SurfaceView AFTER 2 VSync frames so Compose has already composited dry ink
+                    if (StrokeGeometry.isHalo(toolKind)) {
+                        clearWetBuffer()
+                    } else {
+                        scheduleClearWetBufferAfterVSync()
+                    }
+                } else {
+                    clearWetBuffer()
                 }
             }
             MotionEvent.ACTION_CANCEL -> {
@@ -424,48 +951,147 @@ private class SaltWetInkSurfaceView(context: Context) : SurfaceView(context), Su
         }
     }
 
-    private fun addSmoothWetSegment(x: Float, y: Float) {
-        val midX = (lastScreenX + x) * 0.5f
-        val midY = (lastScreenY + y) * 0.5f
-        wetPath.quadTo(lastScreenX, lastScreenY, midX, midY)
-        lastScreenX = x
-        lastScreenY = y
+    private fun normalizeAndroidPressure(raw: Float, isStylus: Boolean): Float {
+        if (!isStylus && (raw <= 0.01f || raw >= 0.99f)) {
+            return 0.65f
+        }
+        return raw.coerceIn(StrokeGeometry.PRESSURE_MIN, StrokeGeometry.PRESSURE_MAX)
     }
 
-    private fun abortActiveStroke() {
-        activeStrokePointerId = MotionEvent.INVALID_POINTER_ID
-        activeStrokeIsStylus = false
-        collected.clear()
-        wetPath.reset()
-        clearWetBuffer()
-    }
-
-    private fun appendWorldSample(screenX: Float, screenY: Float, pressure: Float, dtMs: Int) {
+    private fun appendSampleIfAccepted(
+        screenX: Float,
+        screenY: Float,
+        rawPressure: Float,
+        dtMs: Int,
+        forceAccept: Boolean = false,
+    ): Boolean {
         val wx = (screenX - panX) / zoom
         val wy = (screenY - panY) / zoom
         val last = collected.lastOrNull()
-        if (last != null) {
+        if (!forceAccept && last != null) {
             val d = hypot((wx - last.x).toDouble(), (wy - last.y).toDouble())
-            if (d < 0.35) return
+            if (d < 0.35) return false
         }
-        collected.add(StrokeSample(wx, wy, pressure.coerceIn(0.1f, 1.0f), dtMs))
+        val smoothP = StrokeGeometry.smoothPressure(smoothedPressure, rawPressure)
+        smoothedPressure = smoothP
+        collected.add(StrokeSample(wx, wy, smoothP, dtMs))
+        wetPoints.add(AndroidWetPoint(screenX, screenY, smoothP))
+        return true
     }
+
+    private fun cancelPendingClear() {
+        pendingClearCallback?.let { cb ->
+            Choreographer.getInstance().removeFrameCallback(cb)
+        }
+        pendingClearCallback = null
+        pendingClearFrames = 0
+    }
+
+    private fun scheduleClearWetBufferAfterVSync() {
+        cancelPendingClear()
+        pendingClearFrames = 2
+        val cb = object : Choreographer.FrameCallback {
+            override fun doFrame(frameTimeNanos: Long) {
+                if (activeStrokePointerId != MotionEvent.INVALID_POINTER_ID) {
+                    pendingClearCallback = null
+                    return
+                }
+                pendingClearFrames--
+                if (pendingClearFrames <= 0) {
+                    pendingClearCallback = null
+                    clearWetBuffer()
+                } else {
+                    Choreographer.getInstance().postFrameCallback(this)
+                }
+            }
+        }
+        pendingClearCallback = cb
+        Choreographer.getInstance().postFrameCallback(cb)
+    }
+
+    private fun abortActiveStroke() {
+        cancelPendingClear()
+        activeStrokePointerId = MotionEvent.INVALID_POINTER_ID
+        activeStrokeIsStylus = false
+        collected.clear()
+        wetPoints.clear()
+        smoothedPressure = null
+        clearWetBuffer()
+    }
+
+    private fun lockFastCanvas(): AndroidCanvas? =
+        runCatching { holder.lockHardwareCanvas() }.getOrNull() ?: holder.lockCanvas()
 
     private fun renderWetInk(predicted: MotionEvent?) {
         if (!surfaceReady) return
-        val canvas = holder.lockCanvas() ?: return
+        val canvas = lockFastCanvas() ?: return
         try {
             canvas.drawColor(0, PorterDuff.Mode.CLEAR)
-            val isHighlighter = toolKind == "highlighter"
-            val isHalo = toolKind.startsWith("halo_")
+            val count = wetPoints.size
+            if (count == 0) return
+
+            val isHighlighter = StrokeGeometry.isHighlighter(toolKind)
+            val isHalo = StrokeGeometry.isHalo(toolKind)
+            val effectiveAlpha = if (isHighlighter) StrokeGeometry.HIGHLIGHTER_ALPHA_INT else 255
+
+            if (count == 1) {
+                val p0 = wetPoints[0]
+                dotPaint.color = strokeColorArgb
+                dotPaint.alpha = effectiveAlpha
+                val r = StrokeGeometry.dotRadius(toolKind, strokeWidthPx, p0.pressure) * zoom
+                canvas.drawCircle(p0.x, p0.y, r, dotPaint)
+                return
+            }
+
             wetPaint.color = strokeColorArgb
-            wetPaint.alpha = if (isHighlighter) 96 else 255
-            wetPaint.strokeWidth = (strokeWidthPx * zoom * if (isHighlighter) 3f else 1f).coerceAtLeast(1.5f)
+            wetPaint.alpha = effectiveAlpha
             wetPaint.pathEffect = if (isHalo) DashPathEffect(floatArrayOf(18f, 12f), 0f) else null
 
-            canvas.drawPath(wetPath, wetPaint)
+            if (isHighlighter || isHalo) {
+                unifiedPath.reset()
+                unifiedPath.moveTo(wetPoints[0].x, wetPoints[0].y)
+                if (count == 2) {
+                    unifiedPath.lineTo(wetPoints[1].x, wetPoints[1].y)
+                } else {
+                    for (i in 1 until count - 1) {
+                        val cur = wetPoints[i]
+                        val next = wetPoints[i + 1]
+                        unifiedPath.quadTo(cur.x, cur.y, (cur.x + next.x) * 0.5f, (cur.y + next.y) * 0.5f)
+                    }
+                    val last = wetPoints[count - 1]
+                    unifiedPath.lineTo(last.x, last.y)
+                }
+                wetPaint.strokeWidth = StrokeGeometry.worldWidth(toolKind, strokeWidthPx, 0.65f) * zoom
+                canvas.drawPath(unifiedPath, wetPaint)
+            } else {
+                // Exact 1:1 midpoint quadratic-Bezier per-segment pressure rendering matching StrokeRenderer.kt
+                var prevMidX = wetPoints[0].x
+                var prevMidY = wetPoints[0].y
+                for (i in 1 until count) {
+                    val prev = wetPoints[i - 1]
+                    val cur = wetPoints[i]
+                    val midX = if (i == count - 1) cur.x else (prev.x + cur.x) * 0.5f
+                    val midY = if (i == count - 1) cur.y else (prev.y + cur.y) * 0.5f
+                    val avgP = (prev.pressure + cur.pressure) * 0.5f
+                    wetPaint.strokeWidth = StrokeGeometry.worldWidth(toolKind, strokeWidthPx, avgP) * zoom
+
+                    segPath.reset()
+                    segPath.moveTo(prevMidX, prevMidY)
+                    segPath.quadTo(prev.x, prev.y, midX, midY)
+                    canvas.drawPath(segPath, wetPaint)
+                    prevMidX = midX
+                    prevMidY = midY
+                }
+            }
+
             if (predicted != null && predicted.pointerCount > 0) {
-                canvas.drawLine(lastScreenX, lastScreenY, predicted.x, predicted.y, wetPaint)
+                val last = wetPoints[count - 1]
+                val predDist = hypot((predicted.x - last.x).toDouble(), (predicted.y - last.y).toDouble())
+                // Cap prediction tail to prevent sharp-corner overshoot jumps
+                if (predDist in 1.0..36.0) {
+                    wetPaint.strokeWidth = StrokeGeometry.worldWidth(toolKind, strokeWidthPx, last.pressure) * zoom
+                    canvas.drawLine(last.x, last.y, predicted.x, predicted.y, wetPaint)
+                }
             }
         } finally {
             holder.unlockCanvasAndPost(canvas)
@@ -474,7 +1100,7 @@ private class SaltWetInkSurfaceView(context: Context) : SurfaceView(context), Su
 
     private fun clearWetBuffer() {
         if (!surfaceReady) return
-        val canvas = holder.lockCanvas() ?: return
+        val canvas = lockFastCanvas() ?: return
         try {
             canvas.drawColor(0, PorterDuff.Mode.CLEAR)
         } finally {

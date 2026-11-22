@@ -1,5 +1,6 @@
 package com.saltnote.android
 
+import android.Manifest
 import android.net.Uri
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -16,6 +17,22 @@ import com.saltnote.ui.state.SaltAppState
 
 class MainActivity : ComponentActivity() {
     private var appState: SaltAppState? = null
+    private var pendingCameraPermissionCallback: ((Boolean) -> Unit)? = null
+    private var pendingFolderTreeCallback: ((Uri?) -> Unit)? = null
+
+    private val cameraPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            val cb = pendingCameraPermissionCallback
+            pendingCameraPermissionCallback = null
+            cb?.invoke(granted)
+        }
+
+    private val folderTreePickerLauncher =
+        registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri: Uri? ->
+            val cb = pendingFolderTreeCallback
+            pendingFolderTreeCallback = null
+            cb?.invoke(uri)
+        }
 
     private val imagePickerLauncher =
         registerForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
@@ -33,11 +50,20 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         AndroidPlatformContext.appContext = applicationContext
+        AndroidPlatformContext.lifecycleOwner = this
         AndroidPlatformContext.imagePickerBridge = {
             imagePickerLauncher.launch("image/*")
             null
         }
+        AndroidPlatformContext.cameraPermissionBridge = { onResult ->
+            pendingCameraPermissionCallback = onResult
+            cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
+        }
 
+        AndroidPlatformContext.folderTreePickerBridge = { onResult ->
+            pendingFolderTreeCallback = onResult
+            folderTreePickerLauncher.launch(null)
+        }
         val vaultPath = defaultVaultDirectory()
         val deviceName = defaultDeviceName()
         val client = openSaltNoteClient(

@@ -12,6 +12,7 @@ data class PageMetaDto(
     val tags: List<String> = emptyList(),
     @SerialName("created_at_utc") val createdAtUtc: Long = 0L,
     @SerialName("updated_at_utc") val updatedAtUtc: Long = 0L,
+    @SerialName("is_deleted") val isDeleted: Boolean = false,
 )
 
 @Serializable
@@ -125,6 +126,8 @@ data class HaloAnnotationDto(
     @SerialName("preset_id") val presetId: String,
     @SerialName("anchor_bbox") val anchorBbox: RectFDto? = null,
     @SerialName("anchor_text_offset") val anchorTextOffset: Int? = null,
+    @SerialName("pin_x") val pinX: Float? = null,
+    @SerialName("pin_y") val pinY: Float? = null,
     @SerialName("slice_cache_path") val sliceCachePath: String? = null,
     @SerialName("context_excerpt") val contextExcerpt: String = "",
     @SerialName("response_markdown") val responseMarkdown: String = "",
@@ -189,6 +192,8 @@ data class ProviderConfigDto(
 data class RouterConfigDto(
     @SerialName("default_text_provider") val defaultTextProvider: String,
     @SerialName("default_vision_provider") val defaultVisionProvider: String,
+    @SerialName("ui_language") val uiLanguage: String = "system",
+    @SerialName("ai_output_language") val aiOutputLanguage: String = "follow_ui",
     val providers: List<ProviderConfigDto>,
 )
 

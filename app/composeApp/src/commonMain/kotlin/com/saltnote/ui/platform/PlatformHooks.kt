@@ -8,14 +8,43 @@ import com.saltnote.bridge.StrokeSample
 
 expect fun defaultVaultDirectory(): String
 expect fun defaultDeviceName(): String
+expect fun systemLanguageTag(): String
+expect fun saveLastVaultDirectory(path: String)
 expect fun loadImageBitmapFromVault(vaultPath: String, relPath: String): ImageBitmap?
 expect fun pickLocalImageBytes(): ByteArray?
-expect fun pickLocalFolderPath(title: String, initialPath: String): String?
+expect fun pickVaultDirectory(
+    initialPath: String,
+    strings: com.saltnote.ui.i18n.SaltStrings,
+    onPicked: (String) -> Unit,
+    onMessage: (String) -> Unit,
+)
+expect fun exportMarkdownBackupWithPicker(
+    client: com.saltnote.bridge.SaltNoteClient,
+    initialPath: String,
+    strings: com.saltnote.ui.i18n.SaltStrings,
+    onResult: (String) -> Unit,
+)
 expect fun formatUtcTimestamp(utcMs: Long): String
 expect fun setLanMulticastLock(enabled: Boolean)
 
+expect fun copyTextToClipboard(text: String)
+expect fun readTextFromClipboard(): String?
+expect fun supportsLiveCameraQrScan(): Boolean
+
 /**
- * Platform-specialized low-latency wet-ink input overlay with hardware palm rejection
+ * Cross-platform QR pairing scanner dialog:
+ * - Android: Live CameraX + ZXing offline QR scanner with runtime CAMERA permission request.
+ * - Desktop: Decode QR code from a local image file or paste pairing URI from clipboard.
+ */
+@Composable
+expect fun PlatformQrScannerDialog(
+    onScanned: (String) -> Unit,
+    onDismiss: () -> Unit,
+)
+
+/**
+ * Platform-specialized low-latency wet-ink input overlay with hardware palm rejection,
+ * unified `StrokeGeometry` WYSIWYG rendering, VSync-aligned zero-blink handoff,
  * and scroll-conflict prevention for both full-page canvas and inline document canvas blocks.
  */
 @Composable

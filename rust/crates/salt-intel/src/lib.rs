@@ -76,6 +76,13 @@ impl IntelEngine {
 
     /// Rebuilds the entire local FTS5 index and FSRS derived state from `VaultStore`.
     pub fn rebuild_from_vault(&self, vault: &VaultStore) -> SaltResult<()> {
+        {
+            let conn = self.conn.lock();
+            conn.execute_batch(
+                "DELETE FROM pages_meta; DELETE FROM pages_fts; DELETE FROM fsrs_card_state;",
+            )
+            .map_err(|e| SaltError::Database(e.to_string()))?;
+        }
         for summary in vault.list_pages() {
             if let Ok(snap) = vault.get_page_snapshot(&summary.meta.page_id) {
                 self.index_page(&snap.meta, &snap.body_markdown)?;
@@ -83,6 +90,21 @@ impl IntelEngine {
         }
         let (cards, logs) = vault.get_all_cards_and_logs();
         self.replay_and_store_fsrs(&cards, &logs)?;
+        Ok(())
+    }
+
+    /// Removes a deleted page from FTS5 search index and removes its flashcards from FSRS state.
+    pub fn remove_page(&self, page_id: &str) -> SaltResult<()> {
+        let conn = self.conn.lock();
+        conn.execute("DELETE FROM pages_meta WHERE page_id = ?1", params![page_id])
+            .map_err(|e| SaltError::Database(e.to_string()))?;
+        conn.execute("DELETE FROM pages_fts WHERE page_id = ?1", params![page_id])
+            .map_err(|e| SaltError::Database(e.to_string()))?;
+        conn.execute(
+            "DELETE FROM fsrs_card_state WHERE page_id = ?1",
+            params![page_id],
+        )
+        .map_err(|e| SaltError::Database(e.to_string()))?;
         Ok(())
     }
 
@@ -99,6 +121,9 @@ impl IntelEngine {
                         ..
                     }) => {
                         let _ = engine.index_page(&meta, &body_markdown);
+                    }
+                    Ok(DocChangeEvent::PageDeleted { page_id }) => {
+                        let _ = engine.remove_page(&page_id);
                     }
                     Ok(DocChangeEvent::CardsUpdated {
                         cards,
@@ -644,6 +669,7 @@ mod tests {
             tags: vec!["物理".into(), "SaltNote".into()],
             created_at_utc: 1,
             updated_at_utc: 1,
+            is_deleted: false,
         };
         engine
             .index_page(&meta, "薛定谔方程描述了波函数随时间的演化，属于 Quantum Mechanics 核心。支持 #private 隐私模式。")
@@ -663,6 +689,10 @@ mod tests {
         assert_eq!(engine.search("Note", 10).unwrap().len(), 1);
         assert_eq!(engine.search("#private", 10).unwrap().len(), 1);
         assert_eq!(engine.search("物理", 10).unwrap().len(), 1);
+
+        // Removing the page clears FTS5 search results immediately
+        engine.remove_page("p1").unwrap();
+        assert!(engine.search("量子", 10).unwrap().is_empty());
 
         let _ = std::fs::remove_file(&tmp);
     }

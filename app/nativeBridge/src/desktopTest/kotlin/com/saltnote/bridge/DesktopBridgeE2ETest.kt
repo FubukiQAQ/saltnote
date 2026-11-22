@@ -63,13 +63,32 @@ class DesktopBridgeE2ETest {
             assertTrue(client.searchNotes("双模记录", 10).any { it.pageId == welcome.pageId })
             assertTrue(client.searchNotes("#private", 10).any { it.pageId == welcome.pageId })
 
-            // 4. FSRS card create & review
+            // 4. FSRS card create, review, edit & tombstone delete
             val card = client.createFlashcard(welcome.pageId, null, "Loro CRDT 作用？", "多端离线无冲突协同")
             assertTrue(client.listDueCards().any { it.cardId == card.cardId })
             val afterReview = client.submitCardReview(welcome.pageId, card.cardId, 3, 2200)
             assertEquals(1, afterReview.reps)
+            val updatedCard = client.updateFlashcard(welcome.pageId, card.cardId, "Loro CRDT 优势？", "零冲突离线合并")
+            assertEquals("Loro CRDT 优势？", updatedCard.front)
+            assertTrue(client.listAllCards().any { it.cardId == card.cardId && it.front == "Loro CRDT 优势？" && it.reps == 1 })
+            client.deleteFlashcard(welcome.pageId, card.cardId)
+            assertFalse(client.listAllCards().any { it.cardId == card.cardId })
 
-            // 5. #private page hard-blocks cloud provider across UniFFI boundary
+            // 4b. Page creation, tag update & tombstone deletion
+            val tempNote = client.createPage("待删临时页", "study", false, listOf("临时"), "临时正文")
+            assertTrue(client.listPages().any { it.meta.pageId == tempNote.pageId })
+            client.deletePage(tempNote.pageId)
+            assertFalse(client.listPages().any { it.meta.pageId == tempNote.pageId })
+            assertTrue(client.searchNotes("临时正文", 10).isEmpty())
+
+            // 5. #private page hard-blocks cloud provider across UniFFI boundary + RouterConfig language persistence
+            val rcfg = client.getRouterConfig()
+            val updatedCfg = rcfg.copy(uiLanguage = "en", aiOutputLanguage = "ja")
+            client.saveRouterConfig(updatedCfg)
+            val reloadedCfg = client.getRouterConfig()
+            assertEquals("en", reloadedCfg.uiLanguage)
+            assertEquals("ja", reloadedCfg.aiOutputLanguage)
+
             client.updatePageMeta(welcome.pageId, isPrivate = true)
             assertThrows(Exception::class.java) {
                 client.triggerTextHalo(
@@ -78,6 +97,7 @@ class DesktopBridgeE2ETest {
                     anchorOffset = 0,
                     selectedText = "private text",
                     providerId = "openai-byok",
+                    outputLanguageHint = "zh-CN",
                     listener = object : HaloStreamListener {
                         override fun onDelta(chunk: String) = Unit
                         override fun onComplete(fullMarkdown: String, halo: HaloAnnotationDto?) = Unit

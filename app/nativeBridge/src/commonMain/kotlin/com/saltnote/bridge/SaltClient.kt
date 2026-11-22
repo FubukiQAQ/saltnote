@@ -47,6 +47,7 @@ interface SaltNoteClient {
     ): PageMetaDto
 
     fun updatePageBody(pageId: String, markdown: String)
+    fun deletePage(pageId: String)
     fun flushDeltas(): Int
     fun exportMarkdownBackup(targetDir: String): Int
 
@@ -92,7 +93,18 @@ interface SaltNoteClient {
         rawImageBytes: ByteArray,
         x: Float,
         y: Float,
-        maxWidth: Float = 420f,
+        maxWidth: Float = 360f,
+    ): CanvasImageNodeDto
+
+    fun updateCanvasImageTransform(
+        pageId: String,
+        canvasId: String,
+        imageId: String,
+        x: Float,
+        y: Float,
+        width: Float,
+        height: Float,
+        deleted: Boolean = false,
     ): CanvasImageNodeDto
 
     fun getHaloPresets(): List<HaloPresetDto>
@@ -102,6 +114,7 @@ interface SaltNoteClient {
         presetId: String,
         lassoPoints: List<StrokeSample>,
         providerId: String?,
+        outputLanguageHint: String? = null,
         listener: HaloStreamListener,
     ): CancelHandle
 
@@ -111,11 +124,15 @@ interface SaltNoteClient {
         anchorOffset: Int,
         selectedText: String,
         providerId: String?,
+        outputLanguageHint: String? = null,
         listener: HaloStreamListener,
     ): CancelHandle
 
+    fun updateHaloPin(pageId: String, haloId: String, pinX: Float, pinY: Float): HaloAnnotationDto
+
     fun fuseHaloIntoBody(pageId: String, haloId: String): String
     fun toggleHaloCollapsed(pageId: String, haloId: String, collapsed: Boolean)
+    fun deleteHalo(pageId: String, haloId: String)
     fun parseFlashcardDrafts(rawOutput: String): List<FlashcardDraftDto>
 
     fun getRouterConfig(): RouterConfigDto
@@ -129,6 +146,15 @@ interface SaltNoteClient {
         front: String,
         back: String,
     ): FlashCardDto
+
+    fun updateFlashcard(
+        pageId: String,
+        cardId: String,
+        front: String,
+        back: String,
+    ): FlashCardDto
+
+    fun deleteFlashcard(pageId: String, cardId: String)
 
     fun listDueCards(): List<FsrsCardStateDto>
     fun listAllCards(): List<FsrsCardStateDto>

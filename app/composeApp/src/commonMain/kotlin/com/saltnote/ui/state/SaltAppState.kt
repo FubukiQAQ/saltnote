@@ -25,7 +25,16 @@ import com.saltnote.bridge.StrokeSample
 import com.saltnote.bridge.SyncReportDto
 import com.saltnote.bridge.WebDavConfigDto
 import com.saltnote.bridge.openSaltNoteClient
+import com.saltnote.ui.components.LanPairingCodec
+import com.saltnote.ui.components.StrokeGeometry
+import com.saltnote.ui.i18n.AppLanguage
+import com.saltnote.ui.i18n.SaltStrings
+import com.saltnote.ui.i18n.resolveAiOutputLanguageCode
+import com.saltnote.ui.i18n.resolveAppLanguage
+import com.saltnote.ui.i18n.stringsFor
+import com.saltnote.ui.platform.saveLastVaultDirectory
 import com.saltnote.ui.platform.setLanMulticastLock
+import com.saltnote.ui.platform.systemLanguageTag
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -79,17 +88,33 @@ class SaltAppState(
     var snackbarMessage by mutableStateOf<String?>(null)
     var deviceState by mutableStateOf(DeviceStateDto())
 
+    // Multi-language settings
+    var uiLanguage by mutableStateOf("system")
+    var aiOutputLanguage by mutableStateOf("follow_ui")
+
+    val activeAppLanguage: AppLanguage
+        get() = resolveAppLanguage(uiLanguage, systemLanguageTag())
+
+    val strings: SaltStrings
+        get() = stringsFor(activeAppLanguage)
+
+    val effectiveAiLanguageCode: String
+        get() = resolveAiOutputLanguageCode(aiOutputLanguage, uiLanguage, systemLanguageTag())
+
     // Notes & Search
     val pages = mutableStateListOf<PageSummaryDto>()
     var activePage by mutableStateOf<PageSnapshotDto?>(null)
     var editableBody by mutableStateOf("")
     var modeFilter by mutableStateOf<String?>(null)
+    var tagFilter by mutableStateOf<String?>(null)
     var searchQuery by mutableStateOf("")
     val searchHits = mutableStateListOf<SearchHitDto>()
+    private var optimisticStrokeSeq: Long = 0L
 
     // Canvas State
     var activeCanvasId by mutableStateOf("main")
     var selectedTool by mutableStateOf("pen")
+    var selectedImageId by mutableStateOf<String?>(null)
     var inkColor by mutableStateOf(Color(0xFF191C1E))
     var strokeWidth by mutableStateOf(3.2f)
     var stylusOnlyMode by mutableStateOf(false)
@@ -162,7 +187,7 @@ class SaltAppState(
                     syncUiVersion = rev
                     refreshAll()
                     activePage?.meta?.pageId?.let { reloadCurrentPageInPlace(it) }
-                    showToast("已收到局域网同步更新")
+                    showToast(strings.lanIncomingSyncToast)
                 }
                 delay(1_800L)
             }
@@ -203,13 +228,15 @@ class SaltAppState(
                     openSaltNoteClient(newVaultPath, deviceName, client.secretVault)
                 }
             }.onSuccess { newClient ->
+                saveLastVaultDirectory(newVaultPath)
                 client = newClient
                 activePage = null
+                selectedImageId = null
                 activeCrystal = null
                 bootstrapVault(checkOnboarding = false)
-                showToast("已切换笔记目录")
+                showToast(strings.vaultSwitchedToast)
             }.onFailure { err ->
-                showToast("切换目录失败：${err.message}")
+                showToast("${strings.vaultSwitchFailedPrefix}${err.message}")
             }
         }
     }
@@ -235,7 +262,12 @@ class SaltAppState(
                 dueCards.addAll(second.first)
                 allCards.clear()
                 allCards.addAll(second.second)
-                routerConfig = second.third
+                val rcfg = second.third
+                routerConfig = rcfg
+                if (rcfg != null) {
+                    uiLanguage = rcfg.uiLanguage.ifBlank { "system" }
+                    aiOutputLanguage = rcfg.aiOutputLanguage.ifBlank { "follow_ui" }
+                }
                 webDavConfig = dav
             }
         }
@@ -277,6 +309,8 @@ class SaltAppState(
             activePage = snap
             editableBody = snap.bodyMarkdown
             activeCanvasId = "main"
+            selectedImageId = null
+            if (selectedTool == "select") selectedTool = "pen"
             editorMode = if (snap.meta.mode == "journal") EditorViewMode.Canvas else EditorViewMode.Document
             reloadCanvasStrokes()
 
@@ -289,21 +323,95 @@ class SaltAppState(
         }
     }
 
-    fun createNewPage(title: String, mode: String, isPrivate: Boolean) {
+    fun createNewPage(
+        title: String,
+        mode: String,
+        isPrivate: Boolean,
+        customTags: List<String> = emptyList(),
+    ) {
         scope.launch {
             flushPendingBodyImmediately()
+            val cleanedTags = customTags.map { it.trim().removePrefix("#") }.filter { it.isNotEmpty() }.distinct()
+            val finalTags = if (cleanedTags.isNotEmpty()) {
+                cleanedTags
+            } else {
+                listOf(if (mode == "journal") strings.filterJournal else strings.filterStudy)
+            }
+            val fallbackTitle = if (mode == "journal") strings.journalCanvas else strings.studyNote
+            val resolvedTitle = title.ifBlank { fallbackTitle }
             val created = withContext(Dispatchers.IO) {
                 client.createPage(
-                    title = title.ifBlank { if (mode == "journal") "手账灵感页" else "学习笔记" },
+                    title = resolvedTitle,
                     mode = mode,
                     isPrivate = isPrivate,
-                    tags = listOf(if (mode == "journal") "手账" else "学习"),
-                    initialMarkdown = "# ${title.ifBlank { "新笔记" }}\n\n",
+                    tags = finalTags,
+                    initialMarkdown = "# $resolvedTitle\n\n",
                 )
             }
             refreshAll()
             openPage(created.pageId)
             editorMode = if (mode == "journal") EditorViewMode.Canvas else EditorViewMode.Document
+        }
+    }
+
+    fun updatePageTags(newTags: List<String>) {
+        val page = activePage ?: return
+        val cleaned = newTags.map { it.trim().removePrefix("#") }.filter { it.isNotEmpty() }.distinct()
+        scope.launch {
+            withContext(Dispatchers.IO) {
+                runCatching { client.updatePageMeta(page.meta.pageId, tags = cleaned) }
+            }
+            activePage = page.copy(meta = page.meta.copy(tags = cleaned))
+            refreshPageListOnly()
+        }
+    }
+
+    fun deletePage(pageId: String) {
+        scope.launch {
+            if (activePage?.meta?.pageId == pageId) {
+                bodySaveJob?.cancel()
+                pendingBodyDirty = false
+                closeCrystalBubble()
+            }
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    client.deletePage(pageId)
+                    client.flushDeltas()
+                }
+            }.onSuccess {
+                refreshAll()
+                val remaining = withContext(Dispatchers.IO) {
+                    runCatching { client.listPages() }.getOrDefault(emptyList())
+                }
+                pages.clear()
+                pages.addAll(remaining)
+                if (activePage?.meta?.pageId == pageId) {
+                    val nextId = remaining.firstOrNull()?.meta?.pageId
+                    if (nextId != null) {
+                        openPage(nextId)
+                    } else {
+                        activePage = null
+                        selectedImageId = null
+                        editableBody = ""
+                        canvasStrokes.clear()
+                    }
+                }
+                refreshCardsOnly()
+                showToast(strings.noteDeletedToast)
+            }.onFailure { err ->
+                showToast("${strings.deleteFailedPrefix}${err.message}")
+            }
+        }
+    }
+
+    fun notifyInlineStrokePersisted() {
+        val pid = activePage?.meta?.pageId ?: return
+        scope.launch {
+            val refreshed = withContext(Dispatchers.IO) {
+                runCatching { client.getPageSnapshot(pid) }.getOrNull()
+            }
+            if (refreshed != null) activePage = refreshed
+            refreshPageListOnly()
         }
     }
 
@@ -327,7 +435,7 @@ class SaltAppState(
             }
             activePage = page.copy(meta = page.meta.copy(isPrivate = next))
             refreshPageListOnly()
-            showToast(if (next) "已设为私密笔记" else "已取消私密保护")
+            showToast(if (next) strings.privateSetToast else strings.privateUnsetToast)
         }
     }
 
@@ -426,13 +534,30 @@ class SaltAppState(
             return
         }
 
+        val effectiveColor = when (effectiveTool) {
+            "highlighter" -> if (inkColor == Color(0xFF191C1E)) Color(0xFFF5C242) else inkColor
+            else -> inkColor
+        }
         val argb = (
-            ((inkColor.alpha * 255).toInt() and 0xFF).toLong() shl 24 or
-                (((inkColor.red * 255).toInt() and 0xFF).toLong() shl 16) or
-                (((inkColor.green * 255).toInt() and 0xFF).toLong() shl 8) or
-                ((inkColor.blue * 255).toInt() and 0xFF).toLong()
+            ((effectiveColor.alpha * 255).toInt() and 0xFF).toLong() shl 24 or
+                (((effectiveColor.red * 255).toInt() and 0xFF).toLong() shl 16) or
+                (((effectiveColor.green * 255).toInt() and 0xFF).toLong() shl 8) or
+                ((effectiveColor.blue * 255).toInt() and 0xFF).toLong()
             )
         val width = strokeWidth
+
+        // Synchronously insert optimistic dry-ink stroke on Main thread BEFORE wet ink clears -> zero blink!
+        val tempId = "pending-main-${++optimisticStrokeSeq}"
+        if (canvasId == activeCanvasId) {
+            val optimistic = StrokeGeometry.buildOptimisticRenderStroke(
+                tempId = tempId,
+                brush = effectiveTool,
+                colorArgb = argb,
+                baseWidth = width,
+                points = points,
+            )
+            canvasStrokes.add(optimistic)
+        }
 
         scope.launch {
             val ingested = withContext(Dispatchers.IO) {
@@ -442,13 +567,20 @@ class SaltAppState(
             }
             if (ingested != null) {
                 if (canvasId == activeCanvasId) {
-                    canvasStrokes.add(ingested.renderStroke)
+                    val idx = canvasStrokes.indexOfFirst { it.strokeId == tempId }
+                    if (idx >= 0) {
+                        canvasStrokes[idx] = ingested.renderStroke
+                    } else {
+                        canvasStrokes.add(ingested.renderStroke)
+                    }
                 }
                 val refreshed = withContext(Dispatchers.IO) {
                     runCatching { client.getPageSnapshot(pid) }.getOrNull()
                 }
                 if (refreshed != null) activePage = refreshed
                 refreshPageListOnly()
+            } else if (canvasId == activeCanvasId) {
+                canvasStrokes.removeAll { it.strokeId == tempId }
             }
         }
     }
@@ -475,20 +607,141 @@ class SaltAppState(
         }
     }
 
+    fun selectTool(tool: String) {
+        selectedTool = tool
+        if (tool != "select") {
+            selectedImageId = null
+        }
+    }
+
     fun insertImageToActiveCanvas(rawBytes: ByteArray) {
         val pid = activePage?.meta?.pageId ?: return
-        val worldX = (120f - panX) / zoom
-        val worldY = (120f - panY) / zoom
+        val targetMaxWidth = 340f
+        val baseX = (96f - panX) / zoom
+        val baseY = (96f - panY) / zoom
+        val existing = activePage?.canvases
+            ?.firstOrNull { it.canvasId == activeCanvasId }
+            ?.images
+            ?.filter { !it.deleted }
+            .orEmpty()
+        var worldX = baseX
+        var worldY = baseY
+        var attempts = 0
+        while (attempts < 32) {
+            val collisions = existing.filter { img ->
+                val pad = 20f
+                worldX < img.x + img.width + pad &&
+                    worldX + targetMaxWidth + pad > img.x &&
+                    worldY < img.y + img.height + pad &&
+                    worldY + targetMaxWidth + pad > img.y
+            }
+            if (collisions.isEmpty()) break
+            worldY = collisions.maxOf { it.y + it.height } + 24f
+            attempts++
+        }
         scope.launch {
             runCatching {
                 withContext(Dispatchers.IO) {
-                    client.insertCanvasImage(pid, activeCanvasId, rawBytes, worldX, worldY, 420f)
+                    client.insertCanvasImage(pid, activeCanvasId, rawBytes, worldX, worldY, targetMaxWidth)
                 }
-            }.onSuccess {
+            }.onSuccess { inserted ->
                 activePage = withContext(Dispatchers.IO) { client.getPageSnapshot(pid) }
-                showToast("已插入图片")
+                selectedImageId = inserted.imageId
+                selectedTool = "select"
+                showToast(strings.imageInsertedToast)
             }.onFailure { err ->
-                showToast("插图失败：${err.message}")
+                showToast("${strings.imageInsertFailedPrefix}${err.message}")
+            }
+        }
+    }
+
+    fun updateCanvasImageTransform(
+        imageId: String,
+        x: Float,
+        y: Float,
+        width: Float,
+        height: Float,
+        deleted: Boolean = false,
+    ) {
+        val page = activePage ?: return
+        val pid = page.meta.pageId
+        activePage = page.copy(
+            canvases = page.canvases.map { canvas ->
+                if (canvas.canvasId == activeCanvasId) {
+                    canvas.copy(
+                        images = canvas.images.map { img ->
+                            if (img.imageId == imageId) {
+                                img.copy(x = x, y = y, width = width, height = height, deleted = deleted)
+                            } else {
+                                img
+                            }
+                        },
+                    )
+                } else {
+                    canvas
+                }
+            },
+        )
+        if (deleted && selectedImageId == imageId) {
+            selectedImageId = null
+        }
+        scope.launch {
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    client.updateCanvasImageTransform(
+                        pageId = pid,
+                        canvasId = activeCanvasId,
+                        imageId = imageId,
+                        x = x,
+                        y = y,
+                        width = width,
+                        height = height,
+                        deleted = deleted,
+                    )
+                }
+            }.onSuccess { updated ->
+                val cur = activePage
+                if (cur != null && cur.meta.pageId == pid) {
+                    activePage = cur.copy(
+                        canvases = cur.canvases.map { canvas ->
+                            if (canvas.canvasId == activeCanvasId) {
+                                canvas.copy(
+                                    images = canvas.images.map { if (it.imageId == updated.imageId) updated else it },
+                                )
+                            } else {
+                                canvas
+                            }
+                        },
+                    )
+                }
+                refreshPageListOnly()
+            }.onFailure { err ->
+                showToast("${strings.updateFailedPrefix}${err.message}")
+                reloadCurrentPageInPlace(pid)
+            }
+        }
+    }
+
+    fun moveHaloPin(haloId: String, pinX: Float, pinY: Float) {
+        val page = activePage ?: return
+        val pid = page.meta.pageId
+        activePage = page.copy(
+            halos = page.halos.map { h ->
+                if (h.haloId == haloId) h.copy(pinX = pinX, pinY = pinY) else h
+            },
+        )
+        activeCrystal?.let { cur ->
+            if (cur.persistedHalo?.haloId == haloId) {
+                activeCrystal = cur.copy(persistedHalo = cur.persistedHalo.copy(pinX = pinX, pinY = pinY))
+            }
+        }
+        scope.launch {
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    client.updateHaloPin(pid, haloId, pinX, pinY)
+                }
+            }.onFailure {
+                reloadCurrentPageInPlace(pid)
             }
         }
     }
@@ -523,6 +776,7 @@ class SaltAppState(
                         presetId = presetId,
                         lassoPoints = lassoPoints,
                         providerId = null,
+                        outputLanguageHint = effectiveAiLanguageCode,
                         listener = listener,
                     )
                 }
@@ -536,9 +790,9 @@ class SaltAppState(
                     isStreaming = false,
                     errorCode = if (isPrivacy) "PRIVACY_BLOCKED" else "ROUTER_ERROR",
                     errorMessage = if (isPrivacy) {
-                        "该笔记已设为私密，仅允许使用本地或局域网模型。"
+                        strings.privateBlockError
                     } else {
-                        err.message ?: "请求失败"
+                        err.message ?: strings.requestFailed
                     },
                 )
             }
@@ -568,6 +822,7 @@ class SaltAppState(
                         anchorOffset = editableBody.length,
                         selectedText = excerpt,
                         providerId = null,
+                        outputLanguageHint = effectiveAiLanguageCode,
                         listener = listener,
                     )
                 }
@@ -581,9 +836,9 @@ class SaltAppState(
                     isStreaming = false,
                     errorCode = if (isPrivacy) "PRIVACY_BLOCKED" else "ROUTER_ERROR",
                     errorMessage = if (isPrivacy) {
-                        "该笔记已设为私密，仅允许使用本地或局域网模型。"
+                        strings.privateBlockError
                     } else {
-                        err.message ?: "请求失败"
+                        err.message ?: strings.requestFailed
                     },
                 )
             }
@@ -625,7 +880,7 @@ class SaltAppState(
                         isStreaming = false,
                         errorCode = code,
                         errorMessage = if (code == "PRIVACY_BLOCKED") {
-                            "该笔记已设为私密，仅允许使用本地或局域网模型。"
+                            strings.privateBlockError
                         } else {
                             message
                         },
@@ -672,6 +927,33 @@ class SaltAppState(
         activeCrystal = null
     }
 
+    fun deleteActiveCrystalHalo() {
+        val cur = activeCrystal ?: return
+        val halo = cur.persistedHalo ?: return
+        cancelActiveCrystalStream()
+        activeCrystal = null
+        activePage?.let { page ->
+            if (page.meta.pageId == halo.pageId) {
+                activePage = page.copy(
+                    halos = page.halos.filterNot { it.haloId == halo.haloId },
+                )
+            }
+        }
+        scope.launch {
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    client.deleteHalo(halo.pageId, halo.haloId)
+                }
+            }.onSuccess {
+                refreshPageListOnly()
+                showToast(strings.haloDeletedToast)
+            }.onFailure { err ->
+                showToast("${strings.deleteFailedPrefix}${err.message}")
+                reloadCurrentPageInPlace(halo.pageId)
+            }
+        }
+    }
+
     private fun cancelActiveCrystalStream() {
         activeCancelHandle?.cancel()
         activeCancelHandle = null
@@ -689,9 +971,17 @@ class SaltAppState(
                 editableBody = updatedBody
                 activeCrystal = cur.copy(fused = true, isCollapsed = true)
                 activePage = withContext(Dispatchers.IO) { client.getPageSnapshot(halo.pageId) }
-                showToast("已插入正文")
+                showToast(strings.fusedToast)
             }
         }
+    }
+
+    fun removeCrystalDraftCard(index: Int) {
+        val cur = activeCrystal ?: return
+        if (index !in cur.cardDrafts.indices) return
+        activeCrystal = cur.copy(
+            cardDrafts = cur.cardDrafts.filterIndexed { i, _ -> i != index },
+        )
     }
 
     fun importCrystalDraftCardsToFsrs() {
@@ -706,7 +996,7 @@ class SaltAppState(
             }
             activeCrystal = cur.copy(cardsImported = true)
             refreshCardsOnly()
-            showToast("已添加 ${cur.cardDrafts.size} 张复习卡片")
+            showToast("${strings.addedCardsToastPrefix}${cur.cardDrafts.size}${strings.addedCardsToastSuffix}")
         }
     }
 
@@ -722,7 +1012,45 @@ class SaltAppState(
                 client.createFlashcard(pid, null, front.trim(), back.trim())
             }
             refreshCardsOnly()
-            showToast("已添加卡片")
+            showToast(strings.cardAddedToast)
+        }
+    }
+
+    fun updateFlashcard(pageId: String, cardId: String, front: String, back: String) {
+        if (front.isBlank() || back.isBlank()) return
+        scope.launch {
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    client.updateFlashcard(pageId, cardId, front.trim(), back.trim())
+                }
+            }.onSuccess {
+                refreshCardsOnly()
+                if (activePage?.meta?.pageId == pageId) {
+                    reloadCurrentPageInPlace(pageId)
+                }
+                showToast(strings.cardUpdatedToast)
+            }.onFailure { err ->
+                showToast("${strings.updateFailedPrefix}${err.message}")
+            }
+        }
+    }
+
+    fun deleteFlashcard(pageId: String, cardId: String) {
+        scope.launch {
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    client.deleteFlashcard(pageId, cardId)
+                }
+            }.onSuccess {
+                currentCardRevealed = false
+                refreshCardsOnly()
+                if (activePage?.meta?.pageId == pageId) {
+                    reloadCurrentPageInPlace(pageId)
+                }
+                showToast(strings.cardDeletedToast)
+            }.onFailure { err ->
+                showToast("${strings.deleteFailedPrefix}${err.message}")
+            }
         }
     }
 
@@ -753,6 +1081,8 @@ class SaltAppState(
 
     private fun sanitizeRouterConfig(cfg: RouterConfigDto): RouterConfigDto =
         cfg.copy(
+            uiLanguage = uiLanguage,
+            aiOutputLanguage = aiOutputLanguage,
             providers = cfg.providers.map { p ->
                 val firstUrlLine = p.baseUrl.lineSequence().map { it.trim() }.firstOrNull { it.isNotEmpty() } ?: ""
                 val cleanUrl = firstUrlLine
@@ -768,6 +1098,30 @@ class SaltAppState(
                 )
             },
         )
+
+    fun updateLanguageSettings(newUiLang: String, newAiLang: String) {
+        val normalizedUi = newUiLang.ifBlank { "system" }
+        val normalizedAi = newAiLang.ifBlank { "follow_ui" }
+        uiLanguage = normalizedUi
+        aiOutputLanguage = normalizedAi
+        val currentCfg = routerConfig
+        if (currentCfg != null) {
+            routerConfig = sanitizeRouterConfig(currentCfg)
+        }
+        scope.launch {
+            runCatching {
+                val merged = withContext(Dispatchers.IO) {
+                    val base = currentCfg ?: client.getRouterConfig()
+                    val clean = sanitizeRouterConfig(base)
+                    client.saveRouterConfig(clean)
+                    clean
+                }
+                routerConfig = merged
+            }.onFailure { err ->
+                showToast("${strings.saveFailedPrefix}${err.message}")
+            }
+        }
+    }
 
     fun saveRouterConfig(cfg: RouterConfigDto, unsavedSecrets: Map<String, String> = emptyMap()) {
         val clean = sanitizeRouterConfig(cfg)
@@ -787,9 +1141,9 @@ class SaltAppState(
                 if (unsavedSecrets.isNotEmpty()) {
                     routerSecretEpoch++
                 }
-                showToast("模型配置已保存")
+                showToast(strings.configSavedToast)
             }.onFailure { err ->
-                showToast("保存失败：${err.message}")
+                showToast("${strings.saveFailedPrefix}${err.message}")
             }
         }
     }
@@ -806,7 +1160,7 @@ class SaltAppState(
                 }
             }
             routerSecretEpoch++
-            showToast("密钥已保存")
+            showToast(strings.keySavedToast)
         }
     }
 
@@ -830,7 +1184,7 @@ class SaltAppState(
                     client.saveRouterConfig(clean)
                     client.testProviderConnection(providerId)
                 }.getOrElse {
-                    ConnectivityTestResultDto(false, 0, it.message ?: "连接失败")
+                    ConnectivityTestResultDto(false, 0, it.message ?: strings.connectionFailed)
                 }
             }
             routerConfig = clean
@@ -846,7 +1200,7 @@ class SaltAppState(
         scope.launch {
             val res = withContext(Dispatchers.IO) {
                 runCatching { client.testProviderConnection(providerId) }.getOrElse {
-                    ConnectivityTestResultDto(false, 0, it.message ?: "连接失败")
+                    ConnectivityTestResultDto(false, 0, it.message ?: strings.connectionFailed)
                 }
             }
             connectivityResults.value = connectivityResults.value + (providerId to res)
@@ -865,9 +1219,9 @@ class SaltAppState(
                 }
             }.onSuccess {
                 webDavConfig = cfg
-                showToast("WebDAV 配置已保存")
+                showToast(strings.webdavSavedToast)
             }.onFailure { err ->
-                showToast("保存失败：${err.message}")
+                showToast("${strings.saveFailedPrefix}${err.message}")
             }
         }
     }
@@ -884,9 +1238,9 @@ class SaltAppState(
                 syncUiVersion++
                 refreshAll()
                 activePage?.meta?.pageId?.let { reloadCurrentPageInPlace(it) }
-                showToast("同步完成：上传 ${report.uploadedDeltas} · 拉取 ${report.downloadedDeltas}")
+                showToast("${strings.lanSyncedToast} (↑${report.uploadedDeltas} · ↓${report.downloadedDeltas})")
             }.onFailure { err ->
-                showToast("同步失败：${err.message}")
+                showToast("${strings.syncFailedPrefix}${err.message}")
             }
             isSyncingWebDav = false
         }
@@ -905,10 +1259,10 @@ class SaltAppState(
                     }
                     refreshLanPeers()
                     startLanObserver()
-                    showToast("局域网同步已开启")
+                    showToast(strings.lanSyncStartedToast)
                 }.onFailure { err ->
                     setLanMulticastLock(false)
-                    showToast("开启失败：${err.message}")
+                    showToast("${strings.syncFailedPrefix}${err.message}")
                 }
             } else {
                 lanObserverJob?.cancel()
@@ -916,7 +1270,7 @@ class SaltAppState(
                 setLanMulticastLock(false)
                 lanNodeInfo = null
                 lanPeers.clear()
-                showToast("局域网同步已关闭")
+                showToast(strings.lanSyncStoppedToast)
             }
         }
     }
@@ -929,6 +1283,16 @@ class SaltAppState(
             lanPeers.clear()
             lanPeers.addAll(peers)
         }
+    }
+
+    fun connectFromPairingPayload(raw: String): Boolean {
+        val parsed = LanPairingCodec.parse(raw)
+        if (parsed == null) {
+            showToast(strings.invalidPairingToast)
+            return false
+        }
+        syncWithLanPeer(parsed.host, parsed.port, parsed.fingerprint)
+        return true
     }
 
     fun syncWithLanPeer(host: String, port: Int, fingerprint: String) {
@@ -948,9 +1312,14 @@ class SaltAppState(
                 syncUiVersion++
                 refreshAll()
                 activePage?.meta?.pageId?.let { reloadCurrentPageInPlace(it) }
-                showToast("同步完成：发送 ${res.sentPackets} 篇 · 接收 ${res.receivedPackets} 篇")
+                val msg = if (res.sentPackets == 0 && res.receivedPackets == 0 && res.sentAssets == 0 && res.receivedAssets == 0) {
+                    strings.lanUpToDateToast
+                } else {
+                    "${strings.lanSyncedToast} (↑${res.sentPackets + res.sentAssets} · ↓${res.receivedPackets + res.receivedAssets})"
+                }
+                showToast(msg)
             }.onFailure { err ->
-                showToast("同步失败：${err.message}")
+                showToast("${strings.syncFailedPrefix}${err.message}")
             }
             isSyncingLan = false
         }
@@ -962,11 +1331,15 @@ class SaltAppState(
             runCatching {
                 withContext(Dispatchers.IO) { client.exportMarkdownBackup(targetDir) }
             }.onSuccess { count ->
-                showToast("已导出 $count 篇笔记至 $targetDir")
+                showToast("${strings.backupExportedToast} ($count)")
             }.onFailure { err ->
-                showToast("导出失败：${err.message}")
+                showToast("${strings.backupFailedPrefix}${err.message}")
             }
         }
+    }
+
+    fun notifyMessage(msg: String) {
+        showToast(msg)
     }
 
     fun clearToast() {

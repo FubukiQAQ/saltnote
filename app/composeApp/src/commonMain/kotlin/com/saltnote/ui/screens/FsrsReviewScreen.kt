@@ -18,10 +18,11 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.OpenInNew
 import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.CheckCircle
+import androidx.compose.material.icons.rounded.DeleteOutline
+import androidx.compose.material.icons.rounded.Edit
 import androidx.compose.material.icons.rounded.Style
 import androidx.compose.material.icons.rounded.Visibility
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CardDefaults
@@ -29,6 +30,7 @@ import androidx.compose.material3.ElevatedCard
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedCard
 import androidx.compose.material3.OutlinedTextField
@@ -41,14 +43,20 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import com.saltnote.bridge.FsrsCardStateDto
+import com.saltnote.ui.components.MarkdownContent
+import com.saltnote.ui.components.SaltAssistChip
+import com.saltnote.ui.i18n.LocalSaltStrings
 import com.saltnote.ui.platform.formatUtcTimestamp
 import com.saltnote.ui.state.SaltAppState
 
 @Composable
 fun FsrsReviewScreen(state: SaltAppState) {
+    val strings = LocalSaltStrings.current
     var showCreateCardDialog by remember { mutableStateOf(false) }
+    var editingCard by remember { mutableStateOf<FsrsCardStateDto?>(null) }
+    var deletingCard by remember { mutableStateOf<FsrsCardStateDto?>(null) }
 
     Column(
         modifier = Modifier
@@ -61,11 +69,11 @@ fun FsrsReviewScreen(state: SaltAppState) {
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween,
         ) {
-            Text("记忆复习", style = MaterialTheme.typography.headlineMedium)
+            Text(strings.reviewTitle, style = MaterialTheme.typography.headlineMedium)
             FilledTonalButton(onClick = { showCreateCardDialog = true }) {
                 Icon(Icons.Rounded.Add, null, modifier = Modifier.size(18.dp))
                 Spacer(Modifier.width(6.dp))
-                Text("新建卡片")
+                Text(strings.newCard)
             }
         }
 
@@ -74,12 +82,12 @@ fun FsrsReviewScreen(state: SaltAppState) {
             horizontalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             StatMetricCard(
-                label = "今日待复习",
+                label = strings.dueTodayLabel,
                 value = state.dueCards.size.toString(),
                 modifier = Modifier.weight(1f),
             )
             StatMetricCard(
-                label = "卡片总数",
+                label = strings.totalCardsLabel,
                 value = state.allCards.size.toString(),
                 modifier = Modifier.weight(1f),
             )
@@ -89,8 +97,8 @@ fun FsrsReviewScreen(state: SaltAppState) {
                 state.allCards.map { it.stability }.average()
             }
             StatMetricCard(
-                label = "平均记忆周期",
-                value = "${((avgStab * 10).toInt() / 10.0)} 天",
+                label = strings.avgIntervalLabel,
+                value = "${((avgStab * 10).toInt() / 10.0)} ${strings.daysUnit}",
                 modifier = Modifier.weight(1f),
             )
         }
@@ -104,7 +112,7 @@ fun FsrsReviewScreen(state: SaltAppState) {
                 ElevatedCard(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .widthIn(max = 720.dp),
+                        .widthIn(max = 760.dp),
                     shape = MaterialTheme.shapes.large,
                     colors = CardDefaults.elevatedCardColors(
                         containerColor = MaterialTheme.colorScheme.surfaceContainerLowest,
@@ -114,7 +122,7 @@ fun FsrsReviewScreen(state: SaltAppState) {
                         modifier = Modifier
                             .fillMaxWidth()
                             .padding(24.dp),
-                        verticalArrangement = Arrangement.spacedBy(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(14.dp),
                     ) {
                         Row(
                             modifier = Modifier.fillMaxWidth(),
@@ -122,31 +130,53 @@ fun FsrsReviewScreen(state: SaltAppState) {
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
                             Text(
-                                text = "剩余 ${state.dueCards.size} 张",
+                                text = "${strings.remainingCardsPrefix}${state.dueCards.size}${strings.remainingCardsSuffix}",
                                 style = MaterialTheme.typography.labelMedium,
                                 color = MaterialTheme.colorScheme.primary,
                             )
-                            AssistChip(
-                                onClick = { state.jumpToCardAnchor(currentCard) },
-                                label = { Text("查看原笔记") },
-                                leadingIcon = {
-                                    Icon(Icons.AutoMirrored.Rounded.OpenInNew, null, modifier = Modifier.size(16.dp))
-                                },
-                            )
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                            ) {
+                                IconButton(
+                                    onClick = { editingCard = currentCard },
+                                    modifier = Modifier.size(34.dp),
+                                ) {
+                                    Icon(Icons.Rounded.Edit, strings.editCard, modifier = Modifier.size(18.dp))
+                                }
+                                IconButton(
+                                    onClick = { deletingCard = currentCard },
+                                    modifier = Modifier.size(34.dp),
+                                ) {
+                                    Icon(
+                                        Icons.Rounded.DeleteOutline,
+                                        strings.deleteCard,
+                                        tint = MaterialTheme.colorScheme.error,
+                                        modifier = Modifier.size(18.dp),
+                                    )
+                                }
+                                SaltAssistChip(
+                                    onClick = { state.jumpToCardAnchor(currentCard) },
+                                    label = { Text(strings.viewSourceNote) },
+                                    leadingIcon = {
+                                        Icon(Icons.AutoMirrored.Rounded.OpenInNew, null, modifier = Modifier.size(16.dp))
+                                    },
+                                )
+                            }
                         }
 
-                        Text(
-                            text = currentCard.front,
-                            style = MaterialTheme.typography.headlineSmall,
-                            fontWeight = FontWeight.SemiBold,
+                        MarkdownContent(
+                            markdown = currentCard.front,
+                            compact = false,
+                            modifier = Modifier.fillMaxWidth(),
                         )
 
                         if (state.currentCardRevealed) {
                             HorizontalDivider()
-                            Text(
-                                text = currentCard.back,
-                                style = MaterialTheme.typography.bodyLarge,
-                                color = MaterialTheme.colorScheme.onSurface,
+                            MarkdownContent(
+                                markdown = currentCard.back,
+                                compact = false,
+                                modifier = Modifier.fillMaxWidth(),
                             )
                             Spacer(Modifier.height(6.dp))
                             Row(
@@ -159,19 +189,19 @@ fun FsrsReviewScreen(state: SaltAppState) {
                                         containerColor = MaterialTheme.colorScheme.error,
                                     ),
                                     modifier = Modifier.weight(1f),
-                                ) { Text("重来") }
+                                ) { Text(strings.ratingAgain) }
                                 FilledTonalButton(
                                     onClick = { state.submitReviewRating(currentCard, 2) },
                                     modifier = Modifier.weight(1f),
-                                ) { Text("困难") }
+                                ) { Text(strings.ratingHard) }
                                 Button(
                                     onClick = { state.submitReviewRating(currentCard, 3) },
                                     modifier = Modifier.weight(1f),
-                                ) { Text("良好") }
+                                ) { Text(strings.ratingGood) }
                                 FilledTonalButton(
                                     onClick = { state.submitReviewRating(currentCard, 4) },
                                     modifier = Modifier.weight(1f),
-                                ) { Text("简单") }
+                                ) { Text(strings.ratingEasy) }
                             }
                         } else {
                             Button(
@@ -180,7 +210,7 @@ fun FsrsReviewScreen(state: SaltAppState) {
                             ) {
                                 Icon(Icons.Rounded.Visibility, null, modifier = Modifier.size(18.dp))
                                 Spacer(Modifier.width(8.dp))
-                                Text("显示答案")
+                                Text(strings.showAnswer)
                             }
                         }
                     }
@@ -202,12 +232,12 @@ fun FsrsReviewScreen(state: SaltAppState) {
                         tint = MaterialTheme.colorScheme.primary,
                         modifier = Modifier.size(32.dp),
                     )
-                    Text("今日复习已全部完成", style = MaterialTheme.typography.titleMedium)
+                    Text(strings.allReviewsDone, style = MaterialTheme.typography.titleMedium)
                 }
             }
         }
 
-        Text("全部卡片 (${state.allCards.size})", style = MaterialTheme.typography.titleMedium)
+        Text("${strings.allCardsLabel} (${state.allCards.size})", style = MaterialTheme.typography.titleMedium)
         LazyColumn(
             modifier = Modifier.weight(1f),
             verticalArrangement = Arrangement.spacedBy(8.dp),
@@ -219,19 +249,36 @@ fun FsrsReviewScreen(state: SaltAppState) {
                             .fillMaxWidth()
                             .padding(14.dp),
                         verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
                     ) {
                         Icon(Icons.Rounded.Style, null, tint = MaterialTheme.colorScheme.primary)
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(card.front, style = MaterialTheme.typography.titleSmall)
+                        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            MarkdownContent(markdown = card.front, compact = true)
                             Text(
-                                text = "下次复习：${formatUtcTimestamp(card.dueAtUtc)}",
+                                text = "${strings.nextReviewPrefix}${formatUtcTimestamp(card.dueAtUtc)} · ${strings.reviewsCountPrefix}${card.reps}${strings.reviewsCountSuffix}",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
                         }
+                        IconButton(
+                            onClick = { editingCard = card },
+                            modifier = Modifier.size(34.dp),
+                        ) {
+                            Icon(Icons.Rounded.Edit, strings.editCard, modifier = Modifier.size(18.dp))
+                        }
+                        IconButton(
+                            onClick = { deletingCard = card },
+                            modifier = Modifier.size(34.dp),
+                        ) {
+                            Icon(
+                                Icons.Rounded.DeleteOutline,
+                                strings.deleteCard,
+                                tint = MaterialTheme.colorScheme.error,
+                                modifier = Modifier.size(18.dp),
+                            )
+                        }
                         TextButton(onClick = { state.jumpToCardAnchor(card) }) {
-                            Text("原笔记")
+                            Text(strings.sourceNoteShort)
                         }
                     }
                 }
@@ -240,41 +287,95 @@ fun FsrsReviewScreen(state: SaltAppState) {
     }
 
     if (showCreateCardDialog) {
-        var front by remember { mutableStateOf("") }
-        var back by remember { mutableStateOf("") }
-        AlertDialog(
-            onDismissRequest = { showCreateCardDialog = false },
-            title = { Text("新建卡片") },
-            text = {
-                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    OutlinedTextField(
-                        value = front,
-                        onValueChange = { front = it },
-                        label = { Text("问题") },
-                        modifier = Modifier.fillMaxWidth(),
-                    )
-                    OutlinedTextField(
-                        value = back,
-                        onValueChange = { back = it },
-                        label = { Text("答案") },
-                        minLines = 3,
-                        modifier = Modifier.fillMaxWidth(),
-                    )
-                }
-            },
-            confirmButton = {
-                Button(
-                    onClick = {
-                        state.createManualFlashcard(front, back)
-                        showCreateCardDialog = false
-                    },
-                ) { Text("保存") }
-            },
-            dismissButton = {
-                TextButton(onClick = { showCreateCardDialog = false }) { Text("取消") }
+        FlashcardEditorDialog(
+            title = strings.newCard,
+            initialFront = "",
+            initialBack = "",
+            onDismiss = { showCreateCardDialog = false },
+            onSave = { f, b ->
+                state.createManualFlashcard(f, b)
+                showCreateCardDialog = false
             },
         )
     }
+
+    editingCard?.let { card ->
+        FlashcardEditorDialog(
+            title = strings.editCard,
+            initialFront = card.front,
+            initialBack = card.back,
+            onDismiss = { editingCard = null },
+            onSave = { f, b ->
+                state.updateFlashcard(card.pageId, card.cardId, f, b)
+                editingCard = null
+            },
+        )
+    }
+
+    deletingCard?.let { card ->
+        AlertDialog(
+            onDismissRequest = { deletingCard = null },
+            title = { Text(strings.deleteCardTitle) },
+            text = { Text(strings.deleteCardConfirm) },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        state.deleteFlashcard(card.pageId, card.cardId)
+                        deletingCard = null
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
+                ) { Text(strings.confirmDelete) }
+            },
+            dismissButton = {
+                TextButton(onClick = { deletingCard = null }) { Text(strings.cancel) }
+            },
+        )
+    }
+}
+
+@Composable
+private fun FlashcardEditorDialog(
+    title: String,
+    initialFront: String,
+    initialBack: String,
+    onDismiss: () -> Unit,
+    onSave: (front: String, back: String) -> Unit,
+) {
+    val strings = LocalSaltStrings.current
+    var front by remember(initialFront) { mutableStateOf(initialFront) }
+    var back by remember(initialBack) { mutableStateOf(initialBack) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(title) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                OutlinedTextField(
+                    value = front,
+                    onValueChange = { front = it },
+                    label = { Text(strings.cardFrontLabel) },
+                    minLines = 2,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                OutlinedTextField(
+                    value = back,
+                    onValueChange = { back = it },
+                    label = { Text(strings.cardBackLabel) },
+                    minLines = 3,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = { onSave(front, back) },
+                enabled = front.isNotBlank() && back.isNotBlank(),
+            ) { Text(strings.save) }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text(strings.cancel) }
+        },
+    )
 }
 
 @Composable

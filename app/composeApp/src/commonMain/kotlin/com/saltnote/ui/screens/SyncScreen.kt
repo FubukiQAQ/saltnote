@@ -14,7 +14,10 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Archive
 import androidx.compose.material.icons.rounded.CloudSync
+import androidx.compose.material.icons.rounded.ContentCopy
+import androidx.compose.material.icons.rounded.ContentPaste
 import androidx.compose.material.icons.rounded.Devices
+import androidx.compose.material.icons.rounded.QrCodeScanner
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Wifi
 import androidx.compose.material3.Button
@@ -40,11 +43,19 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import com.saltnote.bridge.WebDavConfigDto
-import com.saltnote.ui.platform.pickLocalFolderPath
+import com.saltnote.ui.components.LanPairingCodec
+import com.saltnote.ui.components.SaltQrCodeView
+import com.saltnote.ui.i18n.LocalSaltStrings
+import com.saltnote.ui.platform.PlatformQrScannerDialog
+import com.saltnote.ui.platform.copyTextToClipboard
+import com.saltnote.ui.platform.exportMarkdownBackupWithPicker
+import com.saltnote.ui.platform.readTextFromClipboard
+import com.saltnote.ui.platform.supportsLiveCameraQrScan
 import com.saltnote.ui.state.SaltAppState
 
 @Composable
 fun SyncScreen(state: SaltAppState) {
+    val strings = LocalSaltStrings.current
     var endpoint by remember(state.webDavConfig) { mutableStateOf(state.webDavConfig.endpoint) }
     var rootPath by remember(state.webDavConfig) { mutableStateOf(state.webDavConfig.rootPath) }
     var username by remember(state.webDavConfig) { mutableStateOf(state.webDavConfig.username) }
@@ -54,6 +65,7 @@ fun SyncScreen(state: SaltAppState) {
     var manualHost by remember { mutableStateOf("") }
     var manualPort by remember { mutableStateOf("47821") }
     var manualFp by remember { mutableStateOf("") }
+    var showQrScannerDialog by remember { mutableStateOf(false) }
 
     Column(
         modifier = Modifier
@@ -62,7 +74,7 @@ fun SyncScreen(state: SaltAppState) {
             .padding(20.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
-        Text("多端同步", style = MaterialTheme.typography.headlineMedium)
+        Text(strings.syncTitle, style = MaterialTheme.typography.headlineMedium)
 
         // Card 1: WebDAV Sync
         ElevatedCard(modifier = Modifier.fillMaxWidth(), shape = MaterialTheme.shapes.large) {
@@ -76,14 +88,14 @@ fun SyncScreen(state: SaltAppState) {
                 ) {
                     Icon(Icons.Rounded.CloudSync, null, tint = MaterialTheme.colorScheme.primary)
                     Spacer(Modifier.width(10.dp))
-                    Text("WebDAV 同步", style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
+                    Text(strings.webdavSync, style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
                     Switch(checked = webDavEnabled, onCheckedChange = { webDavEnabled = it })
                 }
 
                 OutlinedTextField(
                     value = endpoint,
                     onValueChange = { endpoint = it },
-                    label = { Text("服务器地址") },
+                    label = { Text(strings.serverUrlLabel) },
                     placeholder = { Text("https://dav.jianguoyun.com/dav/") },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
@@ -95,24 +107,27 @@ fun SyncScreen(state: SaltAppState) {
                     OutlinedTextField(
                         value = rootPath,
                         onValueChange = { rootPath = it },
-                        label = { Text("远端目录") },
+                        label = { Text(strings.remoteDirLabel) },
                         singleLine = true,
                         modifier = Modifier.weight(1f),
                     )
                     OutlinedTextField(
                         value = username,
                         onValueChange = { username = it },
-                        label = { Text("用户名") },
+                        label = { Text(strings.usernameLabel) },
                         singleLine = true,
                         modifier = Modifier.weight(1f),
                     )
                 }
+                val hasSaved = state.client.secretVault.hasSecret(state.webDavConfig.passwordKeyRef)
                 OutlinedTextField(
                     value = passwordInput,
                     onValueChange = { passwordInput = it },
-                    label = {
-                        val hasSaved = state.client.secretVault.hasSecret(state.webDavConfig.passwordKeyRef)
-                        Text(if (hasSaved) "密码（已保存，留空不变）" else "密码")
+                    label = { Text(strings.passwordLabel) },
+                    placeholder = if (hasSaved) {
+                        { Text(strings.savedPlaceholder) }
+                    } else {
+                        null
                     },
                     visualTransformation = PasswordVisualTransformation(),
                     singleLine = true,
@@ -134,7 +149,7 @@ fun SyncScreen(state: SaltAppState) {
                             )
                             passwordInput = ""
                         },
-                    ) { Text("保存配置") }
+                    ) { Text(strings.saveConfig) }
 
                     Button(
                         onClick = { state.triggerWebDavSync() },
@@ -148,7 +163,7 @@ fun SyncScreen(state: SaltAppState) {
                             )
                             Spacer(Modifier.width(8.dp))
                         }
-                        Text("立即同步")
+                        Text(strings.syncNow)
                     }
                 }
 
@@ -159,7 +174,7 @@ fun SyncScreen(state: SaltAppState) {
                         modifier = Modifier.fillMaxWidth(),
                     ) {
                         Text(
-                            text = "上次同步：上传 ${r.uploadedDeltas} · 拉取 ${r.downloadedDeltas}",
+                            text = "${strings.lastSyncPrefix}${strings.uploadedLabel} ${r.uploadedDeltas} · ${strings.downloadedLabel} ${r.downloadedDeltas}",
                             style = MaterialTheme.typography.bodySmall,
                             modifier = Modifier.padding(10.dp),
                         )
@@ -168,7 +183,7 @@ fun SyncScreen(state: SaltAppState) {
             }
         }
 
-        // Card 2: LAN Direct Sync
+        // Card 2: LAN Direct Sync & QR Pairing
         ElevatedCard(modifier = Modifier.fillMaxWidth(), shape = MaterialTheme.shapes.large) {
             Column(
                 modifier = Modifier.padding(20.dp),
@@ -180,7 +195,7 @@ fun SyncScreen(state: SaltAppState) {
                 ) {
                     Icon(Icons.Rounded.Wifi, null, tint = MaterialTheme.colorScheme.primary)
                     Spacer(Modifier.width(10.dp))
-                    Text("局域网同步", style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
+                    Text(strings.lanSyncTitle, style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
                     Switch(
                         checked = state.lanNodeInfo != null,
                         onCheckedChange = { state.toggleLanP2p(it) },
@@ -188,17 +203,65 @@ fun SyncScreen(state: SaltAppState) {
                 }
 
                 state.lanNodeInfo?.let { node ->
-                    OutlinedCard(modifier = Modifier.fillMaxWidth(), shape = MaterialTheme.shapes.small) {
-                        Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                            Text(
-                                text = "本机地址：${node.hostIp.ifBlank { "获取中" }}:${node.port}",
-                                style = MaterialTheme.typography.labelLarge,
+                    val pairingUri = remember(node, state.deviceState.deviceName) {
+                        LanPairingCodec.encode(
+                            host = node.hostIp.ifBlank { "127.0.0.1" },
+                            port = node.port,
+                            fingerprint = node.fingerprint,
+                            deviceName = state.deviceState.deviceName,
+                        )
+                    }
+
+                    OutlinedCard(modifier = Modifier.fillMaxWidth(), shape = MaterialTheme.shapes.medium) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(14.dp),
+                            horizontalArrangement = Arrangement.spacedBy(16.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            SaltQrCodeView(
+                                payload = pairingUri,
+                                size = 148.dp,
                             )
-                            Text(
-                                text = "配对指纹：${node.fingerprint}",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
+                            Column(
+                                modifier = Modifier.weight(1f),
+                                verticalArrangement = Arrangement.spacedBy(6.dp),
+                            ) {
+                                Text(
+                                    text = strings.localQrTitle,
+                                    style = MaterialTheme.typography.titleSmall,
+                                )
+                                Text(
+                                    text = "${strings.addressLabel}: ${node.hostIp.ifBlank { "…" }}:${node.port}",
+                                    style = MaterialTheme.typography.labelLarge,
+                                )
+                                Text(
+                                    text = "${strings.fingerprintLabel}: ${node.fingerprint.take(24)}…",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    FilledTonalButton(
+                                        onClick = {
+                                            copyTextToClipboard(pairingUri)
+                                            state.notifyMessage(strings.pairingCopiedToast)
+                                        },
+                                    ) {
+                                        Icon(Icons.Rounded.ContentCopy, null, modifier = Modifier.size(16.dp))
+                                        Spacer(Modifier.width(6.dp))
+                                        Text(strings.copyPairingCode)
+                                    }
+                                    Button(
+                                        onClick = { showQrScannerDialog = true },
+                                        enabled = !state.isSyncingLan,
+                                    ) {
+                                        Icon(Icons.Rounded.QrCodeScanner, null, modifier = Modifier.size(16.dp))
+                                        Spacer(Modifier.width(6.dp))
+                                        Text(if (supportsLiveCameraQrScan()) strings.scanPair else strings.importPairCode)
+                                    }
+                                }
+                            }
                         }
                     }
 
@@ -207,9 +270,9 @@ fun SyncScreen(state: SaltAppState) {
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.SpaceBetween,
                     ) {
-                        Text("附近设备 (${state.lanPeers.size})", style = MaterialTheme.typography.titleSmall)
+                        Text("${strings.nearbyDevicesLabel} (${state.lanPeers.size})", style = MaterialTheme.typography.titleSmall)
                         IconButton(onClick = { state.refreshLanPeers() }) {
-                            Icon(Icons.Rounded.Refresh, "刷新")
+                            Icon(Icons.Rounded.Refresh, strings.refreshDesc)
                         }
                     }
 
@@ -245,19 +308,43 @@ fun SyncScreen(state: SaltAppState) {
                                         )
                                         Spacer(Modifier.width(6.dp))
                                     }
-                                    Text("同步")
+                                    Text(strings.syncAction)
                                 }
                             }
                         }
                     }
 
                     HorizontalDivider()
-                    Text("手动连接", style = MaterialTheme.typography.labelLarge)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                    ) {
+                        Text(strings.manualConnect, style = MaterialTheme.typography.labelLarge)
+                        FilledTonalButton(
+                            onClick = {
+                                val clip = readTextFromClipboard().orEmpty()
+                                val parsed = LanPairingCodec.parse(clip)
+                                if (parsed != null) {
+                                    manualHost = parsed.host
+                                    manualPort = parsed.port.toString()
+                                    manualFp = parsed.fingerprint
+                                    state.notifyMessage(strings.clipboardFilledToast)
+                                } else {
+                                    state.notifyMessage(strings.clipboardNoPairingUri)
+                                }
+                            },
+                        ) {
+                            Icon(Icons.Rounded.ContentPaste, null, modifier = Modifier.size(16.dp))
+                            Spacer(Modifier.width(6.dp))
+                            Text(strings.pastePairingUri)
+                        }
+                    }
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         OutlinedTextField(
                             value = manualHost,
                             onValueChange = { manualHost = it },
-                            label = { Text("IP 地址") },
+                            label = { Text(strings.ipAddressLabel) },
                             placeholder = { Text("192.168.1.100") },
                             singleLine = true,
                             modifier = Modifier.weight(1f),
@@ -265,7 +352,7 @@ fun SyncScreen(state: SaltAppState) {
                         OutlinedTextField(
                             value = manualPort,
                             onValueChange = { manualPort = it },
-                            label = { Text("端口") },
+                            label = { Text(strings.portLabel) },
                             singleLine = true,
                             modifier = Modifier.width(110.dp),
                         )
@@ -273,7 +360,7 @@ fun SyncScreen(state: SaltAppState) {
                     OutlinedTextField(
                         value = manualFp,
                         onValueChange = { manualFp = it },
-                        label = { Text("对端配对指纹") },
+                        label = { Text(strings.peerFingerprintLabel) },
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth(),
                     )
@@ -285,7 +372,7 @@ fun SyncScreen(state: SaltAppState) {
                             }
                         },
                         enabled = !state.isSyncingLan,
-                    ) { Text("连接并同步") }
+                    ) { Text(strings.connectAndSync) }
                 }
             }
         }
@@ -300,16 +387,28 @@ fun SyncScreen(state: SaltAppState) {
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
             ) {
                 Icon(Icons.Rounded.Archive, null, tint = MaterialTheme.colorScheme.primary)
-                Text("导出 Markdown 备份", style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
+                Text(strings.exportMarkdownBackup, style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
                 FilledTonalButton(
                     onClick = {
-                        val target = pickLocalFolderPath("选择导出目录", state.client.vaultPath)
-                        if (target != null) {
-                            state.exportMarkdownBackup(target)
-                        }
+                        exportMarkdownBackupWithPicker(
+                            client = state.client,
+                            initialPath = state.client.vaultPath,
+                            strings = strings,
+                            onResult = { msg -> state.notifyMessage(msg) },
+                        )
                     },
-                ) { Text("导出") }
+                ) { Text(strings.exportLabel) }
             }
         }
+    }
+
+    if (showQrScannerDialog) {
+        PlatformQrScannerDialog(
+            onScanned = { payload ->
+                showQrScannerDialog = false
+                state.connectFromPairingPayload(payload)
+            },
+            onDismiss = { showQrScannerDialog = false },
+        )
     }
 }

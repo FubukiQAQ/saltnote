@@ -1,5 +1,6 @@
 package com.saltnote.ui.screens
 
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -18,6 +19,7 @@ import androidx.compose.material.icons.rounded.DarkMode
 import androidx.compose.material.icons.rounded.Error
 import androidx.compose.material.icons.rounded.FolderOpen
 import androidx.compose.material.icons.rounded.Key
+import androidx.compose.material.icons.rounded.Language
 import androidx.compose.material.icons.rounded.NetworkCheck
 import androidx.compose.material.icons.rounded.Visibility
 import androidx.compose.material.icons.rounded.VisibilityOff
@@ -25,19 +27,18 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ElevatedCard
 import androidx.compose.material3.FilledTonalButton
-import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedCard
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateMapOf
-import androidx.compose.material3.Surface
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -50,11 +51,16 @@ import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import com.saltnote.bridge.ProviderConfigDto
 import com.saltnote.bridge.RouterConfigDto
-import com.saltnote.ui.platform.pickLocalFolderPath
+import com.saltnote.ui.components.SaltFilterChip
+import com.saltnote.ui.i18n.AiOutputLanguage
+import com.saltnote.ui.i18n.AppLanguage
+import com.saltnote.ui.i18n.LocalSaltStrings
+import com.saltnote.ui.platform.pickVaultDirectory
 import com.saltnote.ui.state.SaltAppState
 
 @Composable
 fun SettingsScreen(state: SaltAppState) {
+    val strings = LocalSaltStrings.current
     val currentRouter = state.routerConfig
     var defaultTextId by remember(currentRouter) { mutableStateOf(currentRouter?.defaultTextProvider ?: "ollama-local") }
     var defaultVisionId by remember(currentRouter) { mutableStateOf(currentRouter?.defaultVisionProvider ?: "ollama-local") }
@@ -89,7 +95,7 @@ fun SettingsScreen(state: SaltAppState) {
             .padding(20.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
-        Text("设置", style = MaterialTheme.typography.headlineMedium)
+        Text(strings.settingsTitle, style = MaterialTheme.typography.headlineMedium)
 
         ElevatedCard(modifier = Modifier.fillMaxWidth(), shape = MaterialTheme.shapes.large) {
             Column(modifier = Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -100,7 +106,7 @@ fun SettingsScreen(state: SaltAppState) {
                     Icon(Icons.Rounded.FolderOpen, null, tint = MaterialTheme.colorScheme.primary)
                     Spacer(Modifier.width(10.dp))
                     Column(modifier = Modifier.weight(1f)) {
-                        Text("笔记目录", style = MaterialTheme.typography.titleMedium)
+                        Text(strings.vaultDirectoryTitle, style = MaterialTheme.typography.titleMedium)
                         Text(
                             text = state.client.vaultPath,
                             style = MaterialTheme.typography.bodySmall,
@@ -109,12 +115,14 @@ fun SettingsScreen(state: SaltAppState) {
                     }
                     FilledTonalButton(
                         onClick = {
-                            val chosen = pickLocalFolderPath("选择笔记目录", state.client.vaultPath)
-                            if (chosen != null) {
-                                state.switchVaultDirectory(chosen)
-                            }
+                            pickVaultDirectory(
+                                initialPath = state.client.vaultPath,
+                                strings = strings,
+                                onPicked = { chosen -> state.switchVaultDirectory(chosen) },
+                                onMessage = { msg -> state.notifyMessage(msg) },
+                            )
                         },
-                    ) { Text("切换") }
+                    ) { Text(strings.switchAction) }
                 }
 
                 HorizontalDivider()
@@ -125,8 +133,72 @@ fun SettingsScreen(state: SaltAppState) {
                 ) {
                     Icon(Icons.Rounded.DarkMode, null, tint = MaterialTheme.colorScheme.primary)
                     Spacer(Modifier.width(10.dp))
-                    Text("深色模式", style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
+                    Text(strings.darkThemeTitle, style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
                     Switch(checked = state.darkTheme, onCheckedChange = { state.darkTheme = it })
+                }
+            }
+        }
+
+        // Language Settings Card
+        ElevatedCard(modifier = Modifier.fillMaxWidth(), shape = MaterialTheme.shapes.large) {
+            Column(modifier = Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Rounded.Language, null, tint = MaterialTheme.colorScheme.primary)
+                    Spacer(Modifier.width(10.dp))
+                    Text(strings.languageCardTitle, style = MaterialTheme.typography.titleMedium)
+                }
+
+                Text(
+                    text = strings.uiLanguageLabel,
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    AppLanguage.entries.forEach { lang ->
+                        val label = if (lang == AppLanguage.System) strings.langFollowSystem else lang.nativeLabel
+                        SaltFilterChip(
+                            selected = state.uiLanguage.equals(lang.code, ignoreCase = true),
+                            onClick = {
+                                state.updateLanguageSettings(lang.code, state.aiOutputLanguage)
+                            },
+                            label = { Text(label) },
+                        )
+                    }
+                }
+
+                Text(
+                    text = strings.aiOutputLanguageLabel,
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    AiOutputLanguage.entries.forEach { lang ->
+                        val label = when (lang) {
+                            AiOutputLanguage.FollowUi -> strings.langFollowUi
+                            AiOutputLanguage.ZhCn -> AppLanguage.ZhCn.nativeLabel
+                            AiOutputLanguage.ZhTw -> AppLanguage.ZhTw.nativeLabel
+                            AiOutputLanguage.En -> AppLanguage.En.nativeLabel
+                            AiOutputLanguage.Ja -> AppLanguage.Ja.nativeLabel
+                            AiOutputLanguage.Ko -> AppLanguage.Ko.nativeLabel
+                        }
+                        SaltFilterChip(
+                            selected = state.aiOutputLanguage.equals(lang.code, ignoreCase = true),
+                            onClick = {
+                                state.updateLanguageSettings(state.uiLanguage, lang.code)
+                            },
+                            label = { Text(label) },
+                        )
+                    }
                 }
             }
         }
@@ -144,7 +216,7 @@ fun SettingsScreen(state: SaltAppState) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Icon(Icons.Rounded.Key, null, tint = MaterialTheme.colorScheme.primary)
                         Spacer(Modifier.width(8.dp))
-                        Text("AI 模型配置", style = MaterialTheme.typography.titleMedium)
+                        Text(strings.aiConfigTitle, style = MaterialTheme.typography.titleMedium)
                     }
                     Button(
                         onClick = {
@@ -159,19 +231,19 @@ fun SettingsScreen(state: SaltAppState) {
                             )
                             clearSavedKeyDrafts()
                         },
-                    ) { Text("保存全部配置") }
+                    ) { Text(strings.saveAllConfig) }
                 }
 
-                val activeTextName = editableProviders.firstOrNull { it.id == defaultTextId }?.let { "${it.name} (${it.model})" } ?: defaultTextId
-                val activeVisionName = editableProviders.firstOrNull { it.id == defaultVisionId }?.let { "${it.name} (${it.model})" } ?: defaultVisionId
+                val activeTextName = editableProviders.firstOrNull { it.id == defaultTextId }?.let { "${it.name} · ${it.model}" } ?: defaultTextId
+                val activeVisionName = editableProviders.firstOrNull { it.id == defaultVisionId }?.let { "${it.name} · ${it.model}" } ?: defaultVisionId
                 Surface(
                     color = MaterialTheme.colorScheme.surfaceContainerLow,
                     shape = MaterialTheme.shapes.small,
                     modifier = Modifier.fillMaxWidth(),
                 ) {
                     Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                        Text("默认文本：$activeTextName", style = MaterialTheme.typography.bodySmall)
-                        Text("默认视觉：$activeVisionName", style = MaterialTheme.typography.bodySmall)
+                        Text("${strings.defaultTextLabel}: $activeTextName", style = MaterialTheme.typography.bodySmall)
+                        Text("${strings.defaultVisionLabel}: $activeVisionName", style = MaterialTheme.typography.bodySmall)
                     }
                 }
 
@@ -195,7 +267,11 @@ fun SettingsScreen(state: SaltAppState) {
                             defaultTextId = provider.id
                             val secrets = buildSecretSnapshot()
                             state.saveRouterConfig(
-                                RouterConfigDto(defaultTextId, defaultVisionId, editableProviders),
+                                RouterConfigDto(
+                                    defaultTextProvider = defaultTextId,
+                                    defaultVisionProvider = defaultVisionId,
+                                    providers = editableProviders,
+                                ),
                                 unsavedSecrets = secrets,
                             )
                             clearSavedKeyDrafts()
@@ -204,7 +280,11 @@ fun SettingsScreen(state: SaltAppState) {
                             defaultVisionId = provider.id
                             val secrets = buildSecretSnapshot()
                             state.saveRouterConfig(
-                                RouterConfigDto(defaultTextId, defaultVisionId, editableProviders),
+                                RouterConfigDto(
+                                    defaultTextProvider = defaultTextId,
+                                    defaultVisionProvider = defaultVisionId,
+                                    providers = editableProviders,
+                                ),
                                 unsavedSecrets = secrets,
                             )
                             clearSavedKeyDrafts()
@@ -215,7 +295,11 @@ fun SettingsScreen(state: SaltAppState) {
                         onSaveSecret = {
                             val secret = keyInputs[provider.id].orEmpty()
                             state.saveRouterConfig(
-                                RouterConfigDto(defaultTextId, defaultVisionId, editableProviders),
+                                RouterConfigDto(
+                                    defaultTextProvider = defaultTextId,
+                                    defaultVisionProvider = defaultVisionId,
+                                    providers = editableProviders,
+                                ),
                                 unsavedSecrets = mapOf(provider.apiKeyRef to secret),
                             )
                             keyInputs.remove(provider.id)
@@ -223,7 +307,11 @@ fun SettingsScreen(state: SaltAppState) {
                         onTestConnectivity = {
                             val secrets = buildSecretSnapshot()
                             state.saveAndTestProvider(
-                                cfg = RouterConfigDto(defaultTextId, defaultVisionId, editableProviders),
+                                cfg = RouterConfigDto(
+                                    defaultTextProvider = defaultTextId,
+                                    defaultVisionProvider = defaultVisionId,
+                                    providers = editableProviders,
+                                ),
                                 providerId = provider.id,
                                 unsavedSecrets = secrets,
                             )
@@ -252,6 +340,7 @@ private fun ProviderCardEditor(
     onSaveSecret: () -> Unit,
     onTestConnectivity: () -> Unit,
 ) {
+    val strings = LocalSaltStrings.current
     var showSecret by remember(provider.id) { mutableStateOf(false) }
 
     OutlinedCard(modifier = Modifier.fillMaxWidth(), shape = MaterialTheme.shapes.medium) {
@@ -262,15 +351,15 @@ private fun ProviderCardEditor(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 Text(provider.name, style = MaterialTheme.typography.titleSmall, modifier = Modifier.weight(1f))
-                FilterChip(
+                SaltFilterChip(
                     selected = isDefaultText,
                     onClick = onSetDefaultText,
-                    label = { Text("默认文本") },
+                    label = { Text(strings.defaultTextChip) },
                 )
-                FilterChip(
+                SaltFilterChip(
                     selected = isDefaultVision,
                     onClick = onSetDefaultVision,
-                    label = { Text("默认视觉") },
+                    label = { Text(strings.defaultVisionChip) },
                 )
             }
 
@@ -284,7 +373,7 @@ private fun ProviderCardEditor(
                         val cleaned = raw.replace("\n", "").replace("\r", "").replace(" ", "")
                         onUpdate(provider.copy(baseUrl = cleaned))
                     },
-                    label = { Text("API 地址") },
+                    label = { Text(strings.apiUrlLabel) },
                     singleLine = true,
                     keyboardOptions = KeyboardOptions(
                         imeAction = ImeAction.Next,
@@ -299,7 +388,7 @@ private fun ProviderCardEditor(
                         val cleaned = raw.replace("\n", "").replace("\r", "")
                         onUpdate(provider.copy(model = cleaned))
                     },
-                    label = { Text("模型名称") },
+                    label = { Text(strings.modelNameLabel) },
                     singleLine = true,
                     keyboardOptions = KeyboardOptions(
                         imeAction = ImeAction.Next,
@@ -318,15 +407,18 @@ private fun ProviderCardEditor(
                     OutlinedTextField(
                         value = secretDraft,
                         onValueChange = onSecretDraftChange,
-                        label = {
-                            Text(if (hasSavedSecret) "API Key（已保存，留空不变）" else "API Key")
+                        label = { Text(strings.apiKeyLabel) },
+                        placeholder = if (hasSavedSecret) {
+                            { Text(strings.savedPlaceholder) }
+                        } else {
+                            null
                         },
                         visualTransformation = if (showSecret) VisualTransformation.None else PasswordVisualTransformation(),
                         trailingIcon = {
                             IconButton(onClick = { showSecret = !showSecret }) {
                                 Icon(
                                     imageVector = if (showSecret) Icons.Rounded.VisibilityOff else Icons.Rounded.Visibility,
-                                    contentDescription = if (showSecret) "隐藏密钥" else "显示密钥",
+                                    contentDescription = if (showSecret) strings.hideSecretDesc else strings.showSecretDesc,
                                 )
                             }
                         },
@@ -339,7 +431,7 @@ private fun ProviderCardEditor(
                         modifier = Modifier.weight(1f),
                     )
                     FilledTonalButton(onClick = onSaveSecret) {
-                        Text("保存密钥")
+                        Text(strings.saveKeyAction)
                     }
                 }
             }
@@ -362,7 +454,7 @@ private fun ProviderCardEditor(
                         Icon(Icons.Rounded.NetworkCheck, null, modifier = Modifier.size(16.dp))
                     }
                     Spacer(Modifier.width(6.dp))
-                    Text(if (isTesting) "测试中…" else "测试连接")
+                    Text(if (isTesting) strings.testingAction else strings.testConnectionAction)
                 }
                 if (testResult != null) {
                     Icon(

@@ -31,7 +31,7 @@ jobs:
           java-version: 21
       - uses: dtolnay/rust-toolchain@stable
       - name: Build native Rust library, generate UniFFI Kotlin bindings & run Desktop E2E tests
-        run: ./gradlew :app:nativeBridge:buildRustDesktop :app:nativeBridge:generateUniFFIBindings :app:nativeBridge:desktopTest :app:composeApp:desktopMainClasses --console=plain
+        run: ./gradlew :app:nativeBridge:buildRustDesktop :app:nativeBridge:generateUniFFIBindings :app:nativeBridge:desktopTest :app:composeApp:desktopTest :app:composeApp:desktopMainClasses --console=plain
 
   android-arm64-apk:
     name: Android ARM64 Cross-Compile & APK Size Gate

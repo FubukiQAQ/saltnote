@@ -24,9 +24,7 @@ import androidx.compose.material.icons.rounded.Create
 import androidx.compose.material.icons.rounded.DoNotTouch
 import androidx.compose.material.icons.rounded.Draw
 import androidx.compose.material.icons.rounded.Preview
-import androidx.compose.material3.AssistChip
 import androidx.compose.material3.FilledIconToggleButton
-import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedCard
@@ -46,11 +44,13 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import com.saltnote.bridge.RenderStrokeDto
 import com.saltnote.bridge.SaltNoteClient
 import com.saltnote.bridge.StrokeSample
+import com.saltnote.ui.i18n.LocalSaltStrings
 import com.saltnote.ui.platform.PlatformInkSurface
 import com.saltnote.ui.theme.SaltHaloAmber
 import com.saltnote.ui.theme.SaltHaloGlacier
@@ -109,10 +109,11 @@ fun DocumentEditorView(
     onMarkdownChange: (String) -> Unit,
     onInsertInlineCanvas: () -> Unit,
     onTriggerTextHalo: (presetId: String, excerpt: String) -> Unit,
-    onInlineStrokeCompleted: (canvasId: String, points: List<StrokeSample>) -> Unit,
+    onInlineStrokePersisted: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     var showSplitPreview by remember { mutableStateOf(true) }
+    val strings = LocalSaltStrings.current
 
     Column(
         modifier = modifier
@@ -126,36 +127,36 @@ fun DocumentEditorView(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            AssistChip(
+            SaltAssistChip(
                 onClick = onInsertInlineCanvas,
-                label = { Text("插入行内画布") },
+                label = { Text(strings.insertInlineCanvas) },
                 leadingIcon = { Icon(Icons.Rounded.Draw, null, modifier = Modifier.size(18.dp)) },
             )
-            AssistChip(
+            SaltAssistChip(
                 onClick = { onTriggerTextHalo("builtin.amber_expand", markdown.takeLast(320)) },
-                label = { Text("琥珀扩充") },
+                label = { Text(strings.amberExpandChip) },
                 leadingIcon = {
                     Box(Modifier.size(10.dp).clip(CircleShape).background(SaltHaloAmber))
                 },
             )
-            AssistChip(
+            SaltAssistChip(
                 onClick = { onTriggerTextHalo("builtin.glacier_card", markdown.takeLast(320)) },
-                label = { Text("冰川制卡") },
+                label = { Text(strings.glacierCardChip) },
                 leadingIcon = {
                     Box(Modifier.size(10.dp).clip(CircleShape).background(SaltHaloGlacier))
                 },
             )
             Spacer(Modifier.weight(1f))
-            FilterChip(
+            SaltFilterChip(
                 selected = stylusOnlyMode,
                 onClick = onToggleStylusOnly,
-                label = { Text("防误触") },
+                label = { Text(strings.palmRejection) },
                 leadingIcon = { Icon(Icons.Rounded.DoNotTouch, null, modifier = Modifier.size(16.dp)) },
             )
-            FilterChip(
+            SaltFilterChip(
                 selected = showSplitPreview,
                 onClick = { showSplitPreview = !showSplitPreview },
-                label = { Text("预览") },
+                label = { Text(strings.previewChip) },
                 leadingIcon = { Icon(Icons.Rounded.Preview, null, modifier = Modifier.size(18.dp)) },
             )
         }
@@ -173,7 +174,7 @@ fun DocumentEditorView(
                     .weight(1f)
                     .fillMaxHeight(),
                 textStyle = MaterialTheme.typography.bodyLarge.copy(fontFamily = FontFamily.Monospace),
-                placeholder = { Text("开始写作…") },
+                placeholder = { Text(strings.editorPlaceholder) },
                 shape = MaterialTheme.shapes.medium,
             )
 
@@ -207,9 +208,7 @@ fun DocumentEditorView(
                                         heightDp = seg.heightDp,
                                         syncVersion = syncVersion,
                                         stylusOnlyMode = stylusOnlyMode,
-                                        onStrokeCompleted = { pts ->
-                                            onInlineStrokeCompleted(seg.canvasId, pts)
-                                        },
+                                        onStrokePersisted = onInlineStrokePersisted,
                                     )
                                 }
                             }
@@ -229,15 +228,15 @@ private fun InlineEmbeddedCanvasBlock(
     heightDp: Int,
     syncVersion: Long,
     stylusOnlyMode: Boolean,
-    onStrokeCompleted: (List<StrokeSample>) -> Unit,
+    onStrokePersisted: () -> Unit,
 ) {
     val strokes = remember(pageId, canvasId) { mutableStateListOf<RenderStrokeDto>() }
     var inlineTool by remember(pageId, canvasId) { mutableStateOf("pen") }
-    var refreshKey by remember { mutableStateOf(0) }
+    var pendingSeq by remember(pageId, canvasId) { mutableStateOf(0L) }
     val scope = rememberCoroutineScope()
     val inkColor = MaterialTheme.colorScheme.onSurface
 
-    LaunchedEffect(pageId, canvasId, refreshKey, syncVersion) {
+    LaunchedEffect(pageId, canvasId, syncVersion) {
         val loaded = withContext(Dispatchers.IO) {
             runCatching {
                 client.getCanvasStrokes(pageId, canvasId, -10_000f, -10_000f, 10_000f, 10_000f)
@@ -266,9 +265,10 @@ private fun InlineEmbeddedCanvasBlock(
                     modifier = Modifier.size(16.dp),
                     tint = MaterialTheme.colorScheme.primary,
                 )
+                val strings = LocalSaltStrings.current
                 Spacer(Modifier.width(6.dp))
                 Text(
-                    text = "行内画布块 · $canvasId",
+                    text = "${strings.inlineCanvasHeader} · $canvasId",
                     style = MaterialTheme.typography.labelMedium,
                     color = MaterialTheme.colorScheme.onSurface,
                     modifier = Modifier.weight(1f),
@@ -278,7 +278,7 @@ private fun InlineEmbeddedCanvasBlock(
                     onCheckedChange = { inlineTool = "pen" },
                     modifier = Modifier.size(30.dp),
                 ) {
-                    Icon(Icons.Rounded.Create, contentDescription = "画笔", modifier = Modifier.size(15.dp))
+                    Icon(Icons.Rounded.Create, contentDescription = strings.toolPen, modifier = Modifier.size(15.dp))
                 }
                 Spacer(Modifier.width(4.dp))
                 FilledIconToggleButton(
@@ -286,7 +286,7 @@ private fun InlineEmbeddedCanvasBlock(
                     onCheckedChange = { inlineTool = "eraser" },
                     modifier = Modifier.size(30.dp),
                 ) {
-                    Icon(Icons.Rounded.AutoFixOff, contentDescription = "橡皮擦", modifier = Modifier.size(15.dp))
+                    Icon(Icons.Rounded.AutoFixOff, contentDescription = strings.toolEraser, modifier = Modifier.size(15.dp))
                 }
             }
 
@@ -319,11 +319,32 @@ private fun InlineEmbeddedCanvasBlock(
                     allowTouchScrollPassThrough = true,
                     onPanZoom = { _, _, _, _, _ -> },
                     onStrokeCompleted = { pts ->
-                        onStrokeCompleted(pts)
+                        // Synchronously append optimistic dry stroke BEFORE wet ink clears -> zero blink!
+                        val tempId = "pending-inline-${++pendingSeq}"
+                        val argb = inkColor.toArgb().toLong() and 0xFFFFFFFFL
+                        val optimistic = StrokeGeometry.buildOptimisticRenderStroke(
+                            tempId = tempId,
+                            brush = "pen",
+                            colorArgb = argb,
+                            baseWidth = 3f,
+                            points = pts,
+                        )
+                        strokes.add(optimistic)
                         scope.launch {
-                            // Brief refresh after Rust ingests the stroke
-                            kotlinx.coroutines.delay(50)
-                            refreshKey++
+                            val persisted = withContext(Dispatchers.IO) {
+                                runCatching {
+                                    client.ingestRawStroke(pageId, canvasId, "pen", argb, 3f, pts)
+                                }.getOrNull()
+                            }
+                            if (persisted != null) {
+                                val idx = strokes.indexOfFirst { it.strokeId == tempId }
+                                if (idx >= 0) {
+                                    strokes[idx] = persisted.renderStroke
+                                } else {
+                                    strokes.add(persisted.renderStroke)
+                                }
+                                onStrokePersisted()
+                            }
                         }
                     },
                     onEraserMove = { wx, wy ->

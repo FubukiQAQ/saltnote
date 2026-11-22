@@ -2,9 +2,10 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use futures_util::StreamExt;
 use image::ImageFormat;
 use reqwest::Client;
+pub use salt_types::{parse_flashcard_drafts, FlashcardDraft};
 use salt_types::{
-    is_local_or_rfc1918_endpoint, redact_sensitive_text, AiProviderKind, HaloPreset,
-    ProviderConfig, SaltError, SaltResult, VisionPolicy,
+    ai_language_display_name, is_local_or_rfc1918_endpoint, redact_sensitive_text, AiProviderKind,
+    HaloOutputMode, HaloPreset, ProviderConfig, SaltError, SaltResult, VisionPolicy,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -32,12 +33,7 @@ pub struct HaloInferenceRequest {
     pub context_markdown: String,
     pub user_prompt_extra: Option<String>,
     pub webp_slice: Option<Vec<u8>>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FlashcardDraft {
-    pub front: String,
-    pub back: String,
+    pub output_language: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -204,6 +200,7 @@ impl SaltRouter {
     ) -> SaltResult<String> {
         let base = normalize_openai_base_url(&provider.base_url);
         let url = format!("{base}/chat/completions");
+        let sys_prompt = compose_system_prompt(req);
         let user_text = build_user_prompt(req);
 
         // Try multimodal payload first when a visual slice is attached
@@ -215,7 +212,7 @@ impl SaltRouter {
                 { "type": "image_url", "image_url": { "url": format!("data:{mime};base64,{b64}") } }
             ]);
             match self
-                .send_openai_stream_request(&url, &provider.model, api_key, &req.preset.system_prompt, user_content, cancel.clone(), sink.clone())
+                .send_openai_stream_request(&url, &provider.model, api_key, &sys_prompt, user_content, cancel.clone(), sink.clone())
                 .await
             {
                 Ok(out) => return Ok(out),
@@ -231,7 +228,7 @@ impl SaltRouter {
                             &url,
                             &provider.model,
                             api_key,
-                            &req.preset.system_prompt,
+                            &sys_prompt,
                             text_content,
                             cancel,
                             sink,
@@ -246,7 +243,7 @@ impl SaltRouter {
             &url,
             &provider.model,
             api_key,
-            &req.preset.system_prompt,
+            &sys_prompt,
             Value::String(user_text),
             cancel,
             sink,
@@ -336,6 +333,7 @@ impl SaltRouter {
             format!("{base}/v1/messages")
         };
 
+        let sys_prompt = compose_system_prompt(req);
         let user_text = build_user_prompt(req);
         let mut content_blocks = vec![json!({ "type": "text", "text": user_text })];
         if let Some(webp) = &req.webp_slice {
@@ -354,7 +352,7 @@ impl SaltRouter {
             "model": provider.model,
             "max_tokens": 2048,
             "stream": true,
-            "system": req.preset.system_prompt,
+            "system": sys_prompt,
             "messages": [
                 { "role": "user", "content": content_blocks }
             ]
@@ -413,6 +411,7 @@ impl SaltRouter {
             provider.model
         );
 
+        let sys_prompt = compose_system_prompt(req);
         let user_text = build_user_prompt(req);
         let mut parts = vec![json!({ "text": user_text })];
         if let Some(webp) = &req.webp_slice {
@@ -425,7 +424,7 @@ impl SaltRouter {
         }
 
         let payload = json!({
-            "system_instruction": { "parts": [{ "text": req.preset.system_prompt }] },
+            "system_instruction": { "parts": [{ "text": sys_prompt }] },
             "contents": [{ "role": "user", "parts": parts }]
         });
 
@@ -846,7 +845,49 @@ fn is_vision_unsupported_error(msg: &str) -> bool {
         || lower.contains("vision")
 }
 
+pub fn compose_system_prompt(req: &HaloInferenceRequest) -> String {
+    let mut sys = req.preset.system_prompt.trim().to_string();
+    if req.preset.output_mode == HaloOutputMode::OcrMarkdown {
+        if !sys.contains("NEVER add explanations") {
+            sys.push_str("\n\nStrict OCR rules: Output ONLY the verbatim transcribed text and LaTeX math ($...$ / $$...$$) in the original language. NEVER add explanations, commentary, solutions, summaries, or greetings.");
+        }
+        return sys;
+    }
+
+    if let Some(lang_raw) = &req.output_language {
+        let lang_name = ai_language_display_name(lang_raw)
+            .map(|s| s.to_string())
+            .or_else(|| {
+                let t = lang_raw.trim();
+                if t.is_empty() || matches!(t.to_ascii_lowercase().as_str(), "system" | "follow_ui" | "auto") {
+                    None
+                } else {
+                    Some(t.to_string())
+                }
+            });
+        if let Some(lang) = lang_name {
+            match req.preset.output_mode {
+                HaloOutputMode::FlashcardJson => {
+                    sys.push_str(&format!(
+                        "\n\nLanguage requirement: Keep JSON keys \"front\" and \"back\" in English, and write all flashcard content in {lang}."
+                    ));
+                }
+                _ => {
+                    sys.push_str(&format!(
+                        "\n\nLanguage requirement: Write the entire response in {lang}."
+                    ));
+                }
+            }
+        }
+    }
+    sys
+}
+
 fn build_user_prompt(req: &HaloInferenceRequest) -> String {
+    if req.preset.output_mode == HaloOutputMode::OcrMarkdown && req.webp_slice.is_some() {
+        return "Transcribe ONLY the visible handwritten or printed content in this image verbatim into Markdown and LaTeX ($...$ / $$...$$). Do NOT explain, interpret, or add anything else.".into();
+    }
+
     let mut prompt = String::new();
     if !req.context_markdown.trim().is_empty() {
         prompt.push_str("### Note Context\n");
@@ -864,63 +905,6 @@ fn build_user_prompt(req: &HaloInferenceRequest) -> String {
         prompt.push_str("Please analyze the attached handwritten region.");
     }
     prompt
-}
-
-/// Parses 1..=3 Q/A flashcard drafts returned by `builtin.glacier_card`.
-pub fn parse_flashcard_drafts(raw_output: &str) -> Vec<FlashcardDraft> {
-    let trimmed = raw_output.trim();
-    let json_candidate = if let Some(start) = trimmed.find('[') {
-        if let Some(end) = trimmed.rfind(']') {
-            &trimmed[start..=end]
-        } else {
-            trimmed
-        }
-    } else {
-        trimmed
-    };
-
-    if let Ok(mut parsed) = serde_json::from_str::<Vec<FlashcardDraft>>(json_candidate) {
-        parsed.retain(|c| !c.front.trim().is_empty() && !c.back.trim().is_empty());
-        parsed.truncate(3);
-        if !parsed.is_empty() {
-            return parsed;
-        }
-    }
-
-    let mut drafts = Vec::new();
-    let mut cur_q = String::new();
-    let mut cur_a = String::new();
-    for line in trimmed.lines() {
-        let l = line.trim();
-        if let Some(q) = l
-            .strip_prefix("Q:")
-            .or_else(|| l.strip_prefix("问："))
-            .or_else(|| l.strip_prefix("**Q**:"))
-        {
-            if !cur_q.is_empty() && !cur_a.is_empty() {
-                drafts.push(FlashcardDraft {
-                    front: cur_q.trim().to_string(),
-                    back: cur_a.trim().to_string(),
-                });
-                cur_a.clear();
-            }
-            cur_q = q.trim().to_string();
-        } else if let Some(a) = l
-            .strip_prefix("A:")
-            .or_else(|| l.strip_prefix("答："))
-            .or_else(|| l.strip_prefix("**A**:"))
-        {
-            cur_a = a.trim().to_string();
-        }
-    }
-    if !cur_q.is_empty() && !cur_a.is_empty() {
-        drafts.push(FlashcardDraft {
-            front: cur_q.trim().to_string(),
-            back: cur_a.trim().to_string(),
-        });
-    }
-    drafts.truncate(3);
-    drafts
 }
 
 #[cfg(test)]
@@ -964,6 +948,7 @@ mod tests {
             context_markdown: "Top secret personal diary".into(),
             user_prompt_extra: None,
             webp_slice: None,
+            output_language: None,
         };
         let sink = Arc::new(VecSink(Mutex::new(vec![])));
         let res = router
@@ -1008,6 +993,7 @@ mod tests {
             context_markdown: "Test".into(),
             user_prompt_extra: None,
             webp_slice: None,
+            output_language: None,
         };
         let cancel = CancellationToken::new();
         cancel.cancel();
@@ -1082,6 +1068,7 @@ mod tests {
             context_markdown: "test".into(),
             user_prompt_extra: None,
             webp_slice: None,
+            output_language: None,
         };
         let sink = Arc::new(VecSink(Mutex::new(vec![])));
         let out = router
@@ -1115,5 +1102,47 @@ mod tests {
         let res = router.test_provider_connection(&provider).await;
         assert!(!res.ok);
         assert!(res.message.contains("/v1"));
+    }
+
+    #[test]
+    fn prompt_composition_injects_language_and_enforces_strict_ocr() {
+        let presets = default_halo_presets();
+        let amber_req = HaloInferenceRequest {
+            page_is_private: false,
+            preset: presets[0].clone(),
+            context_markdown: "Ctx".into(),
+            user_prompt_extra: None,
+            webp_slice: None,
+            output_language: Some("ja".into()),
+        };
+        let amber_sys = compose_system_prompt(&amber_req);
+        assert!(amber_sys.contains("Japanese (日本語)"));
+
+        let glacier_req = HaloInferenceRequest {
+            page_is_private: false,
+            preset: presets[1].clone(),
+            context_markdown: "Ctx".into(),
+            user_prompt_extra: None,
+            webp_slice: None,
+            output_language: Some("zh-TW".into()),
+        };
+        let glacier_sys = compose_system_prompt(&glacier_req);
+        assert!(glacier_sys.contains("Traditional Chinese (繁體中文)"));
+        assert!(glacier_sys.contains("\"front\""));
+
+        let ocr_req = HaloInferenceRequest {
+            page_is_private: false,
+            preset: presets[2].clone(),
+            context_markdown: "Unrelated note body that should not distract OCR".into(),
+            user_prompt_extra: None,
+            webp_slice: Some(vec![1, 2, 3]),
+            output_language: Some("en".into()),
+        };
+        let ocr_sys = compose_system_prompt(&ocr_req);
+        let ocr_user = build_user_prompt(&ocr_req);
+        assert!(ocr_sys.contains("NEVER add explanations"));
+        assert!(!ocr_sys.contains("Language requirement: Write the entire response in English"));
+        assert!(!ocr_user.contains("Unrelated note body"));
+        assert!(ocr_user.contains("verbatim"));
     }
 }

@@ -21,10 +21,12 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.MergeType
 import androidx.compose.material.icons.rounded.AutoAwesome
 import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.DeleteOutline
 import androidx.compose.material.icons.rounded.ExpandLess
 import androidx.compose.material.icons.rounded.ExpandMore
 import androidx.compose.material.icons.rounded.Shield
 import androidx.compose.material.icons.rounded.Style
+import androidx.compose.material3.Button
 import androidx.compose.material3.ElevatedCard
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.HorizontalDivider
@@ -35,12 +37,19 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedCard
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import com.saltnote.ui.i18n.LocalSaltStrings
 import com.saltnote.ui.state.ActiveCrystalBubble
 import com.saltnote.ui.theme.SaltHaloAmber
 import com.saltnote.ui.theme.SaltHaloGlacier
@@ -50,20 +59,31 @@ import com.saltnote.ui.theme.SaltHaloMineral
 fun SaltHaloCrystalOverlay(
     bubble: ActiveCrystalBubble,
     onToggleCollapse: () -> Unit,
+    onDeleteHalo: () -> Unit = {},
     onCloseAndCancel: () -> Unit,
     onFuseIntoBody: () -> Unit,
     onImportCards: () -> Unit,
+    onRemoveDraftCard: (Int) -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
+    val strings = LocalSaltStrings.current
+    val isGlacierCard = bubble.presetId == "builtin.glacier_card"
+    val presetDisplayName = when (bubble.presetId) {
+        "builtin.amber_expand" -> strings.haloAmberShort
+        "builtin.glacier_card" -> strings.haloGlacierShort
+        "builtin.mineral_ocr" -> strings.haloMineralShort
+        else -> bubble.presetName
+    }
     val accent = when (bubble.presetId) {
         "builtin.amber_expand" -> SaltHaloAmber
         "builtin.glacier_card" -> SaltHaloGlacier
         "builtin.mineral_ocr" -> SaltHaloMineral
         else -> MaterialTheme.colorScheme.primary
     }
+    var showRawFallback by remember(bubble.presetId, bubble.persistedHalo?.haloId) { mutableStateOf(false) }
 
     ElevatedCard(
-        modifier = modifier.widthIn(min = 280.dp, max = 440.dp),
+        modifier = modifier.widthIn(min = 300.dp, max = 460.dp),
         shape = MaterialTheme.shapes.large,
     ) {
         Surface(
@@ -87,27 +107,37 @@ fun SaltHaloCrystalOverlay(
                     )
                     Spacer(Modifier.width(8.dp))
                     Icon(
-                        imageVector = Icons.Rounded.AutoAwesome,
+                        imageVector = if (isGlacierCard) Icons.Rounded.Style else Icons.Rounded.AutoAwesome,
                         contentDescription = null,
                         tint = accent,
                         modifier = Modifier.size(18.dp),
                     )
                     Spacer(Modifier.width(6.dp))
                     Text(
-                        text = bubble.presetName,
+                        text = presetDisplayName,
                         style = MaterialTheme.typography.titleSmall,
                         modifier = Modifier.weight(1f),
                     )
+                    if (!bubble.isStreaming && bubble.persistedHalo != null) {
+                        IconButton(onClick = onDeleteHalo, modifier = Modifier.size(32.dp)) {
+                            Icon(
+                                imageVector = Icons.Rounded.DeleteOutline,
+                                contentDescription = strings.deleteHaloDesc,
+                                tint = MaterialTheme.colorScheme.error,
+                                modifier = Modifier.size(18.dp),
+                            )
+                        }
+                    }
                     IconButton(onClick = onToggleCollapse, modifier = Modifier.size(32.dp)) {
                         Icon(
                             imageVector = if (bubble.isCollapsed) Icons.Rounded.ExpandMore else Icons.Rounded.ExpandLess,
-                            contentDescription = "折叠盐晶气泡",
+                            contentDescription = strings.collapseBubbleDesc,
                         )
                     }
                     IconButton(onClick = onCloseAndCancel, modifier = Modifier.size(32.dp)) {
                         Icon(
                             imageVector = Icons.Rounded.Close,
-                            contentDescription = "关闭并中止流式请求",
+                            contentDescription = strings.closeAndCancelBubbleDesc,
                         )
                     }
                 }
@@ -149,48 +179,113 @@ fun SaltHaloCrystalOverlay(
                                     )
                                 }
                             }
+                        } else if (isGlacierCard) {
+                            // Glacier Card mode: NEVER show raw JSON; display ONLY structured cards!
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .heightIn(min = 56.dp, max = 340.dp)
+                                    .verticalScroll(rememberScrollState()),
+                                verticalArrangement = Arrangement.spacedBy(8.dp),
+                            ) {
+                                if (bubble.isStreaming && bubble.cardDrafts.isEmpty()) {
+                                    Text(
+                                        text = strings.extractingCardsEllipsis,
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                } else if (bubble.cardDrafts.isNotEmpty()) {
+                                    Text(
+                                        text = "${strings.extractedCardsPrefix}${bubble.cardDrafts.size}${strings.extractedCardsSuffix}",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = SaltHaloGlacier,
+                                    )
+                                    bubble.cardDrafts.forEachIndexed { idx, draft ->
+                                        OutlinedCard(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            shape = MaterialTheme.shapes.small,
+                                        ) {
+                                            Column(
+                                                modifier = Modifier.padding(10.dp),
+                                                verticalArrangement = Arrangement.spacedBy(6.dp),
+                                            ) {
+                                                Row(
+                                                    modifier = Modifier.fillMaxWidth(),
+                                                    verticalAlignment = Alignment.CenterVertically,
+                                                ) {
+                                                    Text(
+                                                        text = "${strings.cardPrefix}${idx + 1}",
+                                                        style = MaterialTheme.typography.labelMedium,
+                                                        fontWeight = FontWeight.SemiBold,
+                                                        color = SaltHaloGlacier,
+                                                        modifier = Modifier.weight(1f),
+                                                    )
+                                                    if (!bubble.cardsImported && bubble.cardDrafts.size > 1) {
+                                                        IconButton(
+                                                            onClick = { onRemoveDraftCard(idx) },
+                                                            modifier = Modifier.size(24.dp),
+                                                        ) {
+                                                            Icon(
+                                                                imageVector = Icons.Rounded.DeleteOutline,
+                                                                contentDescription = strings.removeDraftCardDesc,
+                                                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                                modifier = Modifier.size(16.dp),
+                                                            )
+                                                        }
+                                                    }
+                                                }
+                                                MarkdownContent(markdown = draft.front, compact = true)
+                                                HorizontalDivider()
+                                                MarkdownContent(markdown = draft.back, compact = true)
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    Text(
+                                        text = strings.noValidCardsMessage,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                    if (bubble.markdown.isNotBlank()) {
+                                        TextButton(onClick = { showRawFallback = !showRawFallback }) {
+                                            Text(if (showRawFallback) strings.hideRawOutput else strings.viewRawOutput)
+                                        }
+                                        if (showRawFallback) {
+                                            Surface(
+                                                color = MaterialTheme.colorScheme.surfaceContainer,
+                                                shape = MaterialTheme.shapes.small,
+                                                modifier = Modifier.fillMaxWidth(),
+                                            ) {
+                                                Text(
+                                                    text = bubble.markdown,
+                                                    style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                                                    modifier = Modifier.padding(8.dp),
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         } else {
+                            // Amber Expand / Mineral OCR: render full Markdown + LaTeX live!
                             Box(
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .heightIn(min = 48.dp, max = 280.dp)
+                                    .heightIn(min = 52.dp, max = 340.dp)
                                     .verticalScroll(rememberScrollState()),
                             ) {
-                                Text(
-                                    text = bubble.markdown.ifBlank { "正在生成…" },
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    color = MaterialTheme.colorScheme.onSurface,
-                                )
-                            }
-                        }
-
-                        if (bubble.cardDrafts.isNotEmpty()) {
-                            HorizontalDivider()
-                            Text(
-                                text = "提取到 ${bubble.cardDrafts.size} 张 FSRS 闪卡草稿",
-                                style = MaterialTheme.typography.labelMedium,
-                                color = SaltHaloGlacier,
-                            )
-                            bubble.cardDrafts.forEachIndexed { idx, draft ->
-                                OutlinedCard(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    shape = MaterialTheme.shapes.small,
-                                ) {
-                                    Column(
-                                        modifier = Modifier.padding(10.dp),
-                                        verticalArrangement = Arrangement.spacedBy(4.dp),
-                                    ) {
-                                        Text(
-                                            text = "Q${idx + 1}: ${draft.front}",
-                                            style = MaterialTheme.typography.labelLarge,
-                                            fontWeight = FontWeight.SemiBold,
-                                        )
-                                        Text(
-                                            text = "A: ${draft.back}",
-                                            style = MaterialTheme.typography.bodySmall,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                        )
-                                    }
+                                if (bubble.markdown.isBlank()) {
+                                    Text(
+                                        text = strings.generatingEllipsis,
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                } else {
+                                    MarkdownContent(
+                                        markdown = bubble.markdown,
+                                        compact = true,
+                                        modifier = Modifier.fillMaxWidth(),
+                                    )
                                 }
                             }
                         }
@@ -200,25 +295,34 @@ fun SaltHaloCrystalOverlay(
                                 modifier = Modifier.fillMaxWidth(),
                                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                             ) {
-                                FilledTonalButton(
-                                    onClick = onFuseIntoBody,
-                                    enabled = !bubble.fused && bubble.persistedHalo != null,
-                                    modifier = Modifier.weight(1f),
-                                ) {
-                                    Icon(Icons.AutoMirrored.Rounded.MergeType, null, modifier = Modifier.size(18.dp))
-                                    Spacer(Modifier.width(6.dp))
-                                    Text(if (bubble.fused) "已熔合正文" else "一键熔合进正文")
-                                }
-
-                                if (bubble.cardDrafts.isNotEmpty()) {
-                                    FilledTonalButton(
+                                if (isGlacierCard && bubble.cardDrafts.isNotEmpty()) {
+                                    Button(
                                         onClick = onImportCards,
                                         enabled = !bubble.cardsImported,
                                         modifier = Modifier.weight(1f),
                                     ) {
                                         Icon(Icons.Rounded.Style, null, modifier = Modifier.size(18.dp))
                                         Spacer(Modifier.width(6.dp))
-                                        Text(if (bubble.cardsImported) "已入库 FSRS" else "一键入库 FSRS")
+                                        Text(if (bubble.cardsImported) strings.importedToFsrs else strings.importToFsrs)
+                                    }
+                                    FilledTonalButton(
+                                        onClick = onFuseIntoBody,
+                                        enabled = !bubble.fused && bubble.persistedHalo != null,
+                                        modifier = Modifier.weight(1f),
+                                    ) {
+                                        Icon(Icons.AutoMirrored.Rounded.MergeType, null, modifier = Modifier.size(18.dp))
+                                        Spacer(Modifier.width(6.dp))
+                                        Text(if (bubble.fused) strings.insertedBodyShort else strings.insertBodyShort)
+                                    }
+                                } else {
+                                    FilledTonalButton(
+                                        onClick = onFuseIntoBody,
+                                        enabled = !bubble.fused && bubble.persistedHalo != null,
+                                        modifier = Modifier.weight(1f),
+                                    ) {
+                                        Icon(Icons.AutoMirrored.Rounded.MergeType, null, modifier = Modifier.size(18.dp))
+                                        Spacer(Modifier.width(6.dp))
+                                        Text(if (bubble.fused) strings.fusedIntoBody else strings.fuseIntoBody)
                                     }
                                 }
                             }

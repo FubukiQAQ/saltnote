@@ -266,6 +266,15 @@ impl SaltEngine {
         Ok(())
     }
 
+    pub fn delete_page(&self, page_id: String) -> Result<(), FfiError> {
+        self.vault.delete_page(&page_id)?;
+        let _ = self.intel.remove_page(&page_id);
+        self.spatial_cache
+            .write()
+            .retain(|(pid, _), _| pid != &page_id);
+        Ok(())
+    }
+
     pub fn flush_deltas(&self) -> Result<u32, FfiError> {
         let entries = self.vault.flush_all_dirty_deltas()?;
         Ok(entries.len() as u32)
@@ -487,9 +496,19 @@ impl SaltEngine {
         let (hash, rel_path, webp_bytes, w, h) = prepare_image_asset_webp(&raw_image_bytes)?;
         self.vault.store_asset_bytes(&rel_path, &webp_bytes)?;
 
-        let aspect = if w > 0 { h as f32 / w as f32 } else { 1.0 };
-        let display_w = (w as f32).min(max_width.max(120.0));
-        let display_h = display_w * aspect;
+        let fw = (w.max(1)) as f32;
+        let fh = (h.max(1)) as f32;
+        let max_dim = max_width.clamp(120.0, 480.0);
+        let long_edge = fw.max(fh);
+        let scale = if long_edge > max_dim {
+            max_dim / long_edge
+        } else if long_edge < 120.0 {
+            160.0 / long_edge
+        } else {
+            1.0
+        };
+        let display_w = (fw * scale).max(48.0);
+        let display_h = (fh * scale).max(48.0);
 
         let node = CanvasImageNode {
             image_id: new_ulid(),
@@ -510,6 +529,26 @@ impl SaltEngine {
         Ok(serde_json::to_string(&node).unwrap_or_else(|_| "{}".into()))
     }
 
+    pub fn update_canvas_image_transform(
+        &self,
+        page_id: String,
+        canvas_id: String,
+        image_id: String,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        deleted: bool,
+    ) -> Result<String, FfiError> {
+        let updated = self.vault.update_canvas_image_transform(
+            &page_id, &canvas_id, &image_id, x, y, width, height, deleted,
+        )?;
+        self.spatial_cache
+            .write()
+            .remove(&(page_id, canvas_id));
+        Ok(serde_json::to_string(&updated).unwrap_or_else(|_| "{}".into()))
+    }
+
     // ------------------------------------------------------------------------
     // Salt Halo (随手圈) & BYOK Multimodal AI
     // ------------------------------------------------------------------------
@@ -526,6 +565,7 @@ impl SaltEngine {
         preset_id: String,
         lasso_points_le: Vec<u8>,
         provider_id: Option<String>,
+        output_language_hint: Option<String>,
         callback: Box<dyn HaloStreamCallback>,
     ) -> Result<Arc<HaloCancelHandle>, FfiError> {
         let snap = self.vault.get_page_snapshot(&page_id)?;
@@ -582,9 +622,17 @@ impl SaltEngine {
 
         let context_markdown = extract_markdown_context(&snap.body_markdown, None);
         let provider = self.resolve_provider(provider_id.as_deref(), webp_slice.is_some())?;
+        let output_language = self.resolve_effective_output_language(output_language_hint.as_deref());
 
         // Enforce privacy guard synchronously too so caller gets immediate error if blocked
         SaltRouter::enforce_privacy_guard(snap.meta.is_private, &provider)?;
+
+        // Smart non-overlapping initial pin placement around padded_bbox
+        let (pin_x, pin_y) = pick_non_overlapping_pin(
+            selection.padded_bbox,
+            &snap.halos,
+            &canvas_id,
+        );
 
         let base_halo = HaloAnnotation {
             halo_id: halo_id.clone(),
@@ -593,6 +641,8 @@ impl SaltEngine {
             preset_id: preset.preset_id.clone(),
             anchor_bbox: Some(selection.padded_bbox),
             anchor_text_offset: None,
+            pin_x: Some(pin_x),
+            pin_y: Some(pin_y),
             slice_cache_path,
             context_excerpt: context_markdown.clone(),
             response_markdown: String::new(),
@@ -609,6 +659,7 @@ impl SaltEngine {
             context_markdown,
             user_prompt_extra: None,
             webp_slice,
+            output_language,
         };
 
         let sink = Arc::new(FfiStreamBridge {
@@ -636,6 +687,7 @@ impl SaltEngine {
         anchor_offset: u32,
         selected_text: String,
         provider_id: Option<String>,
+        output_language_hint: Option<String>,
         callback: Box<dyn HaloStreamCallback>,
     ) -> Result<Arc<HaloCancelHandle>, FfiError> {
         let snap = self.vault.get_page_snapshot(&page_id)?;
@@ -650,6 +702,7 @@ impl SaltEngine {
         let context_markdown =
             extract_markdown_context(&snap.body_markdown, Some(anchor_offset as usize));
         let provider = self.resolve_provider(provider_id.as_deref(), false)?;
+        let output_language = self.resolve_effective_output_language(output_language_hint.as_deref());
         SaltRouter::enforce_privacy_guard(snap.meta.is_private, &provider)?;
 
         let halo_id = new_ulid();
@@ -660,6 +713,8 @@ impl SaltEngine {
             preset_id: preset.preset_id.clone(),
             anchor_bbox: None,
             anchor_text_offset: Some(anchor_offset),
+            pin_x: None,
+            pin_y: None,
             slice_cache_path: None,
             context_excerpt: selected_text.clone(),
             response_markdown: String::new(),
@@ -676,6 +731,7 @@ impl SaltEngine {
             context_markdown,
             user_prompt_extra: Some(format!("Highlighted excerpt:\n{selected_text}")),
             webp_slice: None,
+            output_language,
         };
 
         let sink = Arc::new(FfiStreamBridge {
@@ -694,6 +750,17 @@ impl SaltEngine {
         Ok(Arc::new(HaloCancelHandle {
             token: cancel_token,
         }))
+    }
+
+    pub fn update_halo_pin(
+        &self,
+        page_id: String,
+        halo_id: String,
+        pin_x: f32,
+        pin_y: f32,
+    ) -> Result<String, FfiError> {
+        let updated = self.vault.update_halo_pin(&page_id, &halo_id, pin_x, pin_y)?;
+        Ok(serde_json::to_string(&updated).unwrap_or_else(|_| "{}".into()))
     }
 
     pub fn fuse_halo_into_body(&self, page_id: String, halo_id: String) -> Result<String, FfiError> {
@@ -720,6 +787,11 @@ impl SaltEngine {
             })?;
         halo.collapsed = collapsed;
         self.vault.upsert_halo(&halo)?;
+        Ok(())
+    }
+
+    pub fn delete_halo(&self, page_id: String, halo_id: String) -> Result<(), FfiError> {
+        self.vault.delete_halo(&page_id, &halo_id)?;
         Ok(())
     }
 
@@ -788,6 +860,26 @@ impl SaltEngine {
         let (cards, logs) = self.vault.get_all_cards_and_logs();
         let _ = self.intel.replay_and_store_fsrs(&cards, &logs);
         Ok(serde_json::to_string(&card).unwrap_or_else(|_| "{}".into()))
+    }
+
+    pub fn update_flashcard(
+        &self,
+        page_id: String,
+        card_id: String,
+        front: String,
+        back: String,
+    ) -> Result<String, FfiError> {
+        let updated = self.vault.update_card(&page_id, &card_id, front, back)?;
+        let (cards, logs) = self.vault.get_all_cards_and_logs();
+        let _ = self.intel.replay_and_store_fsrs(&cards, &logs);
+        Ok(serde_json::to_string(&updated).unwrap_or_else(|_| "{}".into()))
+    }
+
+    pub fn delete_flashcard(&self, page_id: String, card_id: String) -> Result<(), FfiError> {
+        self.vault.delete_card(&page_id, &card_id)?;
+        let (cards, logs) = self.vault.get_all_cards_and_logs();
+        let _ = self.intel.replay_and_store_fsrs(&cards, &logs);
+        Ok(())
     }
 
     pub fn list_due_cards_json(&self) -> Result<String, FfiError> {
@@ -979,6 +1071,65 @@ impl SaltEngine {
                 detail: format!("AI provider '{target_id}' is not configured"),
             })
     }
+
+    fn resolve_effective_output_language(&self, ui_hint: Option<&str>) -> Option<String> {
+        let cfg = self.vault.load_router_config().ok();
+        let ai_pref = cfg
+            .as_ref()
+            .map(|c| c.ai_output_language.trim())
+            .unwrap_or("follow_ui");
+        let chosen = if ai_pref.is_empty() || ai_pref.eq_ignore_ascii_case("follow_ui") {
+            let ui_pref = cfg
+                .as_ref()
+                .map(|c| c.ui_language.trim())
+                .unwrap_or("system");
+            if ui_pref.is_empty() || ui_pref.eq_ignore_ascii_case("system") {
+                ui_hint.unwrap_or("").trim().to_string()
+            } else {
+                ui_pref.to_string()
+            }
+        } else {
+            ai_pref.to_string()
+        };
+        if chosen.is_empty() {
+            None
+        } else {
+            Some(chosen)
+        }
+    }
+}
+
+fn pick_non_overlapping_pin(
+    bbox: RectF,
+    existing_halos: &[HaloAnnotation],
+    canvas_id: &str,
+) -> (f32, f32) {
+    let mut px = bbox.max_x;
+    let mut py = bbox.min_y;
+    let existing_pins: Vec<(f32, f32)> = existing_halos
+        .iter()
+        .filter(|h| h.canvas_id.as_deref() == Some(canvas_id))
+        .filter_map(|h| {
+            let x = h.pin_x.or_else(|| h.anchor_bbox.map(|b| b.max_x))?;
+            let y = h.pin_y.or_else(|| h.anchor_bbox.map(|b| b.min_y))?;
+            Some((x, y))
+        })
+        .collect();
+
+    for _ in 0..12 {
+        let collides = existing_pins
+            .iter()
+            .any(|&(ex, ey)| (ex - px).hypot(ey - py) < 26.0);
+        if !collides {
+            break;
+        }
+        py += 34.0;
+        if py > bbox.max_y + 120.0 {
+            py = bbox.min_y;
+            px += 34.0;
+        }
+    }
+    (px, py)
 }
 
 fn parse_page_mode(raw: &str) -> PageMode {
@@ -1099,6 +1250,22 @@ mod tests {
             .unwrap();
         assert!(reviewed.contains("\"reps\":1"));
 
+        // Update & delete flashcard over FFI
+        let edited_card_json = engine
+            .update_flashcard(
+                meta.page_id.clone(),
+                card.card_id.clone(),
+                "Q1 Updated".into(),
+                "A1 Updated".into(),
+            )
+            .unwrap();
+        assert!(edited_card_json.contains("Q1 Updated"));
+        assert!(engine.list_all_cards_json().unwrap().contains("Q1 Updated"));
+        engine
+            .delete_flashcard(meta.page_id.clone(), card.card_id.clone())
+            .unwrap();
+        assert!(!engine.list_all_cards_json().unwrap().contains(&card.card_id));
+
         // Privacy hard-block over FFI
         engine
             .update_page_meta(meta.page_id.clone(), None, None, Some(true), None)
@@ -1116,9 +1283,33 @@ mod tests {
             0,
             "secret".into(),
             Some("openai-byok".into()),
+            Some("zh-CN".into()),
             Box::new(NoopCb),
         );
         assert!(matches!(blocked, Err(FfiError::PrivacyBlocked { .. })));
+
+        // Halo pin move & image transform via FFI
+        let halo = HaloAnnotation {
+            halo_id: "h-ffi-1".into(),
+            page_id: meta.page_id.clone(),
+            canvas_id: Some("main".into()),
+            preset_id: "builtin.amber_expand".into(),
+            anchor_bbox: Some(RectF { min_x: 0.0, min_y: 0.0, max_x: 50.0, max_y: 50.0 }),
+            anchor_text_offset: None,
+            pin_x: Some(50.0),
+            pin_y: Some(0.0),
+            slice_cache_path: None,
+            context_excerpt: String::new(),
+            response_markdown: "hi".into(),
+            collapsed: false,
+            fused: false,
+            created_at_utc: now_utc_ms(),
+        };
+        engine.vault.upsert_halo(&halo).unwrap();
+        let moved_json = engine
+            .update_halo_pin(meta.page_id.clone(), "h-ffi-1".into(), 180.0, 95.0)
+            .unwrap();
+        assert!(moved_json.contains("180.0"));
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

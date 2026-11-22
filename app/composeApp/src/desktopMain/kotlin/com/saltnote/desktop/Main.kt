@@ -33,7 +33,7 @@ fun main() = application {
             exitApplication()
         },
         state = windowState,
-        title = "SaltNote Alpha — Local-First Dual-Mode Notes",
+        title = "SaltNote",
     ) {
         SaltNoteApp(state = appState)
     }

@@ -20,6 +20,9 @@ kotlin {
         namespace = "com.saltnote.compose"
         compileSdk = 37
         minSdk = 26
+        androidResources {
+            enable = true
+        }
         compilerOptions {
             jvmTarget.set(JvmTarget.JVM_17)
         }
@@ -35,6 +38,9 @@ kotlin {
             implementation(compose.ui)
             implementation(libs.kotlinx.coroutines.core)
             implementation(libs.kotlinx.serialization.json)
+            implementation(libs.latex.renderer)
+            implementation(libs.latex.fonts.katex)
+            implementation(libs.zxing.core)
         }
 
         val desktopMain by getting {
@@ -44,15 +50,22 @@ kotlin {
             }
         }
 
+        val desktopTest by getting {
+            dependencies {
+                implementation(libs.junit.jupiter)
+                runtimeOnly(libs.junit.platform.launcher)
+            }
+        }
+
         val androidMain by getting {
             dependencies {
                 implementation(libs.kotlinx.coroutines.android)
                 implementation(libs.androidx.core.ktx)
-                implementation(libs.androidx.ink.authoring)
-                implementation(libs.androidx.ink.brush)
-                implementation(libs.androidx.ink.strokes)
-                implementation(libs.androidx.graphics.core)
                 implementation(libs.androidx.input.motionprediction)
+                implementation(libs.androidx.camera.core)
+                implementation(libs.androidx.camera.camera2)
+                implementation(libs.androidx.camera.lifecycle)
+                implementation(libs.androidx.camera.view)
             }
         }
     }
@@ -73,6 +86,10 @@ compose.desktop {
 }
 
 // Forward MVP documentation convenience tasks (`:app:composeApp:assembleDebug` / `installDebug`)
+tasks.withType<Test>().configureEach {
+    useJUnitPlatform()
+}
+
 tasks.register("assembleDebug") {
     group = "saltnote"
     description = "Assemble Android Debug APK via :app:androidApp:assembleDebug"

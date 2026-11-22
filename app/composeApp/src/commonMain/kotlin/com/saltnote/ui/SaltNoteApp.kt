@@ -36,13 +36,16 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.VerticalDivider
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.unit.dp
-import com.saltnote.ui.platform.pickLocalFolderPath
+import com.saltnote.ui.i18n.LocalSaltStrings
+import com.saltnote.ui.i18n.SaltStrings
+import com.saltnote.ui.platform.pickVaultDirectory
 import com.saltnote.ui.screens.FsrsReviewScreen
 import com.saltnote.ui.screens.NotesWorkspaceScreen
 import com.saltnote.ui.screens.SettingsScreen
@@ -53,111 +56,126 @@ import com.saltnote.ui.theme.SaltNoteTheme
 
 @Composable
 fun SaltNoteApp(state: SaltAppState) {
-    SaltNoteTheme(darkTheme = state.darkTheme) {
-        val snackbarHostState = remember { SnackbarHostState() }
+    val strings = state.strings
+    CompositionLocalProvider(LocalSaltStrings provides strings) {
+        SaltNoteTheme(darkTheme = state.darkTheme) {
+            val snackbarHostState = remember { SnackbarHostState() }
 
-        LaunchedEffect(state.snackbarMessage) {
-            val msg = state.snackbarMessage
-            if (!msg.isNullOrBlank()) {
-                snackbarHostState.showSnackbar(msg)
-                state.clearToast()
-            }
-        }
-
-        BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
-            val isWideScreen = maxWidth >= 840.dp
-
-            Scaffold(
-                snackbarHost = { SnackbarHost(snackbarHostState) },
-                bottomBar = {
-                    if (!isWideScreen) {
-                        NavigationBar {
-                            NavTab.entries.forEach { tab ->
-                                NavigationBarItem(
-                                    selected = state.selectedTab == tab,
-                                    onClick = { state.selectedTab = tab },
-                                    icon = { NavTabIcon(tab, state.dueCards.size) },
-                                    label = { Text(tab.label) },
-                                )
-                            }
-                        }
-                    }
-                },
-            ) { innerPadding ->
-                Row(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .padding(innerPadding),
-                ) {
-                    if (isWideScreen) {
-                        NavigationRail(
-                            containerColor = MaterialTheme.colorScheme.surfaceContainer,
-                            header = {
-                                Column(
-                                    horizontalAlignment = Alignment.CenterHorizontally,
-                                    modifier = Modifier.padding(vertical = 12.dp),
-                                ) {
-                                    Surface(
-                                        shape = MaterialTheme.shapes.medium,
-                                        color = MaterialTheme.colorScheme.primaryContainer,
-                                        modifier = Modifier.size(44.dp),
-                                    ) {
-                                        Box(contentAlignment = Alignment.Center) {
-                                            Icon(
-                                                Icons.Rounded.AutoStories,
-                                                contentDescription = "SaltNote",
-                                                tint = MaterialTheme.colorScheme.onPrimaryContainer,
-                                            )
-                                        }
-                                    }
-                                    Spacer(Modifier.height(4.dp))
-                                    Text("Salt", style = MaterialTheme.typography.labelSmall)
-                                }
-                            },
-                        ) {
-                            NavTab.entries.forEach { tab ->
-                                NavigationRailItem(
-                                    selected = state.selectedTab == tab,
-                                    onClick = { state.selectedTab = tab },
-                                    icon = { NavTabIcon(tab, state.dueCards.size) },
-                                    label = { Text(tab.label) },
-                                )
-                            }
-                        }
-                        VerticalDivider()
-                    }
-
-                    Box(modifier = Modifier.weight(1f).fillMaxHeight()) {
-                        when (state.selectedTab) {
-                            NavTab.Notes -> NotesWorkspaceScreen(state = state, isWideScreen = isWideScreen)
-                            NavTab.Review -> FsrsReviewScreen(state = state)
-                            NavTab.Sync -> SyncScreen(state = state)
-                            NavTab.Settings -> SettingsScreen(state = state)
-                        }
-                    }
+            LaunchedEffect(state.snackbarMessage) {
+                val msg = state.snackbarMessage
+                if (!msg.isNullOrBlank()) {
+                    snackbarHostState.showSnackbar(msg)
+                    state.clearToast()
                 }
             }
 
-            // First-launch zero-config offline onboarding dialog (MVP M4)
-            if (state.showOnboarding) {
-                ZeroConfigOnboardingDialog(
-                    vaultPath = state.client.vaultPath,
-                    onStartOffline = { state.showOnboarding = false },
-                    onChangeVault = {
-                        val picked = pickLocalFolderPath("选择 SaltNote Vault 文件夹", state.client.vaultPath)
-                        if (picked != null) {
-                            state.switchVaultDirectory(picked)
+            BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
+                val isWideScreen = maxWidth >= 840.dp
+
+                Scaffold(
+                    snackbarHost = { SnackbarHost(snackbarHostState) },
+                    bottomBar = {
+                        if (!isWideScreen) {
+                            NavigationBar {
+                                NavTab.entries.forEach { tab ->
+                                    val label = navTabLabel(tab, strings)
+                                    NavigationBarItem(
+                                        selected = state.selectedTab == tab,
+                                        onClick = { state.selectedTab = tab },
+                                        icon = { NavTabIcon(tab, state.dueCards.size, label) },
+                                        label = { Text(label) },
+                                    )
+                                }
+                            }
                         }
-                        state.showOnboarding = false
                     },
-                )
+                ) { innerPadding ->
+                    Row(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(innerPadding),
+                    ) {
+                        if (isWideScreen) {
+                            NavigationRail(
+                                containerColor = MaterialTheme.colorScheme.surfaceContainer,
+                                header = {
+                                    Column(
+                                        horizontalAlignment = Alignment.CenterHorizontally,
+                                        modifier = Modifier.padding(vertical = 12.dp),
+                                    ) {
+                                        Surface(
+                                            shape = MaterialTheme.shapes.medium,
+                                            color = MaterialTheme.colorScheme.primaryContainer,
+                                            modifier = Modifier.size(44.dp),
+                                        ) {
+                                            Box(contentAlignment = Alignment.Center) {
+                                                Icon(
+                                                    Icons.Rounded.AutoStories,
+                                                    contentDescription = "SaltNote",
+                                                    tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                                                )
+                                            }
+                                        }
+                                        Spacer(Modifier.height(4.dp))
+                                        Text("SaltNote", style = MaterialTheme.typography.labelSmall)
+                                    }
+                                },
+                            ) {
+                                NavTab.entries.forEach { tab ->
+                                    val label = navTabLabel(tab, strings)
+                                    NavigationRailItem(
+                                        selected = state.selectedTab == tab,
+                                        onClick = { state.selectedTab = tab },
+                                        icon = { NavTabIcon(tab, state.dueCards.size, label) },
+                                        label = { Text(label) },
+                                    )
+                                }
+                            }
+                            VerticalDivider()
+                        }
+
+                        Box(modifier = Modifier.weight(1f).fillMaxHeight()) {
+                            when (state.selectedTab) {
+                                NavTab.Notes -> NotesWorkspaceScreen(state = state, isWideScreen = isWideScreen)
+                                NavTab.Review -> FsrsReviewScreen(state = state)
+                                NavTab.Sync -> SyncScreen(state = state)
+                                NavTab.Settings -> SettingsScreen(state = state)
+                            }
+                        }
+                    }
+                }
+
+                if (state.showOnboarding) {
+                    ZeroConfigOnboardingDialog(
+                        vaultPath = state.client.vaultPath,
+                        onStart = { state.showOnboarding = false },
+                        onChangeVault = {
+                            pickVaultDirectory(
+                                initialPath = state.client.vaultPath,
+                                strings = strings,
+                                onPicked = { picked ->
+                                    state.switchVaultDirectory(picked)
+                                    state.showOnboarding = false
+                                },
+                                onMessage = { msg -> state.notifyMessage(msg) },
+                            )
+                        },
+                    )
+                }
             }
         }
     }
 }
 
+private fun navTabLabel(tab: NavTab, strings: SaltStrings): String = when (tab) {
+    NavTab.Notes -> strings.navNotes
+    NavTab.Review -> strings.navReview
+    NavTab.Sync -> strings.navSync
+    NavTab.Settings -> strings.navSettings
+}
+
 @Composable
-private fun NavTabIcon(tab: NavTab, dueCount: Int) {
+private fun NavTabIcon(tab: NavTab, dueCount: Int, description: String) {
     val icon: ImageVector = when (tab) {
         NavTab.Notes -> Icons.Rounded.Description
         NavTab.Review -> Icons.Rounded.Style
@@ -166,27 +184,28 @@ private fun NavTabIcon(tab: NavTab, dueCount: Int) {
     }
     if (tab == NavTab.Review && dueCount > 0) {
         BadgedBox(badge = { Badge { Text(dueCount.toString()) } }) {
-            Icon(icon, contentDescription = tab.label)
+            Icon(icon, contentDescription = description)
         }
     } else {
-        Icon(icon, contentDescription = tab.label)
+        Icon(icon, contentDescription = description)
     }
 }
 
 @Composable
 private fun ZeroConfigOnboardingDialog(
     vaultPath: String,
-    onStartOffline: () -> Unit,
+    onStart: () -> Unit,
     onChangeVault: () -> Unit,
 ) {
+    val strings = LocalSaltStrings.current
     AlertDialog(
-        onDismissRequest = onStartOffline,
+        onDismissRequest = onStart,
         icon = { Icon(Icons.Rounded.Shield, contentDescription = null) },
-        title = { Text("欢迎使用 SaltNote") },
+        title = { Text(strings.onboardingTitle) },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text(
-                    text = "已为你准备好本地笔记目录，无需注册或登录即可直接开始记录。",
+                    text = strings.onboardingSubtitle,
                     style = MaterialTheme.typography.bodyMedium,
                 )
                 Text(
@@ -197,13 +216,13 @@ private fun ZeroConfigOnboardingDialog(
             }
         },
         confirmButton = {
-            Button(onClick = onStartOffline) {
-                Text("开始使用")
+            Button(onClick = onStart) {
+                Text(strings.startUsing)
             }
         },
         dismissButton = {
             TextButton(onClick = onChangeVault) {
-                Text("更改目录")
+                Text(strings.changeDirectory)
             }
         },
     )

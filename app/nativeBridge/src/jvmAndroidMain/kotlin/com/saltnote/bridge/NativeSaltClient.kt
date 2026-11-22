@@ -86,6 +86,10 @@ private class NativeSaltNoteClient(
         engine.updatePageBody(pageId, markdown)
     }
 
+    override fun deletePage(pageId: String) {
+        engine.deletePage(pageId)
+    }
+
     override fun flushDeltas(): Int = engine.flushDeltas().toInt()
 
     override fun exportMarkdownBackup(targetDir: String): Int =
@@ -153,6 +157,19 @@ private class NativeSaltNoteClient(
         engine.insertCanvasImage(pageId, canvasId, rawImageBytes, x, y, maxWidth),
     )
 
+    override fun updateCanvasImageTransform(
+        pageId: String,
+        canvasId: String,
+        imageId: String,
+        x: Float,
+        y: Float,
+        width: Float,
+        height: Float,
+        deleted: Boolean,
+    ): CanvasImageNodeDto = saltJson.decodeFromString(
+        engine.updateCanvasImageTransform(pageId, canvasId, imageId, x, y, width, height, deleted),
+    )
+
     override fun getHaloPresets(): List<HaloPresetDto> =
         saltJson.decodeFromString(engine.getHaloPresetsJson())
 
@@ -162,6 +179,7 @@ private class NativeSaltNoteClient(
         presetId: String,
         lassoPoints: List<StrokeSample>,
         providerId: String?,
+        outputLanguageHint: String?,
         listener: HaloStreamListener,
     ): CancelHandle {
         val raw = encodeStrokePointsLe(lassoPoints)
@@ -171,6 +189,7 @@ private class NativeSaltNoteClient(
             presetId = presetId,
             lassoPointsLe = raw,
             providerId = providerId,
+            outputLanguageHint = outputLanguageHint,
             callback = wrapCallback(listener),
         )
         return NativeCancelHandle(handle)
@@ -182,6 +201,7 @@ private class NativeSaltNoteClient(
         anchorOffset: Int,
         selectedText: String,
         providerId: String?,
+        outputLanguageHint: String?,
         listener: HaloStreamListener,
     ): CancelHandle {
         val handle = engine.triggerTextHalo(
@@ -190,16 +210,24 @@ private class NativeSaltNoteClient(
             anchorOffset = anchorOffset.coerceAtLeast(0).toUInt(),
             selectedText = selectedText,
             providerId = providerId,
+            outputLanguageHint = outputLanguageHint,
             callback = wrapCallback(listener),
         )
         return NativeCancelHandle(handle)
     }
+
+    override fun updateHaloPin(pageId: String, haloId: String, pinX: Float, pinY: Float): HaloAnnotationDto =
+        saltJson.decodeFromString(engine.updateHaloPin(pageId, haloId, pinX, pinY))
 
     override fun fuseHaloIntoBody(pageId: String, haloId: String): String =
         engine.fuseHaloIntoBody(pageId, haloId)
 
     override fun toggleHaloCollapsed(pageId: String, haloId: String, collapsed: Boolean) {
         engine.toggleHaloCollapsed(pageId, haloId, collapsed)
+    }
+
+    override fun deleteHalo(pageId: String, haloId: String) {
+        engine.deleteHalo(pageId, haloId)
     }
 
     override fun parseFlashcardDrafts(rawOutput: String): List<FlashcardDraftDto> =
@@ -226,6 +254,19 @@ private class NativeSaltNoteClient(
     ): FlashCardDto = saltJson.decodeFromString(
         engine.createFlashcard(pageId, anchorHaloId, front, back),
     )
+
+    override fun updateFlashcard(
+        pageId: String,
+        cardId: String,
+        front: String,
+        back: String,
+    ): FlashCardDto = saltJson.decodeFromString(
+        engine.updateFlashcard(pageId, cardId, front, back),
+    )
+
+    override fun deleteFlashcard(pageId: String, cardId: String) {
+        engine.deleteFlashcard(pageId, cardId)
+    }
 
     override fun listDueCards(): List<FsrsCardStateDto> =
         saltJson.decodeFromString(engine.listDueCardsJson())

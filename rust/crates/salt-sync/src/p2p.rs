@@ -9,7 +9,7 @@ use salt_crdt::{DeltaPacket, VaultStore};
 use salt_types::{now_utc_ms, sha256_hex, LanPeerInfo, SaltError, SaltResult};
 use serde::{Deserialize, Serialize};
 use socket2::{Domain, Protocol, Socket, Type};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -36,8 +36,17 @@ struct AssetBlob {
     bytes: Vec<u8>,
 }
 
+/// Phase-1 lightweight digest exchanged over QUIC before sending any payload bytes.
 #[derive(Debug, Serialize, Deserialize)]
-struct SyncFrame {
+struct P2pDigest {
+    device_id: String,
+    page_vvs: BTreeMap<String, Vec<u8>>,
+    asset_paths: Vec<String>,
+}
+
+/// Phase-2 incremental bundle containing ONLY missing Loro deltas/snapshots and missing assets.
+#[derive(Debug, Serialize, Deserialize)]
+struct P2pDeltaBundle {
     device_id: String,
     packets: Vec<DeltaPacket>,
     #[serde(default)]
@@ -357,58 +366,65 @@ impl LanP2pNode {
             .await
             .map_err(|e| SaltError::Sync(e.to_string()))?;
 
-        // Flush any dirty local deltas first so Loro state is completely up to date
+        // Phase 1: Exchange lightweight Loro VersionVector + asset path digests
         let _ = vault.flush_all_dirty_deltas();
-        let local_packets = vault.export_all_page_packets()?;
-        let local_assets: Vec<AssetBlob> = vault
-            .export_all_assets()?
+        let local_assets_list = vault.list_asset_rel_paths()?;
+        let local_digest = P2pDigest {
+            device_id: self.device_id.clone(),
+            page_vvs: vault.export_page_version_vectors(),
+            asset_paths: local_assets_list.clone(),
+        };
+        write_framed_json(&mut send, &local_digest).await?;
+        let peer_digest: P2pDigest = read_framed_json(&mut recv).await?;
+
+        // Phase 2: Compute and send ONLY missing page deltas & missing assets
+        let out_packets = vault.export_diff_packets_against(&peer_digest.page_vvs)?;
+        let peer_asset_set: HashSet<&str> =
+            peer_digest.asset_paths.iter().map(String::as_str).collect();
+        let missing_asset_paths: Vec<String> = local_assets_list
+            .into_iter()
+            .filter(|p| !peer_asset_set.contains(p.as_str()))
+            .collect();
+        let out_assets: Vec<AssetBlob> = vault
+            .read_assets_by_paths(&missing_asset_paths)?
             .into_iter()
             .map(|(rel_path, bytes)| AssetBlob { rel_path, bytes })
             .collect();
 
-        let sent_packets = local_packets.len() as u32;
-        let sent_assets = local_assets.len() as u32;
-        let out_frame = SyncFrame {
+        let sent_packets = out_packets.len() as u32;
+        let sent_assets = out_assets.len() as u32;
+        let out_bundle = P2pDeltaBundle {
             device_id: self.device_id.clone(),
-            packets: local_packets,
-            assets: local_assets,
+            packets: out_packets,
+            assets: out_assets,
         };
-        let out_bytes =
-            serde_json::to_vec(&out_frame).map_err(|e| SaltError::Sync(e.to_string()))?;
-
-        send.write_all(&out_bytes)
-            .await
-            .map_err(|e| SaltError::Sync(e.to_string()))?;
+        write_framed_json(&mut send, &out_bundle).await?;
         send.finish().map_err(|e| SaltError::Sync(e.to_string()))?;
 
-        let in_bytes = tokio::time::timeout(Duration::from_secs(30), recv.read_to_end(MAX_FRAME_BYTES))
-            .await
-            .map_err(|_| SaltError::Sync("读取对端同步数据超时".into()))?
-            .map_err(|e| SaltError::Sync(e.to_string()))?;
+        let in_bundle: P2pDeltaBundle = read_framed_json(&mut recv).await?;
 
-        let in_frame: SyncFrame = serde_json::from_slice(&in_bytes)
-            .map_err(|e| SaltError::Sync(format!("Invalid peer frame: {e}")))?;
-
-        // Import all assets first, then all pages
+        // Import missing assets first, then missing page deltas
         let mut received_assets = 0u32;
-        for asset in &in_frame.assets {
+        for asset in &in_bundle.assets {
             vault.store_asset_bytes(&asset.rel_path, &asset.bytes)?;
             received_assets += 1;
         }
         let mut received_packets = 0u32;
-        for pkt in &in_frame.packets {
+        for pkt in &in_bundle.packets {
             let raw = serde_json::to_vec(pkt).map_err(|e| SaltError::Sync(e.to_string()))?;
             vault.import_delta_packet_bytes(&raw)?;
             received_packets += 1;
         }
 
-        if let Some(hook) = &self.on_remote_sync {
-            hook();
+        if received_packets > 0 || received_assets > 0 {
+            if let Some(hook) = &self.on_remote_sync {
+                hook();
+            }
         }
 
         conn.close(0u32.into(), b"done");
         Ok(P2pSyncResult {
-            peer_device_id: in_frame.device_id,
+            peer_device_id: in_bundle.device_id,
             sent_packets,
             received_packets,
             sent_assets,
@@ -425,6 +441,39 @@ impl LanP2pNode {
     }
 }
 
+async fn write_framed_json<T: Serialize>(send: &mut quinn::SendStream, value: &T) -> SaltResult<()> {
+    let bytes = serde_json::to_vec(value).map_err(|e| SaltError::Sync(e.to_string()))?;
+    if bytes.len() > MAX_FRAME_BYTES {
+        return Err(SaltError::Sync("Sync frame exceeds size limit".into()));
+    }
+    let len_le = (bytes.len() as u32).to_le_bytes();
+    send.write_all(&len_le)
+        .await
+        .map_err(|e| SaltError::Sync(e.to_string()))?;
+    send.write_all(&bytes)
+        .await
+        .map_err(|e| SaltError::Sync(e.to_string()))?;
+    Ok(())
+}
+
+async fn read_framed_json<T: for<'de> Deserialize<'de>>(recv: &mut quinn::RecvStream) -> SaltResult<T> {
+    let mut len_buf = [0u8; 4];
+    tokio::time::timeout(Duration::from_secs(30), recv.read_exact(&mut len_buf))
+        .await
+        .map_err(|_| SaltError::Sync("读取对端同步帧头超时".into()))?
+        .map_err(|e| SaltError::Sync(e.to_string()))?;
+    let frame_len = u32::from_le_bytes(len_buf) as usize;
+    if frame_len > MAX_FRAME_BYTES {
+        return Err(SaltError::Sync("Incoming sync frame exceeds size limit".into()));
+    }
+    let mut buf = vec![0u8; frame_len];
+    tokio::time::timeout(Duration::from_secs(30), recv.read_exact(&mut buf))
+        .await
+        .map_err(|_| SaltError::Sync("读取对端同步数据超时".into()))?
+        .map_err(|e| SaltError::Sync(e.to_string()))?;
+    serde_json::from_slice(&buf).map_err(|e| SaltError::Sync(format!("Invalid sync frame: {e}")))
+}
+
 async fn handle_incoming_sync_conn(
     conn: quinn::Connection,
     vault: &VaultStore,
@@ -435,46 +484,59 @@ async fn handle_incoming_sync_conn(
         .await
         .map_err(|e| SaltError::Sync(e.to_string()))?;
 
-    let in_bytes = tokio::time::timeout(Duration::from_secs(30), recv.read_to_end(MAX_FRAME_BYTES))
-        .await
-        .map_err(|_| SaltError::Sync("Incoming sync read timeout".into()))?
-        .map_err(|e| SaltError::Sync(e.to_string()))?;
-    let in_frame: SyncFrame = serde_json::from_slice(&in_bytes)
-        .map_err(|e| SaltError::Sync(format!("Invalid incoming frame: {e}")))?;
-
-    // Snapshot local pages & assets BEFORE importing peer packets to avoid echoing peer data back
+    // Phase 1: Receive peer digest and reply with local digest BEFORE importing anything
+    let peer_digest: P2pDigest = read_framed_json(&mut recv).await?;
     let _ = vault.flush_all_dirty_deltas();
-    let local_packets = vault.export_all_page_packets()?;
-    let local_assets: Vec<AssetBlob> = vault
-        .export_all_assets()?
+    let local_assets_list = vault.list_asset_rel_paths()?;
+    let local_digest = P2pDigest {
+        device_id: vault.device_state().device_id,
+        page_vvs: vault.export_page_version_vectors(),
+        asset_paths: local_assets_list.clone(),
+    };
+    write_framed_json(&mut send, &local_digest).await?;
+
+    // Compute diff for peer BEFORE importing incoming bundle (zero echo)
+    let out_packets = vault.export_diff_packets_against(&peer_digest.page_vvs)?;
+    let peer_asset_set: HashSet<&str> =
+        peer_digest.asset_paths.iter().map(String::as_str).collect();
+    let missing_asset_paths: Vec<String> = local_assets_list
+        .into_iter()
+        .filter(|p| !peer_asset_set.contains(p.as_str()))
+        .collect();
+    let out_assets: Vec<AssetBlob> = vault
+        .read_assets_by_paths(&missing_asset_paths)?
         .into_iter()
         .map(|(rel_path, bytes)| AssetBlob { rel_path, bytes })
         .collect();
 
-    // Import ALL incoming assets & pages completely
-    for asset in &in_frame.assets {
-        let _ = vault.store_asset_bytes(&asset.rel_path, &asset.bytes);
+    // Phase 2: Receive peer's diff bundle, import locally, then send our diff bundle
+    let in_bundle: P2pDeltaBundle = read_framed_json(&mut recv).await?;
+    let mut imported_any = false;
+    for asset in &in_bundle.assets {
+        if vault.store_asset_bytes(&asset.rel_path, &asset.bytes).is_ok() {
+            imported_any = true;
+        }
     }
-    for pkt in &in_frame.packets {
+    for pkt in &in_bundle.packets {
         if let Ok(raw) = serde_json::to_vec(pkt) {
-            let _ = vault.import_delta_packet_bytes(&raw);
+            if vault.import_delta_packet_bytes(&raw).is_ok() {
+                imported_any = true;
+            }
         }
     }
 
-    // Notify host engine so receiver's FTS5/FSRS index, spatial cache & UI refresh immediately
-    if let Some(hook) = on_remote_sync {
-        hook();
+    if imported_any {
+        if let Some(hook) = on_remote_sync {
+            hook();
+        }
     }
 
-    let reply = SyncFrame {
+    let reply = P2pDeltaBundle {
         device_id: vault.device_state().device_id,
-        packets: local_packets,
-        assets: local_assets,
+        packets: out_packets,
+        assets: out_assets,
     };
-    let reply_bytes = serde_json::to_vec(&reply).map_err(|e| SaltError::Sync(e.to_string()))?;
-    send.write_all(&reply_bytes)
-        .await
-        .map_err(|e| SaltError::Sync(e.to_string()))?;
+    write_framed_json(&mut send, &reply).await?;
     send.finish().map_err(|e| SaltError::Sync(e.to_string()))?;
 
     // Wait for client's clean close confirmation so the full reply stream is guaranteed delivered
@@ -791,6 +853,41 @@ mod tests {
         assert!(v2.get_page_snapshot(&m1a.page_id).is_ok());
         assert!(v2.get_page_snapshot(&m1b.page_id).is_ok());
         assert!(v2.paths().root.join("assets/ab/abcdef0123456789.webp").exists());
+
+        // Second sync with zero changes must transfer ZERO packets and ZERO assets (State Vector diff!)
+        let res_noop = node1
+            .sync_with_peer(addr2, node2.cert_fingerprint(), &v1)
+            .await
+            .unwrap();
+        assert_eq!(res_noop.sent_packets, 0);
+        assert_eq!(res_noop.received_packets, 0);
+        assert_eq!(res_noop.sent_assets, 0);
+        assert_eq!(res_noop.received_assets, 0);
+
+        // Edit ONLY 1 page on tablet -> next sync transfers ONLY that 1 page delta and ZERO assets
+        v1.update_page_body(&m1a.page_id, "Sketch A updated incrementally")
+            .unwrap();
+        let res_inc = node1
+            .sync_with_peer(addr2, node2.cert_fingerprint(), &v1)
+            .await
+            .unwrap();
+        assert_eq!(res_inc.sent_packets, 1);
+        assert_eq!(res_inc.received_packets, 0);
+        assert_eq!(res_inc.sent_assets, 0);
+        assert_eq!(res_inc.received_assets, 0);
+        assert_eq!(
+            v2.get_page_snapshot(&m1a.page_id).unwrap().body_markdown,
+            "Sketch A updated incrementally"
+        );
+
+        // Delete 1 page on desktop -> propagates tombstone to tablet cleanly
+        v2.delete_page(&m1b.page_id).unwrap();
+        let res_del = node1
+            .sync_with_peer(addr2, node2.cert_fingerprint(), &v1)
+            .await
+            .unwrap();
+        assert_eq!(res_del.received_packets, 1);
+        assert!(v1.list_pages().iter().all(|p| p.meta.page_id != m1b.page_id));
 
         // Fingerprint persistence check across restarts
         let saved_fp = node2.cert_fingerprint().to_string();

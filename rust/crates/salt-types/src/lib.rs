@@ -89,6 +89,8 @@ pub struct PageMeta {
     pub tags: Vec<String>,
     pub created_at_utc: i64,
     pub updated_at_utc: i64,
+    #[serde(default)]
+    pub is_deleted: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -460,7 +462,7 @@ pub fn default_halo_presets() -> Vec<HaloPreset> {
             color_argb: 0xFFF5C242,
             vision_policy: VisionPolicy::TextShortCircuitIfClean,
             output_mode: HaloOutputMode::MarkdownExpand,
-            system_prompt: "You are SaltNote's study assistant. Provide a crisp Markdown explanation, intuitive analogy, and key takeaways for the circled note region. Keep it structured and concise.".into(),
+            system_prompt: "You are SaltNote's study assistant. Provide a crisp Markdown explanation, intuitive analogy, and key takeaways for the circled note region. Use standard LaTeX delimiters ($...$ for inline math, $$...$$ for display math) for all mathematical formulas instead of code blocks. Keep it structured and concise.".into(),
         },
         HaloPreset {
             preset_id: "builtin.glacier_card".into(),
@@ -469,7 +471,7 @@ pub fn default_halo_presets() -> Vec<HaloPreset> {
             color_argb: 0xFF4EA8DE,
             vision_policy: VisionPolicy::TextShortCircuitIfClean,
             output_mode: HaloOutputMode::FlashcardJson,
-            system_prompt: "Extract 1 to 3 high-value spaced-repetition flashcards from the circled content. Respond ONLY with a JSON array of objects containing {\"front\": \"...\", \"back\": \"...\"}.".into(),
+            system_prompt: "Extract 1 to 3 high-value spaced-repetition flashcards from the circled content. You may use Markdown and standard LaTeX ($...$ / $$...$$) inside front and back values. Respond ONLY with a valid JSON array of objects containing {\"front\": \"...\", \"back\": \"...\"}.".into(),
         },
         HaloPreset {
             preset_id: "builtin.mineral_ocr".into(),
@@ -478,9 +480,73 @@ pub fn default_halo_presets() -> Vec<HaloPreset> {
             color_argb: 0xFF8D99AE,
             vision_policy: VisionPolicy::ForceWebpSlice,
             output_mode: HaloOutputMode::OcrMarkdown,
-            system_prompt: "Transcribe the handwritten notes, formulas, diagrams, or whiteboard image accurately into clean Markdown. Preserve math expressions clearly in code/LaTeX blocks.".into(),
+            system_prompt: "You are a strict verbatim OCR transcriber. Output ONLY the exact text and mathematical formulas visible in the image, formatted cleanly in Markdown with standard LaTeX delimiters ($...$ for inline math, $$...$$ on separate lines for display math). Preserve the original language. NEVER add explanations, commentary, solutions, interpretations, summaries, greetings, or closing remarks.".into(),
         },
     ]
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FlashcardDraft {
+    pub front: String,
+    pub back: String,
+}
+
+/// Parses 1..=3 Q/A flashcard drafts returned by `builtin.glacier_card` (supports raw JSON,
+/// fenced ```json blocks, and Q:/A: markdown fallbacks).
+pub fn parse_flashcard_drafts(raw_output: &str) -> Vec<FlashcardDraft> {
+    let trimmed = raw_output.trim();
+    let json_candidate = if let Some(start) = trimmed.find('[') {
+        if let Some(end) = trimmed.rfind(']') {
+            &trimmed[start..=end]
+        } else {
+            trimmed
+        }
+    } else {
+        trimmed
+    };
+
+    if let Ok(mut parsed) = serde_json::from_str::<Vec<FlashcardDraft>>(json_candidate) {
+        parsed.retain(|c| !c.front.trim().is_empty() && !c.back.trim().is_empty());
+        parsed.truncate(3);
+        if !parsed.is_empty() {
+            return parsed;
+        }
+    }
+
+    let mut drafts = Vec::new();
+    let mut cur_q = String::new();
+    let mut cur_a = String::new();
+    for line in trimmed.lines() {
+        let l = line.trim();
+        if let Some(q) = l
+            .strip_prefix("Q:")
+            .or_else(|| l.strip_prefix("问："))
+            .or_else(|| l.strip_prefix("**Q**:"))
+        {
+            if !cur_q.is_empty() && !cur_a.is_empty() {
+                drafts.push(FlashcardDraft {
+                    front: cur_q.trim().to_string(),
+                    back: cur_a.trim().to_string(),
+                });
+                cur_a.clear();
+            }
+            cur_q = q.trim().to_string();
+        } else if let Some(a) = l
+            .strip_prefix("A:")
+            .or_else(|| l.strip_prefix("答："))
+            .or_else(|| l.strip_prefix("**A**:"))
+        {
+            cur_a = a.trim().to_string();
+        }
+    }
+    if !cur_q.is_empty() && !cur_a.is_empty() {
+        drafts.push(FlashcardDraft {
+            front: cur_q.trim().to_string(),
+            back: cur_a.trim().to_string(),
+        });
+    }
+    drafts.truncate(3);
+    drafts
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -491,6 +557,10 @@ pub struct HaloAnnotation {
     pub preset_id: String,
     pub anchor_bbox: Option<RectF>,
     pub anchor_text_offset: Option<u32>,
+    #[serde(default)]
+    pub pin_x: Option<f32>,
+    #[serde(default)]
+    pub pin_y: Option<f32>,
     pub slice_cache_path: Option<String>,
     pub context_excerpt: String,
     pub response_markdown: String,
@@ -520,10 +590,35 @@ pub struct ProviderConfig {
     pub api_key_ref: String,
 }
 
+fn default_ui_language() -> String {
+    "system".into()
+}
+
+fn default_ai_output_language() -> String {
+    "follow_ui".into()
+}
+
+pub fn ai_language_display_name(code: &str) -> Option<&'static str> {
+    let norm = code.trim().to_ascii_lowercase();
+    match norm.as_str() {
+        "" | "system" | "follow_ui" | "auto" => None,
+        "zh-cn" | "zh_cn" | "zh-hans" | "zh" => Some("Simplified Chinese (简体中文)"),
+        "zh-tw" | "zh_tw" | "zh-hk" | "zh-hant" => Some("Traditional Chinese (繁體中文)"),
+        "en" | "en-us" | "en-gb" => Some("English"),
+        "ja" | "ja-jp" => Some("Japanese (日本語)"),
+        "ko" | "ko-kr" => Some("Korean (한국어)"),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RouterConfig {
     pub default_text_provider: String,
     pub default_vision_provider: String,
+    #[serde(default = "default_ui_language")]
+    pub ui_language: String,
+    #[serde(default = "default_ai_output_language")]
+    pub ai_output_language: String,
     pub providers: Vec<ProviderConfig>,
 }
 
@@ -532,10 +627,12 @@ impl Default for RouterConfig {
         Self {
             default_text_provider: "ollama-local".into(),
             default_vision_provider: "ollama-local".into(),
+            ui_language: default_ui_language(),
+            ai_output_language: default_ai_output_language(),
             providers: vec![
                 ProviderConfig {
                     id: "ollama-local".into(),
-                    name: "Local Ollama (Offline / Private)".into(),
+                    name: "Ollama".into(),
                     kind: AiProviderKind::OllamaLocal,
                     base_url: "http://127.0.0.1:11434/v1".into(),
                     model: "qwen2.5vl:7b".into(),
@@ -543,7 +640,7 @@ impl Default for RouterConfig {
                 },
                 ProviderConfig {
                     id: "openai-byok".into(),
-                    name: "OpenAI Compatible (BYOK)".into(),
+                    name: "OpenAI".into(),
                     kind: AiProviderKind::OpenAiCompatible,
                     base_url: "https://api.openai.com/v1".into(),
                     model: "gpt-4o-mini".into(),
@@ -551,7 +648,7 @@ impl Default for RouterConfig {
                 },
                 ProviderConfig {
                     id: "anthropic-byok".into(),
-                    name: "Anthropic Claude (BYOK)".into(),
+                    name: "Anthropic Claude".into(),
                     kind: AiProviderKind::Anthropic,
                     base_url: "https://api.anthropic.com".into(),
                     model: "claude-3-5-sonnet-latest".into(),
@@ -559,7 +656,7 @@ impl Default for RouterConfig {
                 },
                 ProviderConfig {
                     id: "gemini-byok".into(),
-                    name: "Google Gemini (BYOK)".into(),
+                    name: "Google Gemini".into(),
                     kind: AiProviderKind::Gemini,
                     base_url: "https://generativelanguage.googleapis.com".into(),
                     model: "gemini-2.5-flash".into(),
