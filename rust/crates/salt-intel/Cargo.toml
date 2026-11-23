@@ -8,6 +8,7 @@ license = "Apache-2.0"
 fsrs = "7.0"
 parking_lot = "0.12"
 rusqlite = { version = "0.32", features = ["bundled"] }
+salt-canvas = { path = "../salt-canvas" }
 salt-crdt = { path = "../salt-crdt" }
 salt-types = { path = "../salt-types" }
 tokio = { version = "1", features = ["rt", "sync"] }

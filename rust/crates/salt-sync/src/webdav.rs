@@ -4,9 +4,9 @@ use salt_crdt::VaultStore;
 use salt_router::SecretResolver;
 use salt_types::{
     redact_sensitive_text, sha256_hex, validate_router_config_no_plaintext_keys, DeviceManifest,
-    SaltError, SaltResult, SyncReport, WebDavConfig,
+    SaltError, SaltResult, SyncNetworkPolicy, SyncReport, WebDavConfig,
 };
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::time::Duration;
@@ -83,6 +83,18 @@ impl WebDavSyncClient {
     /// Executes a complete single-writer upload + remote manifest pull cycle.
     /// Hardcoded ignores `.saltnote/local/**` and guarantees atomic `PUT *.tmp` -> `MOVE` writes.
     pub async fn sync_once(&self, vault: &VaultStore) -> SaltResult<SyncReport> {
+        self.sync_once_with_policy(vault, SyncNetworkPolicy::default())
+            .await
+    }
+
+    /// Executes sync with a caller-supplied `SyncNetworkPolicy` (Metered-Network Guard).
+    /// On cellular/metered links (`allow_large_assets == false`), `.delta` packets, 320px thumbnails,
+    /// Opus voice memos, and Halo WebP slices sync immediately while >2MB assets wait for Wi-Fi.
+    pub async fn sync_once_with_policy(
+        &self,
+        vault: &VaultStore,
+        policy: SyncNetworkPolicy,
+    ) -> SaltResult<SyncReport> {
         // Guard: verify router.json contains zero plaintext keys before syncing config
         if let Ok(rcfg) = vault.load_router_config() {
             validate_router_config_no_plaintext_keys(&rcfg)?;
@@ -108,10 +120,23 @@ impl WebDavSyncClient {
             let _ = self.retry_op(&mut report, || self.op.create_dir(dir)).await;
         }
 
-        // 2. Upload immutable assets with HEAD existence check (skip if present)
+        let priority_map: HashMap<String, bool> = vault
+            .collect_referenced_assets()
+            .into_iter()
+            .collect();
+
+        // 2. Upload immutable assets with HEAD existence check & metered-network size guard
         let local_assets_dir = vault.paths().assets_dir();
         if local_assets_dir.exists() {
             for rel_asset in collect_relative_files(&local_assets_dir, "assets")? {
+                let local_file = vault.paths().root.join(&rel_asset);
+                let file_len = fs::metadata(&local_file).map(|m| m.len()).unwrap_or(0);
+                let is_lightweight = *priority_map.get(&rel_asset).unwrap_or(&false);
+                if !policy.allow_large_assets && !is_lightweight && file_len > policy.max_asset_bytes {
+                    report.deferred_assets += 1;
+                    continue;
+                }
+
                 let exists = self
                     .retry_op(&mut report, || self.op.exists(&rel_asset))
                     .await
@@ -125,8 +150,7 @@ impl WebDavSyncClient {
                         .retry_op(&mut report, || self.op.create_dir(&parent_dir))
                         .await;
                 }
-                let bytes = fs::read(vault.paths().root.join(&rel_asset))
-                    .map_err(|e| SaltError::Io(e.to_string()))?;
+                let bytes = fs::read(&local_file).map_err(|e| SaltError::Io(e.to_string()))?;
                 self.atomic_put_move(&rel_asset, bytes, &mut report).await?;
                 report.uploaded_assets += 1;
             }
@@ -179,8 +203,6 @@ impl WebDavSyncClient {
             .await
             .unwrap_or_default();
 
-        let mut referenced_assets: HashSet<String> = HashSet::new();
-
         for item in manifest_entries {
             let path = item.path().to_string();
             if !path.ends_with(".json") || path.ends_with(".tmp") {
@@ -232,27 +254,25 @@ impl WebDavSyncClient {
                     )));
                 }
 
-                let page_id = vault.import_delta_packet_bytes(&data)?;
+                vault.import_delta_packet_bytes(&data)?;
                 vault.update_peer_watermark(&peer_manifest.device_id, delta.seq)?;
                 report.downloaded_deltas += 1;
-
-                if let Ok(snap) = vault.get_page_snapshot(&page_id) {
-                    for c in snap.canvases {
-                        for img in c.images {
-                            if !img.deleted && !img.asset_rel_path.is_empty() {
-                                referenced_assets.insert(img.asset_rel_path);
-                            }
-                        }
-                    }
-                }
             }
         }
 
-        // 6. Download any referenced immutable assets not yet present locally
-        for rel_asset in referenced_assets {
+        // 6. Download any referenced immutable assets (including Halo slices & Inbox media) respecting Metered-Network Guard
+        for (rel_asset, is_lightweight) in vault.collect_referenced_assets() {
             let local_p = vault.paths().root.join(&rel_asset);
             if local_p.exists() {
                 continue;
+            }
+            if !policy.allow_large_assets && !is_lightweight {
+                if let Ok(meta) = self.retry_op(&mut report, || self.op.stat(&rel_asset)).await {
+                    if meta.content_length() > policy.max_asset_bytes {
+                        report.deferred_assets += 1;
+                        continue;
+                    }
+                }
             }
             if let Ok(buf) = self.retry_op(&mut report, || self.op.read(&rel_asset)).await {
                 let _ = vault.store_asset_bytes(&rel_asset, &buf.to_vec());
@@ -692,6 +712,78 @@ mod tests {
             v1.compute_page_state_hash(&meta.page_id).unwrap(),
             v2.compute_page_state_hash(&meta.page_id).unwrap()
         );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn webdav_metered_guard_syncs_deltas_thumbs_slices_and_defers_large_assets() {
+        let server = ChaosWebDavServer::start(false).await;
+        let base = std::env::temp_dir().join(format!("saltnote_metered_dav_{}", new_ulid()));
+        let phone = VaultStore::open(base.join("phone"), Some("Phone".into())).unwrap();
+        let tablet = VaultStore::open(base.join("tablet"), Some("Tablet".into())).unwrap();
+
+        // Large >2MB photo + lightweight 320px thumb + lightweight Opus memo + Halo slice
+        let large_bytes = vec![0x42u8; 2_500_000];
+        let thumb_bytes = b"SMALL_THUMB_WEBP".to_vec();
+        let opus_bytes = b"SMALL_OPUS_AUDIO".to_vec();
+        phone
+            .capture_inbox_item(
+                salt_types::InboxKind::PhotoNote,
+                Some("Large board photo".into()),
+                Some(&large_bytes),
+                Some("webp"),
+                Some(&thumb_bytes),
+                0,
+                false,
+            )
+            .unwrap();
+        phone
+            .capture_inbox_item(
+                salt_types::InboxKind::VoiceMemo,
+                None,
+                Some(&opus_bytes),
+                Some("ogg"),
+                None,
+                8000,
+                false,
+            )
+            .unwrap();
+
+        let cfg = WebDavConfig {
+            endpoint: server.url.clone(),
+            root_path: "/vault".into(),
+            username: "tester".into(),
+            password_key_ref: "vault://webdav_pw".into(),
+            enabled: true,
+        };
+        let secret = StaticSecret("pw".into());
+        let client_phone =
+            WebDavSyncClient::from_config(&cfg, &secret, BackoffSchedule::fast_for_tests())
+                .unwrap();
+
+        // Metered cellular upload: uploads deltas + thumb + opus, defers >2MB full photo!
+        let r_metered_up = client_phone
+            .sync_once_with_policy(&phone, SyncNetworkPolicy::metered_guard())
+            .await
+            .unwrap();
+        assert_eq!(r_metered_up.uploaded_deltas, 1);
+        assert_eq!(r_metered_up.uploaded_assets, 2); // thumb + opus
+        assert_eq!(r_metered_up.deferred_assets, 1); // 2.5MB full photo deferred
+
+        // Tablet pulls on Wi-Fi: gets inbox metadata + thumb + opus immediately!
+        let client_tablet =
+            WebDavSyncClient::from_config(&cfg, &secret, BackoffSchedule::fast_for_tests())
+                .unwrap();
+        let r_tab_pull = client_tablet.sync_once(&tablet).await.unwrap();
+        assert_eq!(r_tab_pull.downloaded_deltas, 1);
+        assert_eq!(r_tab_pull.downloaded_assets, 2);
+        assert_eq!(tablet.list_inbox_items(false, 20).len(), 2);
+
+        // Phone switches to Wi-Fi: full 2.5MB photo uploads cleanly
+        let r_wifi_up = client_phone.sync_once(&phone).await.unwrap();
+        assert_eq!(r_wifi_up.uploaded_assets, 1);
+        assert_eq!(r_wifi_up.deferred_assets, 0);
 
         let _ = fs::remove_dir_all(&base);
     }

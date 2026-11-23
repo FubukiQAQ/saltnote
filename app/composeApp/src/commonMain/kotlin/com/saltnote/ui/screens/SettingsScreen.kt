@@ -64,10 +64,24 @@ fun SettingsScreen(state: SaltAppState) {
     val currentRouter = state.routerConfig
     var defaultTextId by remember(currentRouter) { mutableStateOf(currentRouter?.defaultTextProvider ?: "ollama-local") }
     var defaultVisionId by remember(currentRouter) { mutableStateOf(currentRouter?.defaultVisionProvider ?: "ollama-local") }
+    var defaultAudioId by remember(currentRouter) { mutableStateOf(currentRouter?.defaultAudioProvider ?: "gemini-byok") }
+    var localWhisperUrl by remember(currentRouter) { mutableStateOf(currentRouter?.localWhisperUrl ?: "") }
+    var saltRelayEnabled by remember(currentRouter) { mutableStateOf(currentRouter?.saltRelayEnabled ?: false) }
     var editableProviders by remember(currentRouter) {
         mutableStateOf(currentRouter?.providers ?: emptyList())
     }
     val keyInputs = remember { mutableStateMapOf<String, String>() }
+
+    fun buildRouterConfigDto(): RouterConfigDto = RouterConfigDto(
+        defaultTextProvider = defaultTextId,
+        defaultVisionProvider = defaultVisionId,
+        defaultAudioProvider = defaultAudioId,
+        localWhisperUrl = localWhisperUrl.trim(),
+        saltRelayEnabled = saltRelayEnabled,
+        uiLanguage = state.uiLanguage,
+        aiOutputLanguage = state.aiOutputLanguage,
+        providers = editableProviders,
+    )
 
     fun buildSecretSnapshot(): Map<String, String> {
         val out = mutableMapOf<String, String>()
@@ -222,11 +236,7 @@ fun SettingsScreen(state: SaltAppState) {
                         onClick = {
                             val secrets = buildSecretSnapshot()
                             state.saveRouterConfig(
-                                RouterConfigDto(
-                                    defaultTextProvider = defaultTextId,
-                                    defaultVisionProvider = defaultVisionId,
-                                    providers = editableProviders,
-                                ),
+                                buildRouterConfigDto(),
                                 unsavedSecrets = secrets,
                             )
                             clearSavedKeyDrafts()
@@ -236,6 +246,7 @@ fun SettingsScreen(state: SaltAppState) {
 
                 val activeTextName = editableProviders.firstOrNull { it.id == defaultTextId }?.let { "${it.name} · ${it.model}" } ?: defaultTextId
                 val activeVisionName = editableProviders.firstOrNull { it.id == defaultVisionId }?.let { "${it.name} · ${it.model}" } ?: defaultVisionId
+                val activeAudioName = editableProviders.firstOrNull { it.id == defaultAudioId }?.let { "${it.name} · ${it.model}" } ?: defaultAudioId
                 Surface(
                     color = MaterialTheme.colorScheme.surfaceContainerLow,
                     shape = MaterialTheme.shapes.small,
@@ -244,6 +255,55 @@ fun SettingsScreen(state: SaltAppState) {
                     Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                         Text("${strings.defaultTextLabel}: $activeTextName", style = MaterialTheme.typography.bodySmall)
                         Text("${strings.defaultVisionLabel}: $activeVisionName", style = MaterialTheme.typography.bodySmall)
+                        Text("${strings.defaultAudioLabel}: $activeAudioName", style = MaterialTheme.typography.bodySmall)
+                    }
+                }
+
+                // SaltRelay LAN Compute Relay & Local Whisper Endpoint (v0.2-alpha Section 2.1.6 / 4.2)
+                OutlinedCard(modifier = Modifier.fillMaxWidth(), shape = MaterialTheme.shapes.medium) {
+                    Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                Text(strings.saltRelayTitle, style = MaterialTheme.typography.titleSmall)
+                                Text(
+                                    text = strings.saltRelaySubtitle,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                            Spacer(Modifier.width(8.dp))
+                            Switch(
+                                checked = saltRelayEnabled,
+                                onCheckedChange = { checked ->
+                                    saltRelayEnabled = checked
+                                    val secrets = buildSecretSnapshot()
+                                    state.saveRouterConfig(
+                                        buildRouterConfigDto().copy(saltRelayEnabled = checked),
+                                        unsavedSecrets = secrets,
+                                    )
+                                    clearSavedKeyDrafts()
+                                },
+                            )
+                        }
+
+                        OutlinedTextField(
+                            value = localWhisperUrl,
+                            onValueChange = { raw ->
+                                localWhisperUrl = raw.replace("\n", "").replace("\r", "").replace(" ", "")
+                            },
+                            label = { Text(strings.localWhisperUrlLabel) },
+                            placeholder = { Text("http://127.0.0.1:8080/v1/audio/transcriptions") },
+                            singleLine = true,
+                            keyboardOptions = KeyboardOptions(
+                                imeAction = ImeAction.Done,
+                                keyboardType = KeyboardType.Uri,
+                                autoCorrectEnabled = false,
+                            ),
+                            modifier = Modifier.fillMaxWidth(),
+                        )
                     }
                 }
 
@@ -256,6 +316,7 @@ fun SettingsScreen(state: SaltAppState) {
                         provider = provider,
                         isDefaultText = defaultTextId == provider.id,
                         isDefaultVision = defaultVisionId == provider.id,
+                        isDefaultAudio = defaultAudioId == provider.id,
                         hasSavedSecret = savedSecret,
                         secretDraft = keyInputs[provider.id].orEmpty(),
                         isTesting = state.testingProviderId == provider.id,
@@ -267,11 +328,7 @@ fun SettingsScreen(state: SaltAppState) {
                             defaultTextId = provider.id
                             val secrets = buildSecretSnapshot()
                             state.saveRouterConfig(
-                                RouterConfigDto(
-                                    defaultTextProvider = defaultTextId,
-                                    defaultVisionProvider = defaultVisionId,
-                                    providers = editableProviders,
-                                ),
+                                buildRouterConfigDto(),
                                 unsavedSecrets = secrets,
                             )
                             clearSavedKeyDrafts()
@@ -280,11 +337,16 @@ fun SettingsScreen(state: SaltAppState) {
                             defaultVisionId = provider.id
                             val secrets = buildSecretSnapshot()
                             state.saveRouterConfig(
-                                RouterConfigDto(
-                                    defaultTextProvider = defaultTextId,
-                                    defaultVisionProvider = defaultVisionId,
-                                    providers = editableProviders,
-                                ),
+                                buildRouterConfigDto(),
+                                unsavedSecrets = secrets,
+                            )
+                            clearSavedKeyDrafts()
+                        },
+                        onSetDefaultAudio = {
+                            defaultAudioId = provider.id
+                            val secrets = buildSecretSnapshot()
+                            state.saveRouterConfig(
+                                buildRouterConfigDto(),
                                 unsavedSecrets = secrets,
                             )
                             clearSavedKeyDrafts()
@@ -295,11 +357,7 @@ fun SettingsScreen(state: SaltAppState) {
                         onSaveSecret = {
                             val secret = keyInputs[provider.id].orEmpty()
                             state.saveRouterConfig(
-                                RouterConfigDto(
-                                    defaultTextProvider = defaultTextId,
-                                    defaultVisionProvider = defaultVisionId,
-                                    providers = editableProviders,
-                                ),
+                                buildRouterConfigDto(),
                                 unsavedSecrets = mapOf(provider.apiKeyRef to secret),
                             )
                             keyInputs.remove(provider.id)
@@ -307,11 +365,7 @@ fun SettingsScreen(state: SaltAppState) {
                         onTestConnectivity = {
                             val secrets = buildSecretSnapshot()
                             state.saveAndTestProvider(
-                                cfg = RouterConfigDto(
-                                    defaultTextProvider = defaultTextId,
-                                    defaultVisionProvider = defaultVisionId,
-                                    providers = editableProviders,
-                                ),
+                                cfg = buildRouterConfigDto(),
                                 providerId = provider.id,
                                 unsavedSecrets = secrets,
                             )
@@ -329,6 +383,7 @@ private fun ProviderCardEditor(
     provider: ProviderConfigDto,
     isDefaultText: Boolean,
     isDefaultVision: Boolean,
+    isDefaultAudio: Boolean,
     hasSavedSecret: Boolean,
     secretDraft: String,
     isTesting: Boolean,
@@ -336,6 +391,7 @@ private fun ProviderCardEditor(
     onUpdate: (ProviderConfigDto) -> Unit,
     onSetDefaultText: () -> Unit,
     onSetDefaultVision: () -> Unit,
+    onSetDefaultAudio: () -> Unit,
     onSecretDraftChange: (String) -> Unit,
     onSaveSecret: () -> Unit,
     onTestConnectivity: () -> Unit,
@@ -346,11 +402,14 @@ private fun ProviderCardEditor(
     OutlinedCard(modifier = Modifier.fillMaxWidth(), shape = MaterialTheme.shapes.medium) {
         Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             Row(
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState()),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                Text(provider.name, style = MaterialTheme.typography.titleSmall, modifier = Modifier.weight(1f))
+                Text(provider.name, style = MaterialTheme.typography.titleSmall)
+                Spacer(Modifier.width(4.dp))
                 SaltFilterChip(
                     selected = isDefaultText,
                     onClick = onSetDefaultText,
@@ -360,6 +419,11 @@ private fun ProviderCardEditor(
                     selected = isDefaultVision,
                     onClick = onSetDefaultVision,
                     label = { Text(strings.defaultVisionChip) },
+                )
+                SaltFilterChip(
+                    selected = isDefaultAudio,
+                    onClick = onSetDefaultAudio,
+                    label = { Text(strings.defaultAudioChip) },
                 )
             }
 

@@ -10,15 +10,18 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Archive
+import androidx.compose.material.icons.rounded.Bolt
 import androidx.compose.material.icons.rounded.CloudSync
 import androidx.compose.material.icons.rounded.ContentCopy
 import androidx.compose.material.icons.rounded.ContentPaste
 import androidx.compose.material.icons.rounded.Devices
 import androidx.compose.material.icons.rounded.QrCodeScanner
 import androidx.compose.material.icons.rounded.Refresh
+import androidx.compose.material.icons.rounded.SignalCellularAlt
 import androidx.compose.material.icons.rounded.Wifi
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
@@ -75,6 +78,46 @@ fun SyncScreen(state: SaltAppState) {
         verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
         Text(strings.syncTitle, style = MaterialTheme.typography.headlineMedium)
+
+        // Metered vs Wi-Fi Sync Guard Status Banner (v0.2-alpha Section 4.4)
+        Surface(
+            color = if (state.isMeteredNetwork) {
+                MaterialTheme.colorScheme.tertiaryContainer
+            } else {
+                MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.5f)
+            },
+            shape = MaterialTheme.shapes.medium,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Row(
+                modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                Icon(
+                    imageVector = if (state.isMeteredNetwork) Icons.Rounded.SignalCellularAlt else Icons.Rounded.Wifi,
+                    contentDescription = null,
+                    tint = if (state.isMeteredNetwork) {
+                        MaterialTheme.colorScheme.onTertiaryContainer
+                    } else {
+                        MaterialTheme.colorScheme.primary
+                    },
+                )
+                Text(
+                    text = if (state.isMeteredNetwork) {
+                        strings.meteredNetworkWarning
+                    } else {
+                        strings.unmeteredNetworkBanner
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (state.isMeteredNetwork) {
+                        MaterialTheme.colorScheme.onTertiaryContainer
+                    } else {
+                        MaterialTheme.colorScheme.onSecondaryContainer
+                    },
+                )
+            }
+        }
 
         // Card 1: WebDAV Sync
         ElevatedCard(modifier = Modifier.fillMaxWidth(), shape = MaterialTheme.shapes.large) {
@@ -173,11 +216,22 @@ fun SyncScreen(state: SaltAppState) {
                         shape = MaterialTheme.shapes.small,
                         modifier = Modifier.fillMaxWidth(),
                     ) {
-                        Text(
-                            text = "${strings.lastSyncPrefix}${strings.uploadedLabel} ${r.uploadedDeltas} · ${strings.downloadedLabel} ${r.downloadedDeltas}",
-                            style = MaterialTheme.typography.bodySmall,
+                        Column(
                             modifier = Modifier.padding(10.dp),
-                        )
+                            verticalArrangement = Arrangement.spacedBy(4.dp),
+                        ) {
+                            Text(
+                                text = "${strings.lastSyncPrefix}${strings.uploadedLabel} ${r.uploadedDeltas} · ${strings.downloadedLabel} ${r.downloadedDeltas}",
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                            if (r.deferredAssets > 0) {
+                                Text(
+                                    text = "${strings.deferredAssetsPrefix}${r.deferredAssets}",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = MaterialTheme.colorScheme.tertiary,
+                                )
+                            }
+                        }
                     }
                 }
             }
@@ -286,8 +340,37 @@ fun SyncScreen(state: SaltAppState) {
                             ) {
                                 Icon(Icons.Rounded.Devices, null)
                                 Spacer(Modifier.width(10.dp))
-                                Column(modifier = Modifier.weight(1f)) {
-                                    Text(peer.deviceName, style = MaterialTheme.typography.titleSmall)
+                                Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                    ) {
+                                        Text(peer.deviceName, style = MaterialTheme.typography.titleSmall)
+                                        if (peer.relayAvailable) {
+                                            Surface(
+                                                color = MaterialTheme.colorScheme.primaryContainer,
+                                                shape = RoundedCornerShape(50),
+                                            ) {
+                                                Row(
+                                                    modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp),
+                                                    verticalAlignment = Alignment.CenterVertically,
+                                                    horizontalArrangement = Arrangement.spacedBy(3.dp),
+                                                ) {
+                                                    Icon(
+                                                        Icons.Rounded.Bolt,
+                                                        contentDescription = null,
+                                                        modifier = Modifier.size(12.dp),
+                                                        tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                                                    )
+                                                    Text(
+                                                        text = strings.relayBadgeLabel,
+                                                        style = MaterialTheme.typography.labelSmall,
+                                                        color = MaterialTheme.colorScheme.onPrimaryContainer,
+                                                    )
+                                                }
+                                            }
+                                        }
+                                    }
                                     Text(
                                         text = "${peer.host}:${peer.port}",
                                         style = MaterialTheme.typography.bodySmall,

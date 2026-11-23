@@ -1,29 +1,42 @@
 package com.saltnote.android
 
 import android.Manifest
+import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
-import com.saltnote.bridge.AndroidSecretVault
-import com.saltnote.bridge.openSaltNoteClient
+import androidx.compose.runtime.LaunchedEffect
+import androidx.glance.appwidget.updateAll
+import androidx.lifecycle.lifecycleScope
 import com.saltnote.ui.SaltNoteApp
 import com.saltnote.ui.platform.AndroidPlatformContext
 import com.saltnote.ui.platform.defaultDeviceName
-import com.saltnote.ui.platform.defaultVaultDirectory
+import com.saltnote.ui.state.LaunchRoute
 import com.saltnote.ui.state.SaltAppState
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
     private var appState: SaltAppState? = null
     private var pendingCameraPermissionCallback: ((Boolean) -> Unit)? = null
+    private var pendingMicPermissionCallback: ((Boolean) -> Unit)? = null
     private var pendingFolderTreeCallback: ((Uri?) -> Unit)? = null
 
     private val cameraPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
             val cb = pendingCameraPermissionCallback
             pendingCameraPermissionCallback = null
+            cb?.invoke(granted)
+        }
+
+    private val micPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            val cb = pendingMicPermissionCallback
+            pendingMicPermissionCallback = null
             cb?.invoke(granted)
         }
 
@@ -59,33 +72,67 @@ class MainActivity : ComponentActivity() {
             pendingCameraPermissionCallback = onResult
             cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
         }
-
+        AndroidPlatformContext.micPermissionBridge = { onResult ->
+            pendingMicPermissionCallback = onResult
+            micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+        }
         AndroidPlatformContext.folderTreePickerBridge = { onResult ->
             pendingFolderTreeCallback = onResult
             folderTreePickerLauncher.launch(null)
         }
-        val vaultPath = defaultVaultDirectory()
+
         val deviceName = defaultDeviceName()
-        val client = openSaltNoteClient(
-            vaultPath = vaultPath,
-            deviceName = deviceName,
-            secretVault = AndroidSecretVault(applicationContext),
-        )
+        val client = SaltClientRegistry.getOrOpen(applicationContext)
         val state = SaltAppState(initialClient = client, deviceName = deviceName)
         appState = state
+        handleLaunchIntent(intent, state)
+
+        lifecycleScope.launch {
+            var lastSeenTick = SaltClientRegistry.ingestTick.value
+            SaltClientRegistry.ingestTick.collectLatest { tick ->
+                if (tick != lastSeenTick) {
+                    lastSeenTick = tick
+                    appState?.onExternalVaultMutated()
+                }
+            }
+        }
 
         setContent {
+            LaunchedEffect(state.client) {
+                SaltClientRegistry.updateActiveClient(state.client)
+            }
             SaltNoteApp(state = state)
         }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        appState?.let { handleLaunchIntent(intent, it) }
+    }
+
+    private fun handleLaunchIntent(intent: Intent?, state: SaltAppState) {
+        val action = intent?.getStringExtra(SaltClientRegistry.EXTRA_LAUNCH_ACTION) ?: return
+        state.pendingLaunchRoute = when (action) {
+            SaltClientRegistry.ACTION_CAPTURE_CAMERA -> LaunchRoute.CameraCapture
+            SaltClientRegistry.ACTION_CAPTURE_VOICE -> LaunchRoute.VoiceCapture
+            SaltClientRegistry.ACTION_MICRO_REVIEW -> LaunchRoute.MicroReview
+            else -> LaunchRoute.None
+        }
+        intent.removeExtra(SaltClientRegistry.EXTRA_LAUNCH_ACTION)
     }
 
     override fun onPause() {
         super.onPause()
         runCatching { appState?.client?.flushDeltas() }
+        lifecycleScope.launch(Dispatchers.IO) {
+            runCatching { SaltInboxWidget().updateAll(applicationContext) }
+        }
     }
 
     override fun onDestroy() {
         super.onDestroy()
+        appState?.dispose()
         runCatching { appState?.client?.stopLanP2p() }
     }
 }

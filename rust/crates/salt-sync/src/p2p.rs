@@ -6,12 +6,15 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
 use salt_crdt::{DeltaPacket, VaultStore};
-use salt_types::{now_utc_ms, sha256_hex, LanPeerInfo, SaltError, SaltResult};
+use salt_router::InboxEnrichmentOutput;
+use salt_types::{now_utc_ms, sha256_hex, InboxKind, LanPeerInfo, SaltError, SaltResult};
 use serde::{Deserialize, Serialize};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -61,6 +64,34 @@ struct PersistedIdentity {
     fingerprint: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayEnrichRequest {
+    pub relay_request_id: String,
+    pub kind: InboxKind,
+    pub is_private: bool,
+    pub text_note: Option<String>,
+    pub media_bytes: Option<Vec<u8>>,
+    pub media_ext: Option<String>,
+    pub output_language: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayEnrichResponse {
+    pub ok: bool,
+    pub transcript_text: Option<String>,
+    pub summary_text: Option<String>,
+    #[serde(default)]
+    pub auto_tags: Vec<String>,
+    pub error_message: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+enum IncomingP2pEnvelope {
+    Relay(RelayEnrichRequest),
+    SyncDigest(P2pDigest),
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct LanBeaconPayload {
     magic: String,
@@ -68,6 +99,8 @@ struct LanBeaconPayload {
     device_name: String,
     port: u16,
     fingerprint: String,
+    #[serde(default)]
+    relay_available: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -79,7 +112,14 @@ struct TrackedPeer {
 /// Callback invoked whenever incoming remote pages/assets are imported over LAN P2P.
 pub type OnRemoteSyncHook = Arc<dyn Fn() + Send + Sync>;
 
-/// LAN P2P discovery & QUIC/TLS 1.3 direct full-vault (Loro deltas + WebP assets) sync node.
+/// Callback handling incoming LAN `SaltRelay` compute requests over pinned QUIC/TLS 1.3.
+pub type SaltRelayHandler = Arc<
+    dyn Fn(RelayEnrichRequest) -> Pin<Box<dyn Future<Output = SaltResult<InboxEnrichmentOutput>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// LAN P2P discovery & QUIC/TLS 1.3 direct full-vault (Loro deltas + WebP assets) sync + SaltRelay node.
 pub struct LanP2pNode {
     device_id: String,
     cert_fingerprint: String,
@@ -100,6 +140,15 @@ impl LanP2pNode {
         vault: Arc<VaultStore>,
         enable_discovery: bool,
         on_remote_sync: Option<OnRemoteSyncHook>,
+    ) -> SaltResult<Self> {
+        Self::start_with_relay(vault, enable_discovery, on_remote_sync, None)
+    }
+
+    pub fn start_with_relay(
+        vault: Arc<VaultStore>,
+        enable_discovery: bool,
+        on_remote_sync: Option<OnRemoteSyncHook>,
+        relay_handler: Option<SaltRelayHandler>,
     ) -> SaltResult<Self> {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let dev = vault.device_state();
@@ -141,17 +190,19 @@ impl LanP2pNode {
         let local_ipv4 = detect_primary_lan_ipv4();
         let local_ip = local_ipv4.to_string();
 
-        // Background QUIC accept loop for incoming LAN peer sync
+        // Background QUIC accept loop for incoming LAN peer sync & SaltRelay
         let accept_ep = endpoint.clone();
         let accept_vault = Arc::clone(&vault);
         let accept_hook = on_remote_sync.clone();
+        let accept_relay = relay_handler.clone();
         tokio::spawn(async move {
             while let Some(incoming) = accept_ep.accept().await {
                 let v = Arc::clone(&accept_vault);
                 let h = accept_hook.clone();
+                let r = accept_relay.clone();
                 tokio::spawn(async move {
                     if let Ok(conn) = incoming.await {
-                        let _ = handle_incoming_sync_conn(conn, &v, h.as_ref()).await;
+                        let _ = handle_incoming_sync_conn(conn, &v, h.as_ref(), r.as_ref()).await;
                     }
                 });
             }
@@ -160,6 +211,11 @@ impl LanP2pNode {
         let peers: Arc<RwLock<HashMap<String, TrackedPeer>>> =
             Arc::new(RwLock::new(HashMap::new()));
         let stop_flag = Arc::new(AtomicBool::new(false));
+        let advertise_relay = vault
+            .load_router_config()
+            .map(|c| c.salt_relay_enabled)
+            .unwrap_or(false)
+            && relay_handler.is_some();
 
         let mdns = if enable_discovery {
             // 1. Start reliable UDP LAN broadcast beacon (works even when mDNS multicast is dropped)
@@ -169,6 +225,7 @@ impl LanP2pNode {
                 local_ipv4,
                 local_port,
                 fingerprint.clone(),
+                advertise_relay,
                 Arc::clone(&peers),
                 Arc::clone(&stop_flag),
             );
@@ -184,6 +241,10 @@ impl LanP2pNode {
                     props.insert("device_name".to_string(), dev.device_name.clone());
                     props.insert("fingerprint".to_string(), fingerprint.clone());
                     props.insert("ipv4".to_string(), local_ip.clone());
+                    props.insert(
+                        "relay".to_string(),
+                        if advertise_relay { "1" } else { "0" }.to_string(),
+                    );
 
                     if let Ok(info) = ServiceInfo::new(
                         MDNS_SERVICE_TYPE,
@@ -228,6 +289,10 @@ impl LanP2pNode {
                                             .or_else(|| pick_best_lan_ip(info.get_addresses()));
 
                                         if let Some(host) = best_host {
+                                            let relay_available = info
+                                                .get_property_val_str("relay")
+                                                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                                                .unwrap_or(false);
                                             peers_ref.write().insert(
                                                 peer_id.clone(),
                                                 TrackedPeer {
@@ -237,6 +302,7 @@ impl LanP2pNode {
                                                         host,
                                                         port: info.get_port(),
                                                         cert_fingerprint: fp,
+                                                        relay_available,
                                                     },
                                                     last_seen_ms: now_utc_ms(),
                                                 },
@@ -326,12 +392,11 @@ impl LanP2pNode {
         Err(last_err.unwrap_or_else(|| SaltError::Sync("LAN sync failed".into())))
     }
 
-    async fn sync_with_peer_once(
+    async fn connect_pinned_quic(
         &self,
         peer_addr: SocketAddr,
         expected_fingerprint: &str,
-        vault: &VaultStore,
-    ) -> SaltResult<P2pSyncResult> {
+    ) -> SaltResult<quinn::Connection> {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let verifier = Arc::new(PinnedFingerprintVerifier {
             expected_sha256_hex: expected_fingerprint.trim().to_ascii_lowercase(),
@@ -356,10 +421,53 @@ impl LanP2pNode {
             .connect_with(client_config, peer_addr, "saltnote.local")
             .map_err(|e| SaltError::Sync(format!("QUIC connect failed: {e}")))?;
 
-        let conn = tokio::time::timeout(Duration::from_secs(8), connecting)
+        tokio::time::timeout(Duration::from_secs(8), connecting)
             .await
             .map_err(|_| SaltError::Sync(format!("连接超时 ({peer_addr})，请确认双方在同一 Wi-Fi 且未被防火墙拦截")))?
-            .map_err(|e| SaltError::Sync(format!("QUIC 握手失败: {e}")))?;
+            .map_err(|e| SaltError::Sync(format!("QUIC 握手失败: {e}")))
+    }
+
+    /// Sends a `#private` inbox item over pinned QUIC/TLS 1.3 to a paired LAN PC's SaltRelay service.
+    pub async fn relay_enrich_with_peer(
+        &self,
+        peer_addr: SocketAddr,
+        expected_fingerprint: &str,
+        req: RelayEnrichRequest,
+    ) -> SaltResult<InboxEnrichmentOutput> {
+        let conn = self
+            .connect_pinned_quic(peer_addr, expected_fingerprint)
+            .await?;
+        let (mut send, mut recv) = conn
+            .open_bi()
+            .await
+            .map_err(|e| SaltError::Sync(e.to_string()))?;
+        write_framed_json(&mut send, &req).await?;
+        send.finish().map_err(|e| SaltError::Sync(e.to_string()))?;
+
+        let resp: RelayEnrichResponse = read_framed_json(&mut recv).await?;
+        conn.close(0u32.into(), b"relay_done");
+        if !resp.ok {
+            return Err(SaltError::Network(
+                resp.error_message
+                    .unwrap_or_else(|| "SaltRelay failed on peer".into()),
+            ));
+        }
+        Ok(InboxEnrichmentOutput {
+            transcript_text: resp.transcript_text,
+            summary_text: resp.summary_text,
+            auto_tags: resp.auto_tags,
+        })
+    }
+
+    async fn sync_with_peer_once(
+        &self,
+        peer_addr: SocketAddr,
+        expected_fingerprint: &str,
+        vault: &VaultStore,
+    ) -> SaltResult<P2pSyncResult> {
+        let conn = self
+            .connect_pinned_quic(peer_addr, expected_fingerprint)
+            .await?;
 
         let (mut send, mut recv) = conn
             .open_bi()
@@ -478,14 +586,50 @@ async fn handle_incoming_sync_conn(
     conn: quinn::Connection,
     vault: &VaultStore,
     on_remote_sync: Option<&OnRemoteSyncHook>,
+    relay_handler: Option<&SaltRelayHandler>,
 ) -> SaltResult<()> {
     let (mut send, mut recv) = conn
         .accept_bi()
         .await
         .map_err(|e| SaltError::Sync(e.to_string()))?;
 
-    // Phase 1: Receive peer digest and reply with local digest BEFORE importing anything
-    let peer_digest: P2pDigest = read_framed_json(&mut recv).await?;
+    let envelope: IncomingP2pEnvelope = read_framed_json(&mut recv).await?;
+    let peer_digest = match envelope {
+        IncomingP2pEnvelope::Relay(relay_req) => {
+            let reply = match relay_handler {
+                Some(handler) => match handler(relay_req).await {
+                    Ok(out) => RelayEnrichResponse {
+                        ok: true,
+                        transcript_text: out.transcript_text,
+                        summary_text: out.summary_text,
+                        auto_tags: out.auto_tags,
+                        error_message: None,
+                    },
+                    Err(e) => RelayEnrichResponse {
+                        ok: false,
+                        transcript_text: None,
+                        summary_text: None,
+                        auto_tags: Vec::new(),
+                        error_message: Some(e.to_string()),
+                    },
+                },
+                None => RelayEnrichResponse {
+                    ok: false,
+                    transcript_text: None,
+                    summary_text: None,
+                    auto_tags: Vec::new(),
+                    error_message: Some("SaltRelay is disabled on this PC node".into()),
+                },
+            };
+            write_framed_json(&mut send, &reply).await?;
+            send.finish().map_err(|e| SaltError::Sync(e.to_string()))?;
+            let _ = tokio::time::timeout(Duration::from_secs(10), conn.closed()).await;
+            return Ok(());
+        }
+        IncomingP2pEnvelope::SyncDigest(digest) => digest,
+    };
+
+    // Phase 1: Reply with local digest BEFORE importing anything
     let _ = vault.flush_all_dirty_deltas();
     let local_assets_list = vault.list_asset_rel_paths()?;
     let local_digest = P2pDigest {
@@ -554,6 +698,7 @@ fn start_udp_lan_beacon(
     local_ipv4: Ipv4Addr,
     quic_port: u16,
     fingerprint: String,
+    relay_available: bool,
     peers: Arc<RwLock<HashMap<String, TrackedPeer>>>,
     stop: Arc<AtomicBool>,
 ) {
@@ -595,6 +740,7 @@ fn start_udp_lan_beacon(
                                     host: v4.to_string(),
                                     port: beacon.port,
                                     cert_fingerprint: beacon.fingerprint,
+                                    relay_available: beacon.relay_available,
                                 },
                                 last_seen_ms: now_utc_ms(),
                             },
@@ -620,6 +766,7 @@ fn start_udp_lan_beacon(
             device_name,
             port: quic_port,
             fingerprint,
+            relay_available,
         };
         let Ok(bytes) = serde_json::to_vec(&payload) else {
             return;
@@ -904,6 +1051,78 @@ mod tests {
 
         node1.shutdown();
         node2_restarted.shutdown();
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn lan_p2p_syncs_inbox_and_executes_private_salt_relay() {
+        let base = std::env::temp_dir().join(format!("saltnote_p2p_relay_{}", new_ulid()));
+        let phone = Arc::new(VaultStore::open(base.join("phone"), Some("Phone".into())).unwrap());
+        let pc = Arc::new(VaultStore::open(base.join("pc"), Some("PC".into())).unwrap());
+
+        let item = phone
+            .capture_inbox_item(
+                InboxKind::VoiceMemo,
+                None,
+                Some(b"OGG_OPUS_BYTES"),
+                Some("ogg"),
+                None,
+                5000,
+                true,
+            )
+            .unwrap();
+
+        let relay_handler: SaltRelayHandler = Arc::new(|req| {
+            Box::pin(async move {
+                assert!(req.is_private);
+                assert_eq!(req.kind, InboxKind::VoiceMemo);
+                Ok(InboxEnrichmentOutput {
+                    transcript_text: Some("私密语音本地转写成功".into()),
+                    summary_text: Some("本地摘要".into()),
+                    auto_tags: vec!["私密".into()],
+                })
+            })
+        });
+
+        let phone_node = LanP2pNode::start(Arc::clone(&phone), false, None).unwrap();
+        let pc_node =
+            LanP2pNode::start_with_relay(Arc::clone(&pc), false, None, Some(relay_handler))
+                .unwrap();
+
+        let pc_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), pc_node.local_port());
+        // 1. P2P sync transfers Vault-root InboxItem & audio asset to PC
+        let sync_res = phone_node
+            .sync_with_peer(pc_addr, pc_node.cert_fingerprint(), &phone)
+            .await
+            .unwrap();
+        assert_eq!(sync_res.sent_packets, 1);
+        assert_eq!(sync_res.sent_assets, 1);
+        assert_eq!(pc.list_inbox_items(false, 10).len(), 1);
+
+        // 2. SaltRelay over pinned QUIC returns local transcription without public internet
+        let relay_out = phone_node
+            .relay_enrich_with_peer(
+                pc_addr,
+                pc_node.cert_fingerprint(),
+                RelayEnrichRequest {
+                    relay_request_id: new_ulid(),
+                    kind: item.kind,
+                    is_private: true,
+                    text_note: None,
+                    media_bytes: Some(b"OGG_OPUS_BYTES".to_vec()),
+                    media_ext: Some("ogg".into()),
+                    output_language: Some("zh-CN".into()),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            relay_out.transcript_text.as_deref(),
+            Some("私密语音本地转写成功")
+        );
+
+        phone_node.shutdown();
+        pc_node.shutdown();
         let _ = std::fs::remove_dir_all(&base);
     }
 }

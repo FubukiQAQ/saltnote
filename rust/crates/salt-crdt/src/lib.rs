@@ -2,11 +2,12 @@ use chrono::{TimeZone, Utc};
 use loro::{ExportMode, LoroDoc, LoroList, LoroValue, UpdateOptions, VersionVector};
 use parking_lot::RwLock;
 use salt_types::{
-    default_halo_presets, new_ulid, now_utc_ms, parse_flashcard_drafts, sha256_hex,
-    validate_router_config_no_plaintext_keys, CanvasImageNode, CanvasSnapshot, DeltaEntry,
-    DeltaStroke, DeviceManifest, DeviceState, FlashCard, HaloAnnotation, HaloPreset, PageMeta,
-    PageMode, PageSnapshot, PageSummary, ReviewLog, RouterConfig, SaltError, SaltResult,
-    StrokeTransform, WebDavConfig,
+    content_addressed_asset_rel_path, default_halo_presets, new_ulid, now_utc_ms,
+    parse_flashcard_drafts, sha256_hex, validate_router_config_no_plaintext_keys, CanvasImageNode,
+    CanvasSnapshot, DeltaEntry, DeltaStroke, DeviceManifest, DeviceState, FlashCard,
+    HaloAnnotation, HaloPreset, InboxAiEnrichment, InboxConsumption, InboxItem, InboxKind,
+    InboxPayload, InboxState, PageMeta, PageMode, PageSnapshot, PageSummary, ReviewLog,
+    RouterConfig, SaltError, SaltResult, StrokeTransform, TranscriptStatus, WebDavConfig,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -123,6 +124,9 @@ pub struct DeltaPacket {
     pub loro_bytes: Vec<u8>,
 }
 
+/// Reserved document ID for Vault-level CRDT root state (e.g. `inbox` LoroMap).
+pub const VAULT_ROOT_DOC_ID: &str = "__vault_root__";
+
 /// Events emitted on every local edit or remote CRDT import to drive `salt-intel` (FTS5 + FSRS).
 #[derive(Debug, Clone)]
 pub enum DocChangeEvent {
@@ -139,6 +143,7 @@ pub enum DocChangeEvent {
         cards: Vec<FlashCard>,
         review_logs: Vec<ReviewLog>,
     },
+    InboxUpdated,
 }
 
 struct PageEntry {
@@ -154,6 +159,7 @@ pub struct VaultStore {
     paths: VaultPaths,
     peer_id: u64,
     device_state: RwLock<DeviceState>,
+    root_doc: RwLock<PageEntry>,
     pages: RwLock<HashMap<String, PageEntry>>,
     events_tx: broadcast::Sender<DocChangeEvent>,
     sync_revision: AtomicU64,
@@ -212,10 +218,20 @@ impl VaultStore {
         let peer_id = derive_peer_id(&device_state.device_id);
         let (events_tx, _) = broadcast::channel(256);
 
+        let root_loro = LoroDoc::new();
+        let _ = root_loro.set_peer_id(peer_id);
+        let root_entry = PageEntry {
+            doc: root_loro,
+            exported_vv: VersionVector::new(),
+            dirty_since_export: false,
+            markdown_file: None,
+        };
+
         let store = Self {
             paths,
             peer_id,
             device_state: RwLock::new(device_state),
+            root_doc: RwLock::new(root_entry),
             pages: RwLock::new(HashMap::new()),
             events_tx,
             sync_revision: AtomicU64::new(0),
@@ -929,6 +945,286 @@ SaltNote 是一款**永久免费开源、本地优先（Local-First）、零后�
     }
 
     // ------------------------------------------------------------------------
+    // Salt Inbox (盐池) CRDT Root Container Mutations & Queries (v0.2-alpha)
+    // ------------------------------------------------------------------------
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn capture_inbox_item(
+        &self,
+        kind: InboxKind,
+        text_note: Option<String>,
+        primary_media_bytes: Option<&[u8]>,
+        primary_media_ext: Option<&str>,
+        thumb_webp_bytes: Option<&[u8]>,
+        audio_duration_ms: u32,
+        is_private: bool,
+    ) -> SaltResult<InboxItem> {
+        let mut payload = InboxPayload {
+            text_note: text_note.and_then(|s| {
+                let t = s.trim().to_string();
+                if t.is_empty() { None } else { Some(t) }
+            }),
+            audio_duration_ms,
+            ..Default::default()
+        };
+
+        if let Some(bytes) = primary_media_bytes.filter(|b| !b.is_empty()) {
+            let fallback_ext = match kind {
+                InboxKind::VoiceMemo => "ogg",
+                InboxKind::PhotoNote => "webp",
+                _ => "bin",
+            };
+            let ext = primary_media_ext.unwrap_or(fallback_ext);
+            let (hash, rel_path) = content_addressed_asset_rel_path(bytes, ext);
+            self.store_asset_bytes(&rel_path, bytes)?;
+            match kind {
+                InboxKind::VoiceMemo => {
+                    payload.audio_asset_hash = Some(format!("sha256:{}", &hash[..16]));
+                    payload.audio_asset_rel_path = Some(rel_path);
+                }
+                _ => {
+                    payload.image_asset_hash = Some(format!("sha256:{}", &hash[..16]));
+                    payload.image_asset_rel_path = Some(rel_path);
+                }
+            }
+        }
+
+        if let Some(tbytes) = thumb_webp_bytes.filter(|b| !b.is_empty()) {
+            let (hash, rel_path) = content_addressed_asset_rel_path(tbytes, "webp");
+            self.store_asset_bytes(&rel_path, tbytes)?;
+            payload.thumb_asset_hash = Some(format!("sha256:{}", &hash[..16]));
+            payload.thumb_asset_rel_path = Some(rel_path);
+        }
+
+        let initial_status = match kind {
+            InboxKind::VoiceMemo => {
+                if is_private {
+                    TranscriptStatus::WaitingForLanRelay
+                } else {
+                    TranscriptStatus::Pending
+                }
+            }
+            InboxKind::PhotoNote => {
+                if payload.image_asset_rel_path.is_some() {
+                    if is_private {
+                        TranscriptStatus::WaitingForLanRelay
+                    } else {
+                        TranscriptStatus::Pending
+                    }
+                } else {
+                    TranscriptStatus::NotApplicable
+                }
+            }
+            InboxKind::QuickText | InboxKind::WebClip => TranscriptStatus::NotApplicable,
+        };
+
+        let item = InboxItem {
+            inbox_id: format!("inbx_{}", new_ulid()),
+            kind,
+            created_at_utc: now_utc_ms(),
+            source_device_id: self.device_state.read().device_id.clone(),
+            is_private,
+            state: InboxState::Unprocessed,
+            payload,
+            ai_enrichment: InboxAiEnrichment {
+                transcript_status: initial_status,
+                transcript_text: None,
+                summary_text: None,
+                auto_tags: Vec::new(),
+            },
+            consumption: InboxConsumption::default(),
+        };
+
+        self.upsert_inbox_item(&item)?;
+        Ok(item)
+    }
+
+    pub fn upsert_inbox_item(&self, item: &InboxItem) -> SaltResult<()> {
+        {
+            let mut root = self.root_doc.write();
+            let pre_vv = root.doc.oplog_vv();
+            let map = root.doc.get_map("inbox");
+            let encoded =
+                serde_json::to_string(item).map_err(|e| SaltError::Crdt(e.to_string()))?;
+            map.insert(&item.inbox_id, encoded)
+                .map_err(|e| SaltError::Crdt(e.to_string()))?;
+            root.doc.commit();
+
+            let bytes = root
+                .doc
+                .export(ExportMode::updates(&pre_vv))
+                .map_err(|e| SaltError::Crdt(e.to_string()))?;
+            self.append_wal(VAULT_ROOT_DOC_ID, &bytes)?;
+            root.dirty_since_export = true;
+        }
+        let _ = self.events_tx.send(DocChangeEvent::InboxUpdated);
+        Ok(())
+    }
+
+    pub fn get_inbox_item(&self, inbox_id: &str) -> SaltResult<InboxItem> {
+        let root = self.root_doc.read();
+        read_inbox_from_doc(&root.doc)
+            .into_iter()
+            .find(|it| it.inbox_id == inbox_id)
+            .ok_or_else(|| SaltError::InvalidInput(format!("Inbox item {inbox_id} not found")))
+    }
+
+    pub fn list_inbox_items(&self, include_archived: bool, limit: usize) -> Vec<InboxItem> {
+        let root = self.root_doc.read();
+        let mut items: Vec<InboxItem> = read_inbox_from_doc(&root.doc)
+            .into_iter()
+            .filter(|it| match it.state {
+                InboxState::Unprocessed => true,
+                InboxState::Archived => include_archived,
+                InboxState::Deleted => false,
+            })
+            .collect();
+        items.sort_by(|a, b| {
+            b.created_at_utc
+                .cmp(&a.created_at_utc)
+                .then(b.inbox_id.cmp(&a.inbox_id))
+        });
+        if limit > 0 && items.len() > limit {
+            items.truncate(limit);
+        }
+        items
+    }
+
+    pub fn update_inbox_enrichment(
+        &self,
+        inbox_id: &str,
+        status: TranscriptStatus,
+        transcript_text: Option<String>,
+        summary_text: Option<String>,
+        auto_tags: Option<Vec<String>>,
+    ) -> SaltResult<InboxItem> {
+        let mut item = self.get_inbox_item(inbox_id)?;
+        item.ai_enrichment.transcript_status = status;
+        if let Some(txt) = transcript_text {
+            item.ai_enrichment.transcript_text = Some(txt);
+        }
+        if let Some(sum) = summary_text {
+            item.ai_enrichment.summary_text = Some(sum);
+        }
+        if let Some(tags) = auto_tags {
+            item.ai_enrichment.auto_tags = tags;
+        }
+        self.upsert_inbox_item(&item)?;
+        Ok(item)
+    }
+
+    pub fn set_inbox_private(&self, inbox_id: &str, is_private: bool) -> SaltResult<InboxItem> {
+        let mut item = self.get_inbox_item(inbox_id)?;
+        item.is_private = is_private;
+        if is_private && item.ai_enrichment.transcript_status == TranscriptStatus::Pending {
+            item.ai_enrichment.transcript_status = TranscriptStatus::WaitingForLanRelay;
+        } else if !is_private
+            && item.ai_enrichment.transcript_status == TranscriptStatus::WaitingForLanRelay
+        {
+            item.ai_enrichment.transcript_status = TranscriptStatus::Pending;
+        }
+        self.upsert_inbox_item(&item)?;
+        Ok(item)
+    }
+
+    pub fn delete_inbox_item(&self, inbox_id: &str) -> SaltResult<()> {
+        let mut item = self.get_inbox_item(inbox_id)?;
+        item.state = InboxState::Deleted;
+        self.upsert_inbox_item(&item)?;
+        Ok(())
+    }
+
+    pub fn consume_inbox_into_page(
+        &self,
+        inbox_id: &str,
+        target_page_id: &str,
+        target_block_id: &str,
+    ) -> SaltResult<InboxItem> {
+        {
+            let pages = self.pages.read();
+            let entry = pages
+                .get(target_page_id)
+                .ok_or_else(|| SaltError::PageNotFound(target_page_id.to_string()))?;
+            let meta = read_meta_from_doc(&entry.doc, target_page_id)?;
+            if meta.is_deleted {
+                return Err(SaltError::PageNotFound(target_page_id.to_string()));
+            }
+        }
+        let mut item = self.get_inbox_item(inbox_id)?;
+        item.state = InboxState::Archived;
+        item.consumption = InboxConsumption {
+            consumed_page_id: Some(target_page_id.to_string()),
+            consumed_block_id: Some(target_block_id.to_string()),
+            consumed_at_utc: Some(now_utc_ms()),
+        };
+        self.upsert_inbox_item(&item)?;
+        Ok(item)
+    }
+
+    /// Collects all asset relative paths referenced by active pages, Halo slices, and Inbox items,
+    /// returning `(rel_path, is_lightweight_mobile_priority)`.
+    pub fn collect_referenced_assets(&self) -> Vec<(String, bool)> {
+        let mut map: BTreeMap<String, bool> = BTreeMap::new();
+        {
+            let pages = self.pages.read();
+            for (page_id, entry) in pages.iter() {
+                if let Ok(meta) = read_meta_from_doc(&entry.doc, page_id) {
+                    if meta.is_deleted {
+                        continue;
+                    }
+                }
+                for c in read_canvases_from_doc(&entry.doc) {
+                    for img in c.images {
+                        if !img.deleted && !img.asset_rel_path.is_empty() {
+                            map.entry(img.asset_rel_path).or_insert(false);
+                        }
+                    }
+                }
+                for h in read_halos_from_doc(&entry.doc) {
+                    if let Some(rel) = h.slice_asset_rel_path {
+                        if !rel.is_empty() {
+                            map.insert(rel, true);
+                        }
+                    }
+                }
+            }
+        }
+        {
+            let root = self.root_doc.read();
+            for item in read_inbox_from_doc(&root.doc) {
+                if item.state == InboxState::Deleted {
+                    continue;
+                }
+                if let Some(rel) = item.payload.thumb_asset_rel_path {
+                    if !rel.is_empty() {
+                        map.insert(rel, true);
+                    }
+                }
+                if let Some(rel) = item.payload.audio_asset_rel_path {
+                    if !rel.is_empty() {
+                        map.insert(rel, true);
+                    }
+                }
+                if let Some(rel) = item.payload.image_asset_rel_path {
+                    if !rel.is_empty() {
+                        map.entry(rel).or_insert(false);
+                    }
+                }
+            }
+        }
+        map.into_iter().collect()
+    }
+
+    /// Computes canonical SHA-256 hash over normalized Vault-level Inbox CRDT state for tests.
+    pub fn compute_inbox_state_hash(&self) -> SaltResult<String> {
+        let root = self.root_doc.read();
+        let mut items = read_inbox_from_doc(&root.doc);
+        items.sort_by(|a, b| a.inbox_id.cmp(&b.inbox_id));
+        let bytes = serde_json::to_vec(&items).map_err(|e| SaltError::Crdt(e.to_string()))?;
+        Ok(sha256_hex(&bytes))
+    }
+
+    // ------------------------------------------------------------------------
     // Reads & Queries
     // ------------------------------------------------------------------------
 
@@ -1036,10 +1332,10 @@ SaltNote 是一款**永久免费开源、本地优先（Local-First）、零后�
     // Delta Export, Manifest Maintenance & Remote Delta Import
     // ------------------------------------------------------------------------
 
-    /// Flushes all dirty pages into append-only `{ts}_{seq}.delta` files under
+    /// Flushes all dirty pages (and Vault root `inbox` doc) into append-only `{ts}_{seq}.delta` files under
     /// `.saltnote/sync/deltas/{my_device_id}/` and updates `{my_device_id}.json` manifest.
     pub fn flush_all_dirty_deltas(&self) -> SaltResult<Vec<DeltaEntry>> {
-        let dirty_ids: Vec<String> = {
+        let mut dirty_ids: Vec<String> = {
             let pages = self.pages.read();
             pages
                 .iter()
@@ -1047,6 +1343,9 @@ SaltNote 是一款**永久免费开源、本地优先（Local-First）、零后�
                 .map(|(k, _)| k.clone())
                 .collect()
         };
+        if self.root_doc.read().dirty_since_export {
+            dirty_ids.push(VAULT_ROOT_DOC_ID.to_string());
+        }
         let mut created = Vec::new();
         for pid in dirty_ids {
             if let Some(entry) = self.flush_page_delta(&pid)? {
@@ -1057,7 +1356,24 @@ SaltNote 是一款**永久免费开源、本地优先（Local-First）、零后�
     }
 
     pub fn flush_page_delta(&self, page_id: &str) -> SaltResult<Option<DeltaEntry>> {
-        let (loro_bytes, new_vv) = {
+        let is_root = page_id == VAULT_ROOT_DOC_ID;
+        let (loro_bytes, new_vv) = if is_root {
+            let root = self.root_doc.read();
+            if !root.dirty_since_export {
+                return Ok(None);
+            }
+            let current_vv = root.doc.oplog_vv();
+            let bytes = if root.exported_vv.is_empty() {
+                root.doc
+                    .export(ExportMode::Snapshot)
+                    .map_err(|e| SaltError::Crdt(e.to_string()))?
+            } else {
+                root.doc
+                    .export(ExportMode::updates(&root.exported_vv))
+                    .map_err(|e| SaltError::Crdt(e.to_string()))?
+            };
+            (bytes, current_vv)
+        } else {
             let pages = self.pages.read();
             let Some(entry) = pages.get(page_id) else {
                 return Err(SaltError::PageNotFound(page_id.to_string()));
@@ -1131,7 +1447,11 @@ SaltNote 是一款**永久免费开源、本地优先（Local-First）、零后�
             .map_err(|e| SaltError::Io(e.to_string()))?;
         atomic_write(&self.paths.device_state_path(), state_json.as_bytes())?;
 
-        if let Some(entry) = self.pages.write().get_mut(page_id) {
+        if is_root {
+            let mut root = self.root_doc.write();
+            root.exported_vv = new_vv;
+            root.dirty_since_export = false;
+        } else if let Some(entry) = self.pages.write().get_mut(page_id) {
             entry.exported_vv = new_vv;
             entry.dirty_since_export = false;
         }
@@ -1149,11 +1469,11 @@ SaltNote 是一款**永久免费开源、本地优先（Local-First）、零后�
         Ok(Some(m))
     }
 
-    /// Exports full snapshots for all pages (used for P2P QUIC sync handshake).
+    /// Exports full snapshots for all pages & Vault root doc (used for P2P QUIC sync handshake).
     pub fn export_all_page_packets(&self) -> SaltResult<Vec<DeltaPacket>> {
         let dev = self.device_state();
         let pages = self.pages.read();
-        let mut packets = Vec::with_capacity(pages.len());
+        let mut packets = Vec::with_capacity(pages.len() + 1);
         for (idx, (page_id, entry)) in pages.iter().enumerate() {
             let loro_bytes = entry
                 .doc
@@ -1167,33 +1487,56 @@ SaltNote 是一款**永久免费开源、本地优先（Local-First）、零后�
                 loro_bytes,
             });
         }
+        let root_bytes = self
+            .root_doc
+            .read()
+            .doc
+            .export(ExportMode::Snapshot)
+            .map_err(|e| SaltError::Crdt(e.to_string()))?;
+        if !root_bytes.is_empty() {
+            packets.push(DeltaPacket {
+                page_id: VAULT_ROOT_DOC_ID.to_string(),
+                device_id: dev.device_id.clone(),
+                seq: dev.last_seq + packets.len() as u64 + 1,
+                created_at_utc: now_utc_ms(),
+                loro_bytes: root_bytes,
+            });
+        }
         Ok(packets)
     }
 
-    /// Exports encoded Loro `VersionVector` per page (including tombstones) for P2P V2 diff negotiation.
+    /// Exports encoded Loro `VersionVector` per page + Vault root doc for P2P V2 diff negotiation.
     pub fn export_page_version_vectors(&self) -> BTreeMap<String, Vec<u8>> {
-        let pages = self.pages.read();
         let mut out = BTreeMap::new();
-        for (page_id, entry) in pages.iter() {
-            out.insert(page_id.clone(), entry.doc.oplog_vv().encode());
+        {
+            let pages = self.pages.read();
+            for (page_id, entry) in pages.iter() {
+                out.insert(page_id.clone(), entry.doc.oplog_vv().encode());
+            }
+        }
+        let root_vv = self.root_doc.read().doc.oplog_vv();
+        if !root_vv.is_empty() {
+            out.insert(VAULT_ROOT_DOC_ID.to_string(), root_vv.encode());
         }
         out
     }
 
-    /// Exports ONLY missing page snapshots or incremental Loro updates relative to a peer's version vectors.
+    /// Exports ONLY missing page/root snapshots or incremental Loro updates relative to a peer's version vectors.
     pub fn export_diff_packets_against(
         &self,
         remote_vvs: &BTreeMap<String, Vec<u8>>,
     ) -> SaltResult<Vec<DeltaPacket>> {
         let dev = self.device_state();
-        let pages = self.pages.read();
         let mut packets = Vec::new();
         let mut idx = 0u64;
 
-        for (page_id, entry) in pages.iter() {
-            let local_vv = entry.doc.oplog_vv();
+        let compute_diff = |doc: &LoroDoc, doc_id: &str| -> SaltResult<Option<Vec<u8>>> {
+            let local_vv = doc.oplog_vv();
+            if local_vv.is_empty() {
+                return Ok(None);
+            }
             let loro_bytes = match remote_vvs
-                .get(page_id)
+                .get(doc_id)
                 .and_then(|raw| VersionVector::decode(raw).ok())
             {
                 Some(remote_vv) => {
@@ -1201,29 +1544,49 @@ SaltNote 是一款**永久免费开源、本地优先（Local-First）、零后�
                         .iter()
                         .any(|(&peer, &local_cnt)| remote_vv.get(&peer).copied().unwrap_or(0) < local_cnt);
                     if !has_missing_ops {
-                        continue;
+                        return Ok(None);
                     }
-                    entry
-                        .doc
-                        .export(ExportMode::updates(&remote_vv))
+                    doc.export(ExportMode::updates(&remote_vv))
                         .map_err(|e| SaltError::Crdt(e.to_string()))?
                 }
-                None => entry
-                    .doc
+                None => doc
                     .export(ExportMode::Snapshot)
                     .map_err(|e| SaltError::Crdt(e.to_string()))?,
             };
             if loro_bytes.is_empty() {
-                continue;
+                Ok(None)
+            } else {
+                Ok(Some(loro_bytes))
             }
-            idx += 1;
-            packets.push(DeltaPacket {
-                page_id: page_id.clone(),
-                device_id: dev.device_id.clone(),
-                seq: dev.last_seq + idx,
-                created_at_utc: now_utc_ms(),
-                loro_bytes,
-            });
+        };
+
+        {
+            let pages = self.pages.read();
+            for (page_id, entry) in pages.iter() {
+                if let Some(loro_bytes) = compute_diff(&entry.doc, page_id)? {
+                    idx += 1;
+                    packets.push(DeltaPacket {
+                        page_id: page_id.clone(),
+                        device_id: dev.device_id.clone(),
+                        seq: dev.last_seq + idx,
+                        created_at_utc: now_utc_ms(),
+                        loro_bytes,
+                    });
+                }
+            }
+        }
+        {
+            let root = self.root_doc.read();
+            if let Some(loro_bytes) = compute_diff(&root.doc, VAULT_ROOT_DOC_ID)? {
+                idx += 1;
+                packets.push(DeltaPacket {
+                    page_id: VAULT_ROOT_DOC_ID.to_string(),
+                    device_id: dev.device_id.clone(),
+                    seq: dev.last_seq + idx,
+                    created_at_utc: now_utc_ms(),
+                    loro_bytes,
+                });
+            }
         }
         Ok(packets)
     }
@@ -1273,6 +1636,26 @@ SaltNote 是一款**永久免费开源、本地优先（Local-First）、零后�
     pub fn import_delta_packet_bytes(&self, payload: &[u8]) -> SaltResult<String> {
         let packet: DeltaPacket = serde_json::from_slice(payload)
             .map_err(|e| SaltError::Sync(format!("Corrupt delta packet: {e}")))?;
+
+        if packet.page_id == VAULT_ROOT_DOC_ID {
+            {
+                let root = self.root_doc.write();
+                root.doc
+                    .import(&packet.loro_bytes)
+                    .map_err(|e| SaltError::Crdt(format!("Loro root import failed: {e}")))?;
+            }
+            let peer_dir = self.paths.device_deltas_dir(&packet.device_id);
+            fs::create_dir_all(&peer_dir).map_err(|e| SaltError::Io(e.to_string()))?;
+            let short_hash = &sha256_hex(payload)[..10];
+            let fname = format!("{}_{:08}_{}.delta", packet.created_at_utc, packet.seq, short_hash);
+            let p = peer_dir.join(fname);
+            if !p.exists() {
+                atomic_write(&p, payload)?;
+            }
+            self.bump_sync_revision();
+            let _ = self.events_tx.send(DocChangeEvent::InboxUpdated);
+            return Ok(VAULT_ROOT_DOC_ID.to_string());
+        }
 
         let (meta, body, cards, logs, old_file) = {
             let mut pages = self.pages.write();
@@ -1434,19 +1817,25 @@ SaltNote 是一款**永久免费开源、本地优先（Local-First）、零后�
         delta_files.sort();
 
         let mut pages = self.pages.write();
+        let mut root = self.root_doc.write();
         for path in delta_files {
             if let Ok(raw) = fs::read(&path) {
                 if let Ok(packet) = serde_json::from_slice::<DeltaPacket>(&raw) {
-                    let entry = pages
-                        .entry(packet.page_id.clone())
-                        .or_insert_with(|| PageEntry {
-                            doc: self.new_loro_doc(),
-                            exported_vv: VersionVector::new(),
-                            dirty_since_export: false,
-                            markdown_file: None,
-                        });
-                    let _ = entry.doc.import(&packet.loro_bytes);
-                    entry.exported_vv = entry.doc.oplog_vv();
+                    if packet.page_id == VAULT_ROOT_DOC_ID {
+                        let _ = root.doc.import(&packet.loro_bytes);
+                        root.exported_vv = root.doc.oplog_vv();
+                    } else {
+                        let entry = pages
+                            .entry(packet.page_id.clone())
+                            .or_insert_with(|| PageEntry {
+                                doc: self.new_loro_doc(),
+                                exported_vv: VersionVector::new(),
+                                dirty_since_export: false,
+                                markdown_file: None,
+                            });
+                        let _ = entry.doc.import(&packet.loro_bytes);
+                        entry.exported_vv = entry.doc.oplog_vv();
+                    }
                 }
             }
         }
@@ -1461,6 +1850,7 @@ SaltNote 是一款**永久免费开源、本地优先（Local-First）、零后�
         let bytes = fs::read(&wal_path).map_err(|e| SaltError::Io(e.to_string()))?;
         let mut pos = 0usize;
         let mut pages = self.pages.write();
+        let mut root = self.root_doc.write();
         while pos + 2 <= bytes.len() {
             let pid_len = u16::from_le_bytes([bytes[pos], bytes[pos + 1]]) as usize;
             pos += 2;
@@ -1484,17 +1874,24 @@ SaltNote 是一款**永久免费开源、本地优先（Local-First）、零后�
             let chunk = &bytes[pos..pos + data_len];
             pos += data_len;
 
-            let entry = pages
-                .entry(page_id.to_string())
-                .or_insert_with(|| PageEntry {
-                    doc: self.new_loro_doc(),
-                    exported_vv: VersionVector::new(),
-                    dirty_since_export: true,
-                    markdown_file: None,
-                });
-            let _ = entry.doc.import(chunk);
-            if entry.doc.oplog_vv() != entry.exported_vv {
-                entry.dirty_since_export = true;
+            if page_id == VAULT_ROOT_DOC_ID {
+                let _ = root.doc.import(chunk);
+                if root.doc.oplog_vv() != root.exported_vv {
+                    root.dirty_since_export = true;
+                }
+            } else {
+                let entry = pages
+                    .entry(page_id.to_string())
+                    .or_insert_with(|| PageEntry {
+                        doc: self.new_loro_doc(),
+                        exported_vv: VersionVector::new(),
+                        dirty_since_export: true,
+                        markdown_file: None,
+                    });
+                let _ = entry.doc.import(chunk);
+                if entry.doc.oplog_vv() != entry.exported_vv {
+                    entry.dirty_since_export = true;
+                }
             }
         }
 
@@ -1678,6 +2075,19 @@ fn read_halos_from_doc(doc: &LoroDoc) -> Vec<HaloAnnotation> {
         .collect();
     out.sort_by(|a, b| a.created_at_utc.cmp(&b.created_at_utc).then(a.halo_id.cmp(&b.halo_id)));
     out
+}
+
+fn read_inbox_from_doc(doc: &LoroDoc) -> Vec<InboxItem> {
+    let val = doc.get_map("inbox").get_deep_value();
+    let LoroValue::Map(m) = val else {
+        return Vec::new();
+    };
+    m.values()
+        .filter_map(|v| match v {
+            LoroValue::String(s) => serde_json::from_str::<InboxItem>(s).ok(),
+            _ => None,
+        })
+        .collect()
 }
 
 fn read_cards_from_doc(doc: &LoroDoc) -> Vec<FlashCard> {
@@ -2156,6 +2566,7 @@ mod tests {
             pin_x: None,
             pin_y: None,
             slice_cache_path: None,
+            slice_asset_rel_path: None,
             context_excerpt: String::new(),
             response_markdown: "```json\n[{\"front\":\"$\\\\frac{d}{dx} e^x = ?$\",\"back\":\"$e^x$\"}]\n```".into(),
             collapsed: false,
@@ -2241,6 +2652,7 @@ mod tests {
             pin_x: Some(110.0),
             pin_y: Some(20.0),
             slice_cache_path: None,
+            slice_asset_rel_path: None,
             context_excerpt: String::new(),
             response_markdown: "Done".into(),
             collapsed: false,
@@ -2272,6 +2684,126 @@ mod tests {
             .unwrap();
         assert_eq!(tr.x, 120.0);
         assert_eq!(tr.width, 450.0);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn inbox_item_crdt_three_device_convergence_and_consume_into_page() {
+        let base = std::env::temp_dir().join(format!("saltnote_inbox_3dev_{}", new_ulid()));
+        let phone = VaultStore::open(base.join("phone"), Some("Phone".into())).unwrap();
+        let tablet = VaultStore::open(base.join("tablet"), Some("Tablet".into())).unwrap();
+        let pc = VaultStore::open(base.join("pc"), Some("Desktop".into())).unwrap();
+
+        let photo = phone
+            .capture_inbox_item(
+                InboxKind::PhotoNote,
+                Some("黑板上的格林公式例题".into()),
+                Some(b"FAKE_WEBP_BYTES"),
+                Some("webp"),
+                Some(b"FAKE_THUMB_WEBP"),
+                0,
+                false,
+            )
+            .unwrap();
+        let voice = phone
+            .capture_inbox_item(
+                InboxKind::VoiceMemo,
+                None,
+                Some(b"FAKE_OPUS_BYTES"),
+                Some("ogg"),
+                None,
+                14_500,
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            voice.ai_enrichment.transcript_status,
+            TranscriptStatus::WaitingForLanRelay
+        );
+        // Vault-level root doc must NOT pollute `list_pages()`
+        assert!(phone.list_pages().is_empty());
+
+        let page = tablet
+            .create_page("高数笔记", PageMode::Study, false, vec![], "# 格林公式")
+            .unwrap();
+
+        let p_deltas = phone.flush_all_dirty_deltas().unwrap();
+        let p_dir = phone.paths().device_deltas_dir(&phone.device_state().device_id);
+        let p_bytes: Vec<Vec<u8>> = p_deltas
+            .iter()
+            .map(|e| fs::read(p_dir.join(&e.filename)).unwrap())
+            .collect();
+
+        let t_deltas = tablet.flush_all_dirty_deltas().unwrap();
+        let t_dir = tablet.paths().device_deltas_dir(&tablet.device_state().device_id);
+        let t_bytes: Vec<Vec<u8>> = t_deltas
+            .iter()
+            .map(|e| fs::read(t_dir.join(&e.filename)).unwrap())
+            .collect();
+
+        for b in p_bytes.iter().chain(t_bytes.iter()) {
+            pc.import_delta_packet_bytes(b).unwrap();
+        }
+        for b in p_bytes.iter() {
+            tablet.import_delta_packet_bytes(b).unwrap();
+        }
+        for b in t_bytes.iter() {
+            phone.import_delta_packet_bytes(b).unwrap();
+        }
+
+        // Tablet consumes photo into page while PC enriches voice memo concurrently
+        tablet
+            .consume_inbox_into_page(&photo.inbox_id, &page.page_id, "blk_1")
+            .unwrap();
+        pc.update_inbox_enrichment(
+            &voice.inbox_id,
+            TranscriptStatus::Completed,
+            Some("格林公式把闭合曲线积分转化为二重积分".into()),
+            Some("曲线积分与二重积分联系".into()),
+            Some(vec!["高数".into()]),
+        )
+        .unwrap();
+
+        let t_after = tablet.flush_all_dirty_deltas().unwrap();
+        let pc_after = pc.flush_all_dirty_deltas().unwrap();
+        let t_after_bytes: Vec<Vec<u8>> = t_after
+            .iter()
+            .map(|e| fs::read(t_dir.join(&e.filename)).unwrap())
+            .collect();
+        let pc_dir = pc.paths().device_deltas_dir(&pc.device_state().device_id);
+        let pc_after_bytes: Vec<Vec<u8>> = pc_after
+            .iter()
+            .map(|e| fs::read(pc_dir.join(&e.filename)).unwrap())
+            .collect();
+
+        for b in t_after_bytes.iter().chain(pc_after_bytes.iter()) {
+            phone.import_delta_packet_bytes(b).unwrap();
+        }
+        for b in pc_after_bytes.iter() {
+            tablet.import_delta_packet_bytes(b).unwrap();
+        }
+        for b in t_after_bytes.iter() {
+            pc.import_delta_packet_bytes(b).unwrap();
+        }
+
+        assert_eq!(
+            phone.compute_inbox_state_hash().unwrap(),
+            tablet.compute_inbox_state_hash().unwrap()
+        );
+        assert_eq!(
+            tablet.compute_inbox_state_hash().unwrap(),
+            pc.compute_inbox_state_hash().unwrap()
+        );
+        assert_eq!(phone.list_inbox_items(false, 50).len(), 1);
+        let all = phone.list_inbox_items(true, 50);
+        assert_eq!(all.len(), 2);
+        let consumed = all.iter().find(|i| i.inbox_id == photo.inbox_id).unwrap();
+        assert_eq!(consumed.state, InboxState::Archived);
+        assert_eq!(
+            consumed.consumption.consumed_page_id.as_deref(),
+            Some(page.page_id.as_str())
+        );
 
         let _ = fs::remove_dir_all(&base);
     }

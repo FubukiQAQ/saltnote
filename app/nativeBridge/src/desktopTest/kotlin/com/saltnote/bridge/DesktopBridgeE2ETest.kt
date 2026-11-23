@@ -1,5 +1,6 @@
 package com.saltnote.bridge
 
+import kotlinx.coroutines.runBlocking
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertThrows
@@ -139,6 +140,55 @@ class DesktopBridgeE2ETest {
             assertEquals(secret, vault.getSecret(keyRef))
         } finally {
             vault.deleteSecret(keyRef)
+        }
+    }
+
+    @Test
+    fun inboxServiceAndMicroReviewSessionRoundtripOverUniFfi() = runBlocking {
+        val tempVault = Files.createTempDirectory("saltnote_kt_v02_").toFile()
+        try {
+            val secrets = InMemorySecretVault()
+            val client = openSaltNoteClient(
+                vaultPath = tempVault.absolutePath,
+                deviceName = "Kotlin-Phone-Test",
+                secretVault = secrets,
+            )
+
+            val page = client.createPage("高数复习", "study", false, listOf("math"), "# 格林公式")
+            val inboxId = client.captureInboxItem(
+                InboxCaptureInputDto(
+                    kind = InboxKindDto.VoiceMemo,
+                    textNote = "课后思考",
+                    primaryMediaBytes = "FAKE_OGG_OPUS".toByteArray(),
+                    primaryMediaExt = "ogg",
+                    thumbWebpBytes = null,
+                    audioDurationMs = 7_500,
+                    isPrivate = true,
+                ),
+            )
+            assertTrue(inboxId.startsWith("inbx_"))
+
+            val items = client.listInboxItems(includeArchived = false, limit = 20)
+            assertEquals(1, items.size)
+            assertEquals("waiting_for_lan_relay", items[0].transcriptStatus)
+
+            // Async UniFFI enrich_item on #private offline must remain waiting_for_lan_relay
+            val enriched = client.enrichInboxItem(inboxId)
+            assertEquals("waiting_for_lan_relay", enriched.transcriptStatus)
+
+            client.consumeInboxIntoPage(inboxId, page.pageId, "blk_target")
+            assertTrue(client.listInboxItems(includeArchived = false, limit = 20).isEmpty())
+            assertEquals("archived", client.listInboxItems(includeArchived = true, limit = 20)[0].state)
+
+            // Micro-session plan over async IntelService
+            client.createFlashcard(page.pageId, null, "格林公式条件？", "闭合光滑边界 + 偏导连续")
+            val plan = client.buildMicroReviewSession(budgetSeconds = 300, energyLevel = 2, rescueMode = true)
+            assertEquals(300, plan.budgetSeconds)
+            assertEquals(1, plan.totalDueCount)
+            assertEquals(1, plan.cards.size)
+            assertEquals("高数复习", plan.cards[0].sourcePageTitle)
+        } finally {
+            tempVault.deleteRecursively()
         }
     }
 }

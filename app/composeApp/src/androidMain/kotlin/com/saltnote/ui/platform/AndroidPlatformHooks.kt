@@ -5,13 +5,26 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas as AndroidCanvas
+import android.graphics.ColorMatrix
+import android.graphics.ColorMatrixColorFilter
 import android.graphics.DashPathEffect
+import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.PixelFormat
 import android.graphics.PorterDuff
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
+import android.media.AudioManager
+import android.media.ExifInterface
+import android.media.MediaPlayer
+import android.media.MediaRecorder
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.SystemClock
@@ -21,6 +34,8 @@ import android.view.SurfaceHolder
 import android.view.SurfaceView
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
+import androidx.camera.core.ImageCapture
+import androidx.camera.core.ImageCaptureException
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
@@ -28,16 +43,27 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.CameraAlt
+import androidx.compose.material.icons.rounded.Lock
+import androidx.compose.material.icons.rounded.LockOpen
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -46,6 +72,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -67,7 +94,12 @@ import com.google.zxing.MultiFormatReader
 import com.google.zxing.PlanarYUVLuminanceSource
 import com.google.zxing.common.HybridBinarizer
 import com.saltnote.bridge.StrokeSample
+import com.saltnote.ui.components.SaltFilterChip
 import com.saltnote.ui.components.StrokeGeometry
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -75,12 +107,14 @@ import java.util.Locale
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.hypot
+import kotlin.math.roundToInt
 
 object AndroidPlatformContext {
     lateinit var appContext: Context
     var lifecycleOwner: LifecycleOwner? = null
     var imagePickerBridge: (() -> ByteArray?)? = null
     var cameraPermissionBridge: (((Boolean) -> Unit) -> Unit)? = null
+    var micPermissionBridge: (((Boolean) -> Unit) -> Unit)? = null
     var folderTreePickerBridge: (((android.net.Uri?) -> Unit) -> Unit)? = null
     private var multicastLock: WifiManager.MulticastLock? = null
 
@@ -164,6 +198,12 @@ actual fun loadImageBitmapFromVault(vaultPath: String, relPath: String): ImageBi
     return runCatching {
         BitmapFactory.decodeFile(file.absolutePath)?.asImageBitmap()
     }.getOrNull()
+}
+
+actual fun readVaultAssetBytes(vaultPath: String, relPath: String): ByteArray? {
+    val file = File(vaultPath, relPath)
+    if (!file.isFile) return null
+    return runCatching { file.readBytes() }.getOrNull()
 }
 
 actual fun pickLocalImageBytes(): ByteArray? = AndroidPlatformContext.imagePickerBridge?.invoke()
@@ -383,6 +423,547 @@ actual fun readTextFromClipboard(): String? {
 }
 
 actual fun supportsLiveCameraQrScan(): Boolean = true
+
+actual fun supportsInboxCameraCapture(): Boolean = true
+
+actual fun hasMicrophonePermission(): Boolean {
+    if (!AndroidPlatformContext.isInitialized()) return false
+    return ContextCompat.checkSelfPermission(
+        AndroidPlatformContext.appContext,
+        Manifest.permission.RECORD_AUDIO,
+    ) == PackageManager.PERMISSION_GRANTED
+}
+
+actual fun requestMicrophonePermission(onResult: (Boolean) -> Unit) {
+    val bridge = AndroidPlatformContext.micPermissionBridge
+    if (bridge != null) {
+        bridge.invoke(onResult)
+    } else {
+        onResult(hasMicrophonePermission())
+    }
+}
+
+actual fun isNetworkMetered(): Boolean {
+    if (!AndroidPlatformContext.isInitialized()) return false
+    val cm = AndroidPlatformContext.appContext.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+        ?: return false
+    val active = cm.activeNetwork ?: return false
+    val caps = cm.getNetworkCapabilities(active) ?: return cm.isActiveNetworkMetered
+    val unmetered = caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED) ||
+        caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_TEMPORARILY_NOT_METERED)
+    return !unmetered || cm.isActiveNetworkMetered
+}
+
+actual fun observeNetworkMetered(onChange: (Boolean) -> Unit): () -> Unit {
+    if (!AndroidPlatformContext.isInitialized()) {
+        onChange(false)
+        return {}
+    }
+    val cm = AndroidPlatformContext.appContext.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+    if (cm == null) {
+        onChange(false)
+        return {}
+    }
+    onChange(isNetworkMetered())
+    val cb = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) = onChange(isNetworkMetered())
+        override fun onLost(network: Network) = onChange(isNetworkMetered())
+        override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
+            val unmetered = networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED) ||
+                networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_TEMPORARILY_NOT_METERED)
+            onChange(!unmetered || cm.isActiveNetworkMetered)
+        }
+    }
+    return runCatching<() -> Unit> {
+        cm.registerDefaultNetworkCallback(cb)
+        val dispose: () -> Unit = { runCatching { cm.unregisterNetworkCallback(cb) } }
+        dispose
+    }.getOrElse {
+        {}
+    }
+}
+
+actual fun startVoiceRecording(onError: (String) -> Unit): PlatformVoiceRecorderSession? {
+    if (!AndroidPlatformContext.isInitialized()) return null
+    val ctx = AndroidPlatformContext.appContext
+    if (!hasMicrophonePermission()) {
+        onError("Microphone permission not granted")
+        return null
+    }
+    return runCatching {
+        val tempFile = File(ctx.cacheDir, "saltnote_opus_${System.currentTimeMillis()}.ogg")
+        val am = ctx.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+        val focusReq = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE)
+            .setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build(),
+            )
+            .build()
+        am?.requestAudioFocus(focusReq)
+
+        val recorder = if (Build.VERSION.SDK_INT >= 31) {
+            MediaRecorder(ctx)
+        } else {
+            @Suppress("DEPRECATION")
+            MediaRecorder()
+        }
+        recorder.apply {
+            setAudioSource(MediaRecorder.AudioSource.MIC)
+            setOutputFormat(MediaRecorder.OutputFormat.OGG)
+            setAudioEncoder(MediaRecorder.AudioEncoder.OPUS)
+            setAudioSamplingRate(16_000)
+            setAudioChannels(1)
+            setAudioEncodingBitRate(24_000)
+            setOutputFile(tempFile.absolutePath)
+            prepare()
+            start()
+        }
+        val startedAtMs = System.currentTimeMillis()
+        var released = false
+
+        object : PlatformVoiceRecorderSession {
+            override fun stopAndRead(): RecordedAudioClip? {
+                if (released) return null
+                released = true
+                runCatching { recorder.stop() }
+                runCatching { recorder.release() }
+                runCatching { am?.abandonAudioFocusRequest(focusReq) }
+                if (!tempFile.exists() || tempFile.length() == 0L) {
+                    runCatching { tempFile.delete() }
+                    return null
+                }
+                val bytes = runCatching { tempFile.readBytes() }.getOrNull()
+                runCatching { tempFile.delete() }
+                if (bytes == null || bytes.isEmpty()) return null
+                val dur = (System.currentTimeMillis() - startedAtMs).coerceAtLeast(300L).toInt()
+                return RecordedAudioClip(bytes = bytes, ext = "ogg", durationMs = dur)
+            }
+
+            override fun cancel() {
+                if (released) return
+                released = true
+                runCatching { recorder.stop() }
+                runCatching { recorder.release() }
+                runCatching { am?.abandonAudioFocusRequest(focusReq) }
+                runCatching { tempFile.delete() }
+            }
+        }
+    }.getOrElse { err ->
+        onError(err.message ?: "Opus recording failed")
+        null
+    }
+}
+
+actual fun playVaultAudio(
+    vaultPath: String,
+    relPath: String,
+    onCompleted: () -> Unit,
+    onError: (String) -> Unit,
+): PlatformAudioPlaybackHandle? {
+    val file = File(vaultPath, relPath)
+    if (!file.exists()) {
+        onError("Audio file not found: $relPath")
+        return null
+    }
+    return runCatching {
+        val player = MediaPlayer().apply {
+            setDataSource(file.absolutePath)
+            setOnCompletionListener {
+                runCatching { release() }
+                onCompleted()
+            }
+            prepare()
+            start()
+        }
+        object : PlatformAudioPlaybackHandle {
+            override fun isPlaying(): Boolean = runCatching { player.isPlaying }.getOrDefault(false)
+            override fun pause() {
+                runCatching { if (player.isPlaying) player.pause() }
+            }
+            override fun resume() {
+                runCatching { if (!player.isPlaying) player.start() }
+            }
+            override fun stop() {
+                runCatching {
+                    if (player.isPlaying) player.stop()
+                    player.release()
+                }
+            }
+        }
+    }.getOrElse { err ->
+        onError(err.message ?: "Audio playback failed")
+        null
+    }
+}
+
+fun encodeImageBytesToWebpPair(
+    rawBytes: ByteArray,
+    isBoardMode: Boolean = false,
+): Pair<ByteArray, ByteArray>? = runCatching {
+    val targetLimit = if (isBoardMode) 1600 else 1280
+    val optsBounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+    BitmapFactory.decodeByteArray(rawBytes, 0, rawBytes.size, optsBounds)
+    val rawW = optsBounds.outWidth.coerceAtLeast(1)
+    val rawH = optsBounds.outHeight.coerceAtLeast(1)
+    var sampleSize = 1
+    while ((rawW / sampleSize) > targetLimit * 2 || (rawH / sampleSize) > targetLimit * 2) {
+        sampleSize *= 2
+    }
+    val decodeOpts = BitmapFactory.Options().apply { inSampleSize = sampleSize }
+    val decoded = BitmapFactory.decodeByteArray(rawBytes, 0, rawBytes.size, decodeOpts) ?: return null
+    val exif = runCatching { ExifInterface(java.io.ByteArrayInputStream(rawBytes)) }.getOrNull()
+    compressOrientedBitmapToWebpPair(decoded, exif, targetLimit, isBoardMode)
+}.getOrNull()
+
+private fun compressCapturedPhotoToWebp(
+    photoFile: File,
+    isBoardMode: Boolean,
+): Pair<ByteArray, ByteArray>? = runCatching {
+    val optsBounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+    BitmapFactory.decodeFile(photoFile.absolutePath, optsBounds)
+    val rawW = optsBounds.outWidth.coerceAtLeast(1)
+    val rawH = optsBounds.outHeight.coerceAtLeast(1)
+    var sampleSize = 1
+    val targetLimit = if (isBoardMode) 1600 else 1280
+    while ((rawW / sampleSize) > targetLimit * 2 || (rawH / sampleSize) > targetLimit * 2) {
+        sampleSize *= 2
+    }
+    val decodeOpts = BitmapFactory.Options().apply { inSampleSize = sampleSize }
+    val decoded = BitmapFactory.decodeFile(photoFile.absolutePath, decodeOpts) ?: return null
+    val exif = runCatching { ExifInterface(photoFile.absolutePath) }.getOrNull()
+    compressOrientedBitmapToWebpPair(decoded, exif, targetLimit, isBoardMode)
+}.getOrNull()
+
+private fun compressOrientedBitmapToWebpPair(
+    decoded: Bitmap,
+    exif: ExifInterface?,
+    targetLimit: Int,
+    isBoardMode: Boolean,
+): Pair<ByteArray, ByteArray> {
+    val orientation = exif?.getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)
+        ?: ExifInterface.ORIENTATION_NORMAL
+    val matrix = Matrix()
+    when (orientation) {
+        ExifInterface.ORIENTATION_ROTATE_90 -> matrix.postRotate(90f)
+        ExifInterface.ORIENTATION_ROTATE_180 -> matrix.postRotate(180f)
+        ExifInterface.ORIENTATION_ROTATE_270 -> matrix.postRotate(270f)
+        ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> matrix.postScale(-1f, 1f)
+        ExifInterface.ORIENTATION_FLIP_VERTICAL -> matrix.postScale(1f, -1f)
+    }
+    val oriented = if (!matrix.isIdentity) {
+        Bitmap.createBitmap(decoded, 0, 0, decoded.width, decoded.height, matrix, true).also {
+            if (it != decoded) decoded.recycle()
+        }
+    } else {
+        decoded
+    }
+
+    val curLong = maxOf(oriented.width, oriented.height).coerceAtLeast(1)
+    val scale = if (curLong > targetLimit) targetLimit.toFloat() / curLong.toFloat() else 1f
+    val dstW = (oriented.width * scale).roundToInt().coerceAtLeast(1)
+    val dstH = (oriented.height * scale).roundToInt().coerceAtLeast(1)
+    val scaledPrimary = if (dstW != oriented.width || dstH != oriented.height) {
+        Bitmap.createScaledBitmap(oriented, dstW, dstH, true).also {
+            if (it != oriented) oriented.recycle()
+        }
+    } else {
+        oriented
+    }
+
+    val primaryBitmap = if (isBoardMode) {
+        // Mild contrast + brightness boost for whiteboards/blackboards/documents
+        val enhanced = Bitmap.createBitmap(scaledPrimary.width, scaledPrimary.height, Bitmap.Config.ARGB_8888)
+        val canvas = AndroidCanvas(enhanced)
+        val c = 1.18f
+        val b = -14f
+        val cm = ColorMatrix(
+            floatArrayOf(
+                c, 0f, 0f, 0f, b,
+                0f, c, 0f, 0f, b,
+                0f, 0f, c, 0f, b,
+                0f, 0f, 0f, 1f, 0f,
+            ),
+        )
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            colorFilter = ColorMatrixColorFilter(cm)
+        }
+        canvas.drawBitmap(scaledPrimary, 0f, 0f, paint)
+        scaledPrimary.recycle()
+        enhanced
+    } else {
+        scaledPrimary
+    }
+
+    val webpFmt = if (Build.VERSION.SDK_INT >= 30) {
+        Bitmap.CompressFormat.WEBP_LOSSY
+    } else {
+        @Suppress("DEPRECATION")
+        Bitmap.CompressFormat.WEBP
+    }
+    val primaryOut = ByteArrayOutputStream()
+    primaryBitmap.compress(webpFmt, 82, primaryOut)
+
+    val thumbW = 320.coerceAtMost(primaryBitmap.width).coerceAtLeast(1)
+    val thumbH = ((primaryBitmap.height.toFloat() / primaryBitmap.width.coerceAtLeast(1)) * thumbW)
+        .roundToInt()
+        .coerceAtLeast(1)
+    val thumbBitmap = Bitmap.createScaledBitmap(primaryBitmap, thumbW, thumbH, true)
+    val thumbOut = ByteArrayOutputStream()
+    thumbBitmap.compress(webpFmt, 75, thumbOut)
+    if (thumbBitmap != primaryBitmap) thumbBitmap.recycle()
+    primaryBitmap.recycle()
+
+    return primaryOut.toByteArray() to thumbOut.toByteArray()
+}
+
+@Composable
+actual fun PlatformInboxCameraCaptureDialog(
+    initialPrivate: Boolean,
+    onCaptured: (primaryWebp: ByteArray, thumbWebp: ByteArray, isPrivate: Boolean, noteText: String?) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val ctx = AndroidPlatformContext.appContext
+    val strings = com.saltnote.ui.i18n.LocalSaltStrings.current
+    val scope = rememberCoroutineScope()
+    var hasPermission by remember {
+        mutableStateOf(
+            ContextCompat.checkSelfPermission(ctx, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED,
+        )
+    }
+    var isBoardMode by remember { mutableStateOf(true) }
+    var isPrivate by remember { mutableStateOf(initialPrivate) }
+    var isProcessing by remember { mutableStateOf(false) }
+    var capturedPair by remember { mutableStateOf<Pair<ByteArray, ByteArray>?>(null) }
+    var noteText by remember { mutableStateOf("") }
+    var cameraError by remember { mutableStateOf<String?>(null) }
+    var imageCaptureRef by remember { mutableStateOf<ImageCapture?>(null) }
+    val captureExecutor = remember { Executors.newSingleThreadExecutor() }
+
+    DisposableEffect(Unit) {
+        onDispose { captureExecutor.shutdown() }
+    }
+
+    LaunchedEffect(Unit) {
+        if (!hasPermission) {
+            AndroidPlatformContext.cameraPermissionBridge?.invoke { granted ->
+                hasPermission = granted
+                if (!granted) cameraError = strings.cameraPermissionMissing
+            }
+        }
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Text(strings.capturePhoto, style = MaterialTheme.typography.titleMedium)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        imageVector = if (isPrivate) Icons.Rounded.Lock else Icons.Rounded.LockOpen,
+                        contentDescription = null,
+                        tint = if (isPrivate) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(16.dp),
+                    )
+                    Spacer(Modifier.width(4.dp))
+                    Switch(checked = isPrivate, onCheckedChange = { isPrivate = it })
+                }
+            }
+        },
+        text = {
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                if (capturedPair == null) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        SaltFilterChip(
+                            selected = isBoardMode,
+                            onClick = { isBoardMode = true },
+                            label = { Text(strings.cameraModeBoard) },
+                        )
+                        SaltFilterChip(
+                            selected = !isBoardMode,
+                            onClick = { isBoardMode = false },
+                            label = { Text(strings.cameraModeJournal) },
+                        )
+                    }
+
+                    if (hasPermission && AndroidPlatformContext.lifecycleOwner != null) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(300.dp)
+                                .clip(RoundedCornerShape(16.dp)),
+                        ) {
+                            CameraXPhotoCapturePreview(
+                                lifecycleOwner = AndroidPlatformContext.lifecycleOwner!!,
+                                onImageCaptureReady = { imageCaptureRef = it },
+                                onCameraError = { cameraError = it },
+                                modifier = Modifier.fillMaxSize(),
+                            )
+                            if (isProcessing) {
+                                Surface(
+                                    color = Color.Black.copy(alpha = 0.45f),
+                                    modifier = Modifier.fillMaxSize(),
+                                ) {
+                                    Box(contentAlignment = Alignment.Center) {
+                                        CircularProgressIndicator(color = Color.White)
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        Text(
+                            text = cameraError ?: strings.cameraPermissionPrompt,
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                        if (!hasPermission) {
+                            FilledTonalButton(
+                                onClick = {
+                                    AndroidPlatformContext.cameraPermissionBridge?.invoke { granted ->
+                                        hasPermission = granted
+                                    }
+                                },
+                            ) { Text(strings.grantCameraPermission) }
+                        }
+                    }
+                } else {
+                    Text(
+                        text = "WebP ✓ (${capturedPair!!.first.size / 1024} KB)",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                    OutlinedTextField(
+                        value = noteText,
+                        onValueChange = { noteText = it },
+                        label = { Text(strings.captureText) },
+                        maxLines = 3,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
+
+                cameraError?.let {
+                    Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+                }
+            }
+        },
+        confirmButton = {
+            if (capturedPair == null) {
+                Button(
+                    enabled = hasPermission && imageCaptureRef != null && !isProcessing,
+                    onClick = {
+                        val cap = imageCaptureRef ?: return@Button
+                        isProcessing = true
+                        cameraError = null
+                        val tmpFile = File(ctx.cacheDir, "saltnote_cap_${System.currentTimeMillis()}.jpg")
+                        val outputOpts = ImageCapture.OutputFileOptions.Builder(tmpFile).build()
+                        cap.takePicture(
+                            outputOpts,
+                            captureExecutor,
+                            object : ImageCapture.OnImageSavedCallback {
+                                override fun onImageSaved(outputFileResults: ImageCapture.OutputFileResults) {
+                                    scope.launch {
+                                        val compressed = withContext(Dispatchers.IO) {
+                                            compressCapturedPhotoToWebp(tmpFile, isBoardMode).also {
+                                                runCatching { tmpFile.delete() }
+                                            }
+                                        }
+                                        isProcessing = false
+                                        if (compressed != null) {
+                                            capturedPair = compressed
+                                        } else {
+                                            cameraError = "Failed to compress photo"
+                                        }
+                                    }
+                                }
+
+                                override fun onError(exception: ImageCaptureException) {
+                                    scope.launch {
+                                        runCatching { tmpFile.delete() }
+                                        isProcessing = false
+                                        cameraError = exception.message ?: "Capture failed"
+                                    }
+                                }
+                            },
+                        )
+                    },
+                ) {
+                    Icon(Icons.Rounded.CameraAlt, null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text(strings.captureShutterDesc)
+                }
+            } else {
+                Button(
+                    onClick = {
+                        val (prim, thumb) = capturedPair!!
+                        onCaptured(prim, thumb, isPrivate, noteText.trim().ifBlank { null })
+                    },
+                ) { Text(strings.save) }
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text(strings.cancel) }
+        },
+    )
+}
+
+@Composable
+private fun CameraXPhotoCapturePreview(
+    lifecycleOwner: LifecycleOwner,
+    onImageCaptureReady: (ImageCapture) -> Unit,
+    onCameraError: (String) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    var cameraProviderRef by remember { mutableStateOf<ProcessCameraProvider?>(null) }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            runCatching { cameraProviderRef?.unbindAll() }
+        }
+    }
+
+    AndroidView(
+        modifier = modifier,
+        factory = { ctx ->
+            val previewView = PreviewView(ctx).apply {
+                scaleType = PreviewView.ScaleType.FILL_CENTER
+            }
+            val future = ProcessCameraProvider.getInstance(ctx)
+            future.addListener(
+                {
+                    runCatching {
+                        val provider = future.get()
+                        cameraProviderRef = provider
+                        val preview = Preview.Builder().build().also {
+                            it.surfaceProvider = previewView.surfaceProvider
+                        }
+                        val capture = ImageCapture.Builder()
+                            .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+                            .build()
+                        provider.unbindAll()
+                        provider.bindToLifecycle(
+                            lifecycleOwner,
+                            CameraSelector.DEFAULT_BACK_CAMERA,
+                            preview,
+                            capture,
+                        )
+                        onImageCaptureReady(capture)
+                    }.onFailure { err ->
+                        onCameraError("无法启动相机：${err.message}")
+                    }
+                },
+                ContextCompat.getMainExecutor(ctx),
+            )
+            previewView
+        },
+    )
+}
 
 @Composable
 actual fun PlatformQrScannerDialog(

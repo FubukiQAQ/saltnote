@@ -5,7 +5,13 @@ import kotlinx.serialization.json.Json
 import uniffi.saltnote_ffi.FfiException
 import uniffi.saltnote_ffi.HaloCancelHandle
 import uniffi.saltnote_ffi.HaloStreamCallback
+import uniffi.saltnote_ffi.InboxCaptureInput
+import uniffi.saltnote_ffi.InboxItemView
+import uniffi.saltnote_ffi.InboxKind
+import uniffi.saltnote_ffi.InboxService
+import uniffi.saltnote_ffi.IntelService
 import uniffi.saltnote_ffi.PlatformSecretStore
+import uniffi.saltnote_ffi.ReviewCardView
 import uniffi.saltnote_ffi.SaltEngine
 
 private val saltJson = Json {
@@ -35,6 +41,8 @@ private class NativeSaltNoteClient(
             }
         },
     )
+    private val inboxService: InboxService = engine.inbox()
+    private val intelService: IntelService = engine.intel()
 
     override fun getSyncRevision(): Long = engine.getSyncRevision().toLong()
 
@@ -216,6 +224,25 @@ private class NativeSaltNoteClient(
         return NativeCancelHandle(handle)
     }
 
+    override fun triggerInboxHalo(
+        inboxId: String,
+        pageId: String,
+        presetId: String,
+        providerId: String?,
+        outputLanguageHint: String?,
+        listener: HaloStreamListener,
+    ): CancelHandle {
+        val handle = engine.triggerInboxHalo(
+            inboxId = inboxId,
+            pageId = pageId,
+            presetId = presetId,
+            providerId = providerId,
+            outputLanguageHint = outputLanguageHint,
+            callback = wrapCallback(listener),
+        )
+        return NativeCancelHandle(handle)
+    }
+
     override fun updateHaloPin(pageId: String, haloId: String, pinX: Float, pinY: Float): HaloAnnotationDto =
         saltJson.decodeFromString(engine.updateHaloPin(pageId, haloId, pinX, pinY))
 
@@ -290,8 +317,8 @@ private class NativeSaltNoteClient(
         engine.saveWebdavConfigJson(saltJson.encodeToString(config))
     }
 
-    override fun syncWebDavNow(): SyncReportDto =
-        saltJson.decodeFromString(engine.syncWebdavNowJson())
+    override fun syncWebDavNow(isMetered: Boolean): SyncReportDto =
+        saltJson.decodeFromString(engine.syncWebdavWithPolicyJson(isMetered))
 
     override fun startLanP2p(enableMdns: Boolean): LanNodeInfoDto =
         saltJson.decodeFromString(engine.startLanP2p(enableMdns))
@@ -310,6 +337,55 @@ private class NativeSaltNoteClient(
     ): P2pSyncResultDto = saltJson.decodeFromString(
         engine.syncWithLanPeerJson(host, port.toUShort(), expectedFingerprint),
     )
+
+    override fun captureInboxItem(input: InboxCaptureInputDto): String =
+        inboxService.captureItem(
+            InboxCaptureInput(
+                kind = input.kind.toUniffi(),
+                textNote = input.textNote,
+                primaryMediaBytes = input.primaryMediaBytes,
+                primaryMediaExt = input.primaryMediaExt,
+                thumbWebpBytes = input.thumbWebpBytes,
+                audioDurationMs = input.audioDurationMs.coerceAtLeast(0).toUInt(),
+                isPrivate = input.isPrivate,
+            ),
+        )
+
+    override fun listInboxItems(includeArchived: Boolean, limit: Int): List<InboxItemViewDto> =
+        inboxService.listItems(includeArchived, limit.coerceAtLeast(1).toUInt()).map { it.toDto() }
+
+    override suspend fun enrichInboxItem(inboxId: String): InboxItemViewDto =
+        inboxService.enrichItem(inboxId).toDto()
+
+    override fun consumeInboxIntoPage(inboxId: String, targetPageId: String, targetBlockId: String) {
+        inboxService.consumeIntoPage(inboxId, targetPageId, targetBlockId)
+    }
+
+    override fun setInboxItemPrivate(inboxId: String, isPrivate: Boolean): InboxItemViewDto =
+        inboxService.setPrivate(inboxId, isPrivate).toDto()
+
+    override fun deleteInboxItem(inboxId: String) {
+        inboxService.deleteItem(inboxId)
+    }
+
+    override suspend fun buildMicroReviewSession(
+        budgetSeconds: Int,
+        energyLevel: Int,
+        rescueMode: Boolean,
+    ): MicroSessionPlanDto {
+        val plan = intelService.buildMicroReviewSession(
+            budgetSeconds = budgetSeconds.coerceAtLeast(60).toUInt(),
+            energyLevel = energyLevel.coerceIn(1, 3).toUByte(),
+            rescueMode = rescueMode,
+        )
+        return MicroSessionPlanDto(
+            sessionId = plan.sessionId,
+            budgetSeconds = plan.budgetSeconds.toInt(),
+            estimatedSeconds = plan.estimatedSeconds.toInt(),
+            cards = plan.cards.map { it.toDto() },
+            totalDueCount = plan.totalDueCount.toInt(),
+        )
+    }
 
     override fun redactLogText(raw: String): String = engine.redactLogText(raw)
 
@@ -336,3 +412,54 @@ private class NativeCancelHandle(private val handle: HaloCancelHandle) : CancelH
     override fun cancel() = handle.cancel()
     override fun isCancelled(): Boolean = handle.isCancelled()
 }
+
+private fun InboxKindDto.toUniffi(): InboxKind = when (this) {
+    InboxKindDto.QuickText -> InboxKind.QUICK_TEXT
+    InboxKindDto.PhotoNote -> InboxKind.PHOTO_NOTE
+    InboxKindDto.VoiceMemo -> InboxKind.VOICE_MEMO
+    InboxKindDto.WebClip -> InboxKind.WEB_CLIP
+}
+
+private fun InboxKind.toDto(): InboxKindDto = when (this) {
+    InboxKind.QUICK_TEXT -> InboxKindDto.QuickText
+    InboxKind.PHOTO_NOTE -> InboxKindDto.PhotoNote
+    InboxKind.VOICE_MEMO -> InboxKindDto.VoiceMemo
+    InboxKind.WEB_CLIP -> InboxKindDto.WebClip
+}
+
+private fun InboxItemView.toDto(): InboxItemViewDto = InboxItemViewDto(
+    inboxId = inboxId,
+    kind = kind.toDto(),
+    createdAtUtc = createdAtUtc,
+    isPrivate = isPrivate,
+    state = state,
+    textNote = textNote,
+    transcriptText = transcriptText,
+    summaryText = summaryText,
+    autoTags = autoTags,
+    transcriptStatus = transcriptStatus,
+    thumbAssetPath = thumbAssetPath,
+    primaryAssetPath = primaryAssetPath,
+    audioDurationMs = audioDurationMs.toInt(),
+    consumedPageId = consumedPageId,
+    consumedBlockId = consumedBlockId,
+)
+
+private fun ReviewCardView.toDto(): ReviewCardViewDto = ReviewCardViewDto(
+    cardId = cardId,
+    pageId = pageId,
+    anchorHaloId = anchorHaloId,
+    front = front,
+    back = back,
+    stability = stability,
+    difficulty = difficulty,
+    reps = reps.toInt(),
+    lapses = lapses.toInt(),
+    state = state.toInt(),
+    lastReviewUtc = lastReviewUtc,
+    dueAtUtc = dueAtUtc,
+    retrievability = retrievability,
+    sourcePageTitle = sourcePageTitle,
+    sliceAssetPath = sliceAssetPath,
+    contextExcerpt = contextExcerpt,
+)

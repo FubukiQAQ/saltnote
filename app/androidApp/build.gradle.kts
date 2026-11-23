@@ -12,10 +12,10 @@ android {
 
     defaultConfig {
         applicationId = "com.saltnote.alpha"
-        minSdk = 26
+        minSdk = 29
         targetSdk = 36
-        versionCode = 2
-        versionName = "0.1.0-beta"
+        versionCode = 3
+        versionName = "0.2.0-alpha"
 
         ndk {
             abiFilters += listOf("arm64-v8a")
@@ -24,7 +24,8 @@ android {
 
     buildTypes {
         release {
-            isMinifyEnabled = false
+            isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",
@@ -63,6 +64,8 @@ dependencies {
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.androidx.activity.compose)
+    implementation(libs.androidx.glance.appwidget)
+    implementation(libs.androidx.glance.material3)
     implementation(libs.google.material)
 }
 

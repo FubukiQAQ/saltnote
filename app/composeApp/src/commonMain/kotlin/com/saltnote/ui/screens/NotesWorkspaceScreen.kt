@@ -26,6 +26,7 @@ import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.DeleteOutline
 import androidx.compose.material.icons.rounded.Description
 import androidx.compose.material.icons.rounded.Draw
+import androidx.compose.material.icons.rounded.Inbox
 import androidx.compose.material.icons.rounded.LocalOffer
 import androidx.compose.material.icons.rounded.Lock
 import androidx.compose.material.icons.rounded.LockOpen
@@ -62,11 +63,13 @@ import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.saltnote.bridge.PageSummaryDto
+import com.saltnote.ui.components.CompactCanvasPreview
 import com.saltnote.ui.components.DocumentEditorView
 import com.saltnote.ui.components.DualCanvasView
 import com.saltnote.ui.components.SaltAssistChip
 import com.saltnote.ui.components.SaltFilterChip
 import com.saltnote.ui.components.SaltHaloCrystalOverlay
+import com.saltnote.ui.components.SaltTrayDrawer
 import com.saltnote.ui.i18n.LocalSaltStrings
 import com.saltnote.ui.platform.formatUtcTimestamp
 import com.saltnote.ui.state.EditorViewMode
@@ -86,6 +89,9 @@ fun NotesWorkspaceScreen(
 
     val allVaultTags = remember(state.pages.toList()) {
         state.pages.flatMap { it.meta.tags }.distinct().sorted()
+    }
+    val unprocessedInboxCount = remember(state.inboxItems.toList()) {
+        state.inboxItems.count { it.state == "unprocessed" }
     }
 
     Row(modifier = Modifier.fillMaxSize()) {
@@ -147,19 +153,83 @@ fun NotesWorkspaceScreen(
                                 modifier = Modifier.weight(1f),
                             )
 
-                            SaltFilterChip(
-                                selected = active.meta.isPrivate,
-                                onClick = { state.togglePagePrivate() },
-                                label = { Text(if (active.meta.isPrivate) strings.privateLabel else strings.publicLabel) },
-                                leadingIcon = {
-                                    Icon(
-                                        imageVector = if (active.meta.isPrivate) Icons.Rounded.Lock else Icons.Rounded.LockOpen,
-                                        contentDescription = strings.privateLabel,
-                                        modifier = Modifier.size(16.dp),
-                                    )
-                                },
-                            )
+                            if (isWideScreen) {
+                                SaltFilterChip(
+                                    selected = active.meta.isPrivate,
+                                    onClick = { state.togglePagePrivate() },
+                                    label = { Text(if (active.meta.isPrivate) strings.privateLabel else strings.publicLabel) },
+                                    leadingIcon = {
+                                        Icon(
+                                            imageVector = if (active.meta.isPrivate) Icons.Rounded.Lock else Icons.Rounded.LockOpen,
+                                            contentDescription = strings.privateLabel,
+                                            modifier = Modifier.size(16.dp),
+                                        )
+                                    },
+                                )
 
+                                SingleChoiceSegmentedButtonRow {
+                                    EditorViewMode.entries.forEachIndexed { idx, mode ->
+                                        SegmentedButton(
+                                            selected = state.editorMode == mode,
+                                            onClick = { state.editorMode = mode },
+                                            shape = SegmentedButtonDefaults.itemShape(
+                                                index = idx,
+                                                count = EditorViewMode.entries.size,
+                                            ),
+                                            icon = {
+                                                Icon(
+                                                    imageVector = if (mode == EditorViewMode.Canvas) Icons.Rounded.Draw else Icons.Rounded.Description,
+                                                    contentDescription = null,
+                                                    modifier = Modifier.size(16.dp),
+                                                )
+                                            },
+                                        ) {
+                                            Text(if (mode == EditorViewMode.Canvas) strings.modeCanvas else strings.modeDocument)
+                                        }
+                                    }
+                                }
+
+                                SaltFilterChip(
+                                    selected = state.showSaltTray,
+                                    onClick = { state.showSaltTray = !state.showSaltTray },
+                                    label = {
+                                        Text(
+                                            if (unprocessedInboxCount > 0) {
+                                                "${strings.saltTrayTitle} ($unprocessedInboxCount)"
+                                            } else {
+                                                strings.saltTrayTitle
+                                            },
+                                        )
+                                    },
+                                    leadingIcon = {
+                                        Icon(Icons.Rounded.Inbox, null, modifier = Modifier.size(16.dp))
+                                    },
+                                )
+                            }
+
+                            IconButton(
+                                onClick = { pendingDeletePage = active.meta.pageId to active.meta.title },
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.DeleteOutline,
+                                    contentDescription = strings.deleteNote,
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        } else {
+                            Text(strings.selectOrCreateNote, style = MaterialTheme.typography.titleMedium)
+                        }
+                    }
+
+                    if (active != null && !isWideScreen) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .horizontalScroll(rememberScrollState())
+                                .padding(horizontal = 12.dp, vertical = 2.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
                             SingleChoiceSegmentedButtonRow {
                                 EditorViewMode.entries.forEachIndexed { idx, mode ->
                                     SegmentedButton(
@@ -182,17 +252,18 @@ fun NotesWorkspaceScreen(
                                 }
                             }
 
-                            IconButton(
-                                onClick = { pendingDeletePage = active.meta.pageId to active.meta.title },
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Rounded.DeleteOutline,
-                                    contentDescription = strings.deleteNote,
-                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                                )
-                            }
-                        } else {
-                            Text(strings.selectOrCreateNote, style = MaterialTheme.typography.titleMedium)
+                            SaltFilterChip(
+                                selected = active.meta.isPrivate,
+                                onClick = { state.togglePagePrivate() },
+                                label = { Text(if (active.meta.isPrivate) strings.privateLabel else strings.publicLabel) },
+                                leadingIcon = {
+                                    Icon(
+                                        imageVector = if (active.meta.isPrivate) Icons.Rounded.Lock else Icons.Rounded.LockOpen,
+                                        contentDescription = strings.privateLabel,
+                                        modifier = Modifier.size(16.dp),
+                                    )
+                                },
+                            )
                         }
                     }
 
@@ -246,37 +317,54 @@ fun NotesWorkspaceScreen(
                     when (state.editorMode) {
                         EditorViewMode.Canvas -> {
                             val canvasSnap = active.canvases.firstOrNull { it.canvasId == state.activeCanvasId }
-                            DualCanvasView(
-                                vaultPath = state.client.vaultPath,
-                                strokes = state.canvasStrokes,
-                                images = canvasSnap?.images.orEmpty(),
-                                halos = active.halos,
-                                selectedTool = state.selectedTool,
-                                inkColor = state.inkColor,
-                                strokeWidth = state.strokeWidth,
-                                stylusOnlyMode = state.stylusOnlyMode,
-                                panX = state.panX,
-                                panY = state.panY,
-                                zoom = state.zoom,
-                                onSelectTool = { state.selectTool(it) },
-                                onSelectColor = { state.inkColor = it },
-                                onStrokeWidthChange = { state.strokeWidth = it },
-                                onToggleStylusOnly = { state.stylusOnlyMode = !state.stylusOnlyMode },
-                                onPanZoom = { dx, dy, f, px, py -> state.updatePanZoom(dx, dy, f, px, py) },
-                                onResetViewport = { state.resetViewport() },
-                                onStrokeCompleted = { pts -> state.onCanvasStrokeCompleted(state.activeCanvasId, pts) },
-                                onEraserMove = { wx, wy -> state.onEraserMove(state.activeCanvasId, wx, wy) },
-                                onInsertImageBytes = { bytes -> state.insertImageToActiveCanvas(bytes) },
-                                onOpenHalo = { halo -> state.openPersistedHaloBubble(halo) },
-                                activeCanvasId = state.activeCanvasId,
-                                activeHaloId = state.activeCrystal?.persistedHalo?.haloId,
-                                selectedImageId = state.selectedImageId,
-                                onSelectImage = { state.selectedImageId = it },
-                                onMoveHaloPin = { haloId, px, py -> state.moveHaloPin(haloId, px, py) },
-                                onUpdateImageTransform = { imageId, x, y, w, h, deleted ->
-                                    state.updateCanvasImageTransform(imageId, x, y, w, h, deleted)
-                                },
-                            )
+                            if (!isWideScreen) {
+                                CompactCanvasPreview(
+                                    vaultPath = state.client.vaultPath,
+                                    strokes = state.canvasStrokes,
+                                    images = canvasSnap?.images.orEmpty(),
+                                    halos = active.halos,
+                                    panX = state.panX,
+                                    panY = state.panY,
+                                    zoom = state.zoom,
+                                    onPanZoom = { dx, dy, f, px, py -> state.updatePanZoom(dx, dy, f, px, py) },
+                                    onResetViewport = { state.resetViewport() },
+                                    onOpenHalo = { halo -> state.openPersistedHaloBubble(halo) },
+                                    activeCanvasId = state.activeCanvasId,
+                                    activeHaloId = state.activeCrystal?.persistedHalo?.haloId,
+                                )
+                            } else {
+                                DualCanvasView(
+                                    vaultPath = state.client.vaultPath,
+                                    strokes = state.canvasStrokes,
+                                    images = canvasSnap?.images.orEmpty(),
+                                    halos = active.halos,
+                                    selectedTool = state.selectedTool,
+                                    inkColor = state.inkColor,
+                                    strokeWidth = state.strokeWidth,
+                                    stylusOnlyMode = state.stylusOnlyMode,
+                                    panX = state.panX,
+                                    panY = state.panY,
+                                    zoom = state.zoom,
+                                    onSelectTool = { state.selectTool(it) },
+                                    onSelectColor = { state.inkColor = it },
+                                    onStrokeWidthChange = { state.strokeWidth = it },
+                                    onToggleStylusOnly = { state.stylusOnlyMode = !state.stylusOnlyMode },
+                                    onPanZoom = { dx, dy, f, px, py -> state.updatePanZoom(dx, dy, f, px, py) },
+                                    onResetViewport = { state.resetViewport() },
+                                    onStrokeCompleted = { pts -> state.onCanvasStrokeCompleted(state.activeCanvasId, pts) },
+                                    onEraserMove = { wx, wy -> state.onEraserMove(state.activeCanvasId, wx, wy) },
+                                    onInsertImageBytes = { bytes -> state.insertImageToActiveCanvas(bytes) },
+                                    onOpenHalo = { halo -> state.openPersistedHaloBubble(halo) },
+                                    activeCanvasId = state.activeCanvasId,
+                                    activeHaloId = state.activeCrystal?.persistedHalo?.haloId,
+                                    selectedImageId = state.selectedImageId,
+                                    onSelectImage = { state.selectedImageId = it },
+                                    onMoveHaloPin = { haloId, px, py -> state.moveHaloPin(haloId, px, py) },
+                                    onUpdateImageTransform = { imageId, x, y, w, h, deleted ->
+                                        state.updateCanvasImageTransform(imageId, x, y, w, h, deleted)
+                                    },
+                                )
+                            }
                         }
 
                         EditorViewMode.Document -> {
@@ -291,6 +379,7 @@ fun NotesWorkspaceScreen(
                                 onInsertInlineCanvas = { state.insertInlineCanvasBlock() },
                                 onTriggerTextHalo = { presetId, excerpt -> state.triggerTextHalo(presetId, excerpt) },
                                 onInlineStrokePersisted = { state.notifyInlineStrokePersisted() },
+                                isCompact = !isWideScreen,
                             )
                         }
                     }
@@ -311,6 +400,17 @@ fun NotesWorkspaceScreen(
                     )
                 }
             }
+        }
+
+        if (isWideScreen && state.showSaltTray) {
+            VerticalDivider()
+            SaltTrayDrawer(
+                state = state,
+                onClose = { state.showSaltTray = false },
+                modifier = Modifier
+                    .width(304.dp)
+                    .fillMaxHeight(),
+            )
         }
     }
 

@@ -11,6 +11,7 @@ expect fun defaultDeviceName(): String
 expect fun systemLanguageTag(): String
 expect fun saveLastVaultDirectory(path: String)
 expect fun loadImageBitmapFromVault(vaultPath: String, relPath: String): ImageBitmap?
+expect fun readVaultAssetBytes(vaultPath: String, relPath: String): ByteArray?
 expect fun pickLocalImageBytes(): ByteArray?
 expect fun pickVaultDirectory(
     initialPath: String,
@@ -30,6 +31,45 @@ expect fun setLanMulticastLock(enabled: Boolean)
 expect fun copyTextToClipboard(text: String)
 expect fun readTextFromClipboard(): String?
 expect fun supportsLiveCameraQrScan(): Boolean
+expect fun supportsInboxCameraCapture(): Boolean
+expect fun hasMicrophonePermission(): Boolean
+expect fun requestMicrophonePermission(onResult: (Boolean) -> Unit)
+expect fun isNetworkMetered(): Boolean
+expect fun observeNetworkMetered(onChange: (Boolean) -> Unit): () -> Unit
+
+data class RecordedAudioClip(
+    val bytes: ByteArray,
+    val ext: String,
+    val durationMs: Int,
+)
+
+interface PlatformVoiceRecorderSession {
+    fun stopAndRead(): RecordedAudioClip?
+    fun cancel()
+}
+
+expect fun startVoiceRecording(onError: (String) -> Unit): PlatformVoiceRecorderSession?
+
+interface PlatformAudioPlaybackHandle {
+    fun isPlaying(): Boolean
+    fun pause()
+    fun resume()
+    fun stop()
+}
+
+expect fun playVaultAudio(
+    vaultPath: String,
+    relPath: String,
+    onCompleted: () -> Unit,
+    onError: (String) -> Unit,
+): PlatformAudioPlaybackHandle?
+
+@Composable
+expect fun PlatformInboxCameraCaptureDialog(
+    initialPrivate: Boolean = false,
+    onCaptured: (primaryWebp: ByteArray, thumbWebp: ByteArray, isPrivate: Boolean, noteText: String?) -> Unit,
+    onDismiss: () -> Unit,
+)
 
 /**
  * Cross-platform QR pairing scanner dialog:

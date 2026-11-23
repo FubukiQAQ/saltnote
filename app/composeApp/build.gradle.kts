@@ -19,7 +19,7 @@ kotlin {
     android {
         namespace = "com.saltnote.compose"
         compileSdk = 37
-        minSdk = 26
+        minSdk = 29
         androidResources {
             enable = true
         }

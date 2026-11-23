@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">SaltNote</string>
+    <string name="salt_widget_description">SaltNote Quick Capture &amp; 5-Min Review</string>
+    <string name="share_to_salt_inbox">Save to Salt Inbox</string>
+    <string name="tile_quick_voice">SaltNote Voice</string>
+    <string name="tile_quick_camera">SaltNote Photo</string>
+</resources>

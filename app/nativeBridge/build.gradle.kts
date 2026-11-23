@@ -146,7 +146,7 @@ val buildRustAndroidArm64 by tasks.registering(Exec::class) {
         "-t",
         "arm64-v8a",
         "--platform",
-        "26",
+        "29",
         "-o",
         androidJniLibsDir.absolutePath,
         "build",
@@ -166,7 +166,7 @@ kotlin {
     android {
         namespace = "com.saltnote.bridge"
         compileSdk = 37
-        minSdk = 26
+        minSdk = 29
         compilerOptions {
             jvmTarget.set(JvmTarget.JVM_17)
         }

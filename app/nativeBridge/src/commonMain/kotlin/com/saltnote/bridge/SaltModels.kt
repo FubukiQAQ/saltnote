@@ -129,6 +129,7 @@ data class HaloAnnotationDto(
     @SerialName("pin_x") val pinX: Float? = null,
     @SerialName("pin_y") val pinY: Float? = null,
     @SerialName("slice_cache_path") val sliceCachePath: String? = null,
+    @SerialName("slice_asset_rel_path") val sliceAssetRelPath: String? = null,
     @SerialName("context_excerpt") val contextExcerpt: String = "",
     @SerialName("response_markdown") val responseMarkdown: String = "",
     val collapsed: Boolean = false,
@@ -192,6 +193,9 @@ data class ProviderConfigDto(
 data class RouterConfigDto(
     @SerialName("default_text_provider") val defaultTextProvider: String,
     @SerialName("default_vision_provider") val defaultVisionProvider: String,
+    @SerialName("default_audio_provider") val defaultAudioProvider: String = "gemini-byok",
+    @SerialName("local_whisper_url") val localWhisperUrl: String = "",
+    @SerialName("salt_relay_enabled") val saltRelayEnabled: Boolean = false,
     @SerialName("ui_language") val uiLanguage: String = "system",
     @SerialName("ai_output_language") val aiOutputLanguage: String = "follow_ui",
     val providers: List<ProviderConfigDto>,
@@ -228,6 +232,7 @@ data class SyncReportDto(
     @SerialName("downloaded_deltas") val downloadedDeltas: Int = 0,
     @SerialName("uploaded_assets") val uploadedAssets: Int = 0,
     @SerialName("downloaded_assets") val downloadedAssets: Int = 0,
+    @SerialName("deferred_assets") val deferredAssets: Int = 0,
     @SerialName("retried_429_count") val retried429Count: Int = 0,
     val errors: List<String> = emptyList(),
 )
@@ -254,6 +259,69 @@ data class LanPeerInfoDto(
     val host: String,
     val port: Int,
     @SerialName("cert_fingerprint") val certFingerprint: String,
+    @SerialName("relay_available") val relayAvailable: Boolean = false,
+)
+
+enum class InboxKindDto(val wireName: String) {
+    QuickText("quick_text"),
+    PhotoNote("photo_note"),
+    VoiceMemo("voice_memo"),
+    WebClip("web_clip"),
+}
+
+data class InboxCaptureInputDto(
+    val kind: InboxKindDto,
+    val textNote: String? = null,
+    val primaryMediaBytes: ByteArray? = null,
+    val primaryMediaExt: String? = null,
+    val thumbWebpBytes: ByteArray? = null,
+    val audioDurationMs: Int = 0,
+    val isPrivate: Boolean = false,
+)
+
+data class InboxItemViewDto(
+    val inboxId: String,
+    val kind: InboxKindDto,
+    val createdAtUtc: Long,
+    val isPrivate: Boolean,
+    val state: String,
+    val textNote: String? = null,
+    val transcriptText: String? = null,
+    val summaryText: String? = null,
+    val autoTags: List<String> = emptyList(),
+    val transcriptStatus: String = "not_applicable",
+    val thumbAssetPath: String? = null,
+    val primaryAssetPath: String? = null,
+    val audioDurationMs: Int = 0,
+    val consumedPageId: String? = null,
+    val consumedBlockId: String? = null,
+)
+
+data class ReviewCardViewDto(
+    val cardId: String,
+    val pageId: String,
+    val anchorHaloId: String? = null,
+    val front: String,
+    val back: String,
+    val stability: Double = 0.0,
+    val difficulty: Double = 0.0,
+    val reps: Int = 0,
+    val lapses: Int = 0,
+    val state: Int = 0,
+    val lastReviewUtc: Long? = null,
+    val dueAtUtc: Long = 0L,
+    val retrievability: Double = 0.0,
+    val sourcePageTitle: String = "",
+    val sliceAssetPath: String? = null,
+    val contextExcerpt: String? = null,
+)
+
+data class MicroSessionPlanDto(
+    val sessionId: String,
+    val budgetSeconds: Int,
+    val estimatedSeconds: Int,
+    val cards: List<ReviewCardViewDto>,
+    val totalDueCount: Int,
 )
 
 @Serializable

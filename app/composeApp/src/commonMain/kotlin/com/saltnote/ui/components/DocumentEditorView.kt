@@ -110,109 +110,190 @@ fun DocumentEditorView(
     onInsertInlineCanvas: () -> Unit,
     onTriggerTextHalo: (presetId: String, excerpt: String) -> Unit,
     onInlineStrokePersisted: () -> Unit,
+    isCompact: Boolean = false,
     modifier: Modifier = Modifier,
 ) {
     var showSplitPreview by remember { mutableStateOf(true) }
+    var compactEditMode by remember { mutableStateOf(false) }
     val strings = LocalSaltStrings.current
 
     Column(
         modifier = modifier
             .fillMaxSize()
             .background(MaterialTheme.colorScheme.surface)
-            .padding(12.dp),
+            .padding(if (isCompact) 10.dp else 12.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            SaltAssistChip(
-                onClick = onInsertInlineCanvas,
-                label = { Text(strings.insertInlineCanvas) },
-                leadingIcon = { Icon(Icons.Rounded.Draw, null, modifier = Modifier.size(18.dp)) },
-            )
-            SaltAssistChip(
-                onClick = { onTriggerTextHalo("builtin.amber_expand", markdown.takeLast(320)) },
-                label = { Text(strings.amberExpandChip) },
-                leadingIcon = {
-                    Box(Modifier.size(10.dp).clip(CircleShape).background(SaltHaloAmber))
-                },
-            )
-            SaltAssistChip(
-                onClick = { onTriggerTextHalo("builtin.glacier_card", markdown.takeLast(320)) },
-                label = { Text(strings.glacierCardChip) },
-                leadingIcon = {
-                    Box(Modifier.size(10.dp).clip(CircleShape).background(SaltHaloGlacier))
-                },
-            )
-            Spacer(Modifier.weight(1f))
-            SaltFilterChip(
-                selected = stylusOnlyMode,
-                onClick = onToggleStylusOnly,
-                label = { Text(strings.palmRejection) },
-                leadingIcon = { Icon(Icons.Rounded.DoNotTouch, null, modifier = Modifier.size(16.dp)) },
-            )
-            SaltFilterChip(
-                selected = showSplitPreview,
-                onClick = { showSplitPreview = !showSplitPreview },
-                label = { Text(strings.previewChip) },
-                leadingIcon = { Icon(Icons.Rounded.Preview, null, modifier = Modifier.size(18.dp)) },
-            )
-        }
+        if (isCompact) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                SaltFilterChip(
+                    selected = compactEditMode,
+                    onClick = { compactEditMode = !compactEditMode },
+                    label = { Text(strings.compactMarkdownEdit) },
+                    leadingIcon = { Icon(Icons.Rounded.Create, null, modifier = Modifier.size(16.dp)) },
+                )
+                SaltAssistChip(
+                    onClick = { onTriggerTextHalo("builtin.amber_expand", markdown.takeLast(320)) },
+                    label = { Text(strings.amberExpandChip) },
+                    leadingIcon = {
+                        Box(Modifier.size(10.dp).clip(CircleShape).background(SaltHaloAmber))
+                    },
+                )
+                SaltAssistChip(
+                    onClick = { onTriggerTextHalo("builtin.glacier_card", markdown.takeLast(320)) },
+                    label = { Text(strings.glacierCardChip) },
+                    leadingIcon = {
+                        Box(Modifier.size(10.dp).clip(CircleShape).background(SaltHaloGlacier))
+                    },
+                )
+            }
 
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .weight(1f),
-            horizontalArrangement = Arrangement.spacedBy(12.dp),
-        ) {
-            OutlinedTextField(
-                value = markdown,
-                onValueChange = onMarkdownChange,
+            if (compactEditMode) {
+                OutlinedTextField(
+                    value = markdown,
+                    onValueChange = onMarkdownChange,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .weight(1f),
+                    textStyle = MaterialTheme.typography.bodyMedium.copy(fontFamily = FontFamily.Monospace),
+                    placeholder = { Text(strings.editorPlaceholder) },
+                    shape = MaterialTheme.shapes.medium,
+                )
+            } else {
+                DocumentPreviewPane(
+                    client = client,
+                    pageId = pageId,
+                    markdown = markdown,
+                    syncVersion = syncVersion,
+                    stylusOnlyMode = stylusOnlyMode,
+                    readOnlyInlineCanvas = true,
+                    onInlineStrokePersisted = onInlineStrokePersisted,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .weight(1f),
+                )
+            }
+        } else {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                SaltAssistChip(
+                    onClick = onInsertInlineCanvas,
+                    label = { Text(strings.insertInlineCanvas) },
+                    leadingIcon = { Icon(Icons.Rounded.Draw, null, modifier = Modifier.size(18.dp)) },
+                )
+                SaltAssistChip(
+                    onClick = { onTriggerTextHalo("builtin.amber_expand", markdown.takeLast(320)) },
+                    label = { Text(strings.amberExpandChip) },
+                    leadingIcon = {
+                        Box(Modifier.size(10.dp).clip(CircleShape).background(SaltHaloAmber))
+                    },
+                )
+                SaltAssistChip(
+                    onClick = { onTriggerTextHalo("builtin.glacier_card", markdown.takeLast(320)) },
+                    label = { Text(strings.glacierCardChip) },
+                    leadingIcon = {
+                        Box(Modifier.size(10.dp).clip(CircleShape).background(SaltHaloGlacier))
+                    },
+                )
+                Spacer(Modifier.weight(1f))
+                SaltFilterChip(
+                    selected = stylusOnlyMode,
+                    onClick = onToggleStylusOnly,
+                    label = { Text(strings.palmRejection) },
+                    leadingIcon = { Icon(Icons.Rounded.DoNotTouch, null, modifier = Modifier.size(16.dp)) },
+                )
+                SaltFilterChip(
+                    selected = showSplitPreview,
+                    onClick = { showSplitPreview = !showSplitPreview },
+                    label = { Text(strings.previewChip) },
+                    leadingIcon = { Icon(Icons.Rounded.Preview, null, modifier = Modifier.size(18.dp)) },
+                )
+            }
+
+            Row(
                 modifier = Modifier
-                    .weight(1f)
-                    .fillMaxHeight(),
-                textStyle = MaterialTheme.typography.bodyLarge.copy(fontFamily = FontFamily.Monospace),
-                placeholder = { Text(strings.editorPlaceholder) },
-                shape = MaterialTheme.shapes.medium,
-            )
-
-            if (showSplitPreview) {
-                Surface(
+                    .fillMaxWidth()
+                    .weight(1f),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                OutlinedTextField(
+                    value = markdown,
+                    onValueChange = onMarkdownChange,
                     modifier = Modifier
                         .weight(1f)
                         .fillMaxHeight(),
-                    color = MaterialTheme.colorScheme.surfaceContainerLowest,
+                    textStyle = MaterialTheme.typography.bodyLarge.copy(fontFamily = FontFamily.Monospace),
+                    placeholder = { Text(strings.editorPlaceholder) },
                     shape = MaterialTheme.shapes.medium,
-                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
-                ) {
-                    val segments = remember(markdown) { parseDocumentSegments(markdown) }
-                    Column(
+                )
+
+                if (showSplitPreview) {
+                    DocumentPreviewPane(
+                        client = client,
+                        pageId = pageId,
+                        markdown = markdown,
+                        syncVersion = syncVersion,
+                        stylusOnlyMode = stylusOnlyMode,
+                        readOnlyInlineCanvas = false,
+                        onInlineStrokePersisted = onInlineStrokePersisted,
                         modifier = Modifier
-                            .fillMaxSize()
-                            .verticalScroll(rememberScrollState())
-                            .padding(16.dp),
-                        verticalArrangement = Arrangement.spacedBy(10.dp),
-                    ) {
-                        segments.forEach { seg ->
-                            when (seg) {
-                                is MarkdownSegment.TextBlock -> {
-                                    MarkdownLinesPreview(seg.lines)
-                                }
-                                is MarkdownSegment.InlineCanvasBlock -> {
-                                    InlineEmbeddedCanvasBlock(
-                                        client = client,
-                                        pageId = pageId,
-                                        canvasId = seg.canvasId,
-                                        heightDp = seg.heightDp,
-                                        syncVersion = syncVersion,
-                                        stylusOnlyMode = stylusOnlyMode,
-                                        onStrokePersisted = onInlineStrokePersisted,
-                                    )
-                                }
-                            }
-                        }
+                            .weight(1f)
+                            .fillMaxHeight(),
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun DocumentPreviewPane(
+    client: SaltNoteClient,
+    pageId: String,
+    markdown: String,
+    syncVersion: Long,
+    stylusOnlyMode: Boolean,
+    readOnlyInlineCanvas: Boolean,
+    onInlineStrokePersisted: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Surface(
+        modifier = modifier,
+        color = MaterialTheme.colorScheme.surfaceContainerLowest,
+        shape = MaterialTheme.shapes.medium,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+    ) {
+        val segments = remember(markdown) { parseDocumentSegments(markdown) }
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState())
+                .padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            segments.forEach { seg ->
+                when (seg) {
+                    is MarkdownSegment.TextBlock -> {
+                        MarkdownLinesPreview(seg.lines)
+                    }
+                    is MarkdownSegment.InlineCanvasBlock -> {
+                        InlineEmbeddedCanvasBlock(
+                            client = client,
+                            pageId = pageId,
+                            canvasId = seg.canvasId,
+                            heightDp = seg.heightDp,
+                            syncVersion = syncVersion,
+                            stylusOnlyMode = stylusOnlyMode,
+                            readOnly = readOnlyInlineCanvas,
+                            onStrokePersisted = onInlineStrokePersisted,
+                        )
                     }
                 }
             }
@@ -228,6 +309,7 @@ private fun InlineEmbeddedCanvasBlock(
     heightDp: Int,
     syncVersion: Long,
     stylusOnlyMode: Boolean,
+    readOnly: Boolean,
     onStrokePersisted: () -> Unit,
 ) {
     val strokes = remember(pageId, canvasId) { mutableStateListOf<RenderStrokeDto>() }
@@ -273,20 +355,22 @@ private fun InlineEmbeddedCanvasBlock(
                     color = MaterialTheme.colorScheme.onSurface,
                     modifier = Modifier.weight(1f),
                 )
-                FilledIconToggleButton(
-                    checked = inlineTool == "pen",
-                    onCheckedChange = { inlineTool = "pen" },
-                    modifier = Modifier.size(30.dp),
-                ) {
-                    Icon(Icons.Rounded.Create, contentDescription = strings.toolPen, modifier = Modifier.size(15.dp))
-                }
-                Spacer(Modifier.width(4.dp))
-                FilledIconToggleButton(
-                    checked = inlineTool == "eraser",
-                    onCheckedChange = { inlineTool = "eraser" },
-                    modifier = Modifier.size(30.dp),
-                ) {
-                    Icon(Icons.Rounded.AutoFixOff, contentDescription = strings.toolEraser, modifier = Modifier.size(15.dp))
+                if (!readOnly) {
+                    FilledIconToggleButton(
+                        checked = inlineTool == "pen",
+                        onCheckedChange = { inlineTool = "pen" },
+                        modifier = Modifier.size(30.dp),
+                    ) {
+                        Icon(Icons.Rounded.Create, contentDescription = strings.toolPen, modifier = Modifier.size(15.dp))
+                    }
+                    Spacer(Modifier.width(4.dp))
+                    FilledIconToggleButton(
+                        checked = inlineTool == "eraser",
+                        onCheckedChange = { inlineTool = "eraser" },
+                        modifier = Modifier.size(30.dp),
+                    ) {
+                        Icon(Icons.Rounded.AutoFixOff, contentDescription = strings.toolEraser, modifier = Modifier.size(15.dp))
+                    }
                 }
             }
 
@@ -307,59 +391,61 @@ private fun InlineEmbeddedCanvasBlock(
                     )
                 }
 
-                PlatformInkSurface(
-                    modifier = Modifier.fillMaxSize(),
-                    toolKind = inlineTool,
-                    strokeColor = inkColor,
-                    strokeWidth = 3f,
-                    panX = 0f,
-                    panY = 0f,
-                    zoom = 1f,
-                    stylusOnlyMode = stylusOnlyMode,
-                    allowTouchScrollPassThrough = true,
-                    onPanZoom = { _, _, _, _, _ -> },
-                    onStrokeCompleted = { pts ->
-                        // Synchronously append optimistic dry stroke BEFORE wet ink clears -> zero blink!
-                        val tempId = "pending-inline-${++pendingSeq}"
-                        val argb = inkColor.toArgb().toLong() and 0xFFFFFFFFL
-                        val optimistic = StrokeGeometry.buildOptimisticRenderStroke(
-                            tempId = tempId,
-                            brush = "pen",
-                            colorArgb = argb,
-                            baseWidth = 3f,
-                            points = pts,
-                        )
-                        strokes.add(optimistic)
-                        scope.launch {
-                            val persisted = withContext(Dispatchers.IO) {
-                                runCatching {
-                                    client.ingestRawStroke(pageId, canvasId, "pen", argb, 3f, pts)
-                                }.getOrNull()
-                            }
-                            if (persisted != null) {
-                                val idx = strokes.indexOfFirst { it.strokeId == tempId }
-                                if (idx >= 0) {
-                                    strokes[idx] = persisted.renderStroke
-                                } else {
-                                    strokes.add(persisted.renderStroke)
+                if (!readOnly) {
+                    PlatformInkSurface(
+                        modifier = Modifier.fillMaxSize(),
+                        toolKind = inlineTool,
+                        strokeColor = inkColor,
+                        strokeWidth = 3f,
+                        panX = 0f,
+                        panY = 0f,
+                        zoom = 1f,
+                        stylusOnlyMode = stylusOnlyMode,
+                        allowTouchScrollPassThrough = true,
+                        onPanZoom = { _, _, _, _, _ -> },
+                        onStrokeCompleted = { pts ->
+                            // Synchronously append optimistic dry stroke BEFORE wet ink clears -> zero blink!
+                            val tempId = "pending-inline-${++pendingSeq}"
+                            val argb = inkColor.toArgb().toLong() and 0xFFFFFFFFL
+                            val optimistic = StrokeGeometry.buildOptimisticRenderStroke(
+                                tempId = tempId,
+                                brush = "pen",
+                                colorArgb = argb,
+                                baseWidth = 3f,
+                                points = pts,
+                            )
+                            strokes.add(optimistic)
+                            scope.launch {
+                                val persisted = withContext(Dispatchers.IO) {
+                                    runCatching {
+                                        client.ingestRawStroke(pageId, canvasId, "pen", argb, 3f, pts)
+                                    }.getOrNull()
                                 }
-                                onStrokePersisted()
+                                if (persisted != null) {
+                                    val idx = strokes.indexOfFirst { it.strokeId == tempId }
+                                    if (idx >= 0) {
+                                        strokes[idx] = persisted.renderStroke
+                                    } else {
+                                        strokes.add(persisted.renderStroke)
+                                    }
+                                    onStrokePersisted()
+                                }
                             }
-                        }
-                    },
-                    onEraserMove = { wx, wy ->
-                        scope.launch {
-                            val erased = withContext(Dispatchers.IO) {
-                                runCatching {
-                                    client.eraseStrokesAt(pageId, canvasId, wx, wy, 18f)
-                                }.getOrDefault(emptyList())
+                        },
+                        onEraserMove = { wx, wy ->
+                            scope.launch {
+                                val erased = withContext(Dispatchers.IO) {
+                                    runCatching {
+                                        client.eraseStrokesAt(pageId, canvasId, wx, wy, 18f)
+                                    }.getOrDefault(emptyList())
+                                }
+                                if (erased.isNotEmpty()) {
+                                    strokes.removeAll { it.strokeId in erased }
+                                }
                             }
-                            if (erased.isNotEmpty()) {
-                                strokes.removeAll { it.strokeId in erased }
-                            }
-                        }
-                    },
-                )
+                        },
+                    )
+                }
             }
         }
     }

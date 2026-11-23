@@ -296,6 +296,336 @@ data class SaltStrings(
     val showSecretDesc: String,
     val hideSecretDesc: String,
     val connectionFailed: String,
+    val inboxStrings: SaltInboxStrings,
+) {
+    val navInbox: String get() = inboxStrings.navInbox
+    val hubTitle: String get() = inboxStrings.hubTitle
+    val hubMicroReviewTitle: String get() = inboxStrings.hubMicroReviewTitle
+    val hubReadyStart: String get() = inboxStrings.hubReadyStart
+    val hubNoCardsDue: String get() = inboxStrings.hubNoCardsDue
+    val capturePhoto: String get() = inboxStrings.capturePhoto
+    val captureVoice: String get() = inboxStrings.captureVoice
+    val captureText: String get() = inboxStrings.captureText
+    val inboxTitle: String get() = inboxStrings.inboxTitle
+    val inboxEmptyHint: String get() = inboxStrings.inboxEmptyHint
+    val inboxShowArchived: String get() = inboxStrings.inboxShowArchived
+    val inboxEnrichAction: String get() = inboxStrings.inboxEnrichAction
+    val inboxStatusPending: String get() = inboxStrings.inboxStatusPending
+    val inboxStatusProcessing: String get() = inboxStrings.inboxStatusProcessing
+    val inboxStatusWaitingLan: String get() = inboxStrings.inboxStatusWaitingLan
+    val inboxStatusCompleted: String get() = inboxStrings.inboxStatusCompleted
+    val inboxStatusFailed: String get() = inboxStrings.inboxStatusFailed
+    val inboxCapturedToast: String get() = inboxStrings.inboxCapturedToast
+    val inboxConsumedToast: String get() = inboxStrings.inboxConsumedToast
+    val saltTrayTitle: String get() = inboxStrings.saltTrayTitle
+    val insertIntoPage: String get() = inboxStrings.insertIntoPage
+    val haloExtractPromptTitle: String get() = inboxStrings.haloExtractPromptTitle
+    val cameraModeBoard: String get() = inboxStrings.cameraModeBoard
+    val cameraModeJournal: String get() = inboxStrings.cameraModeJournal
+    val captureShutterDesc: String get() = inboxStrings.captureShutterDesc
+    val voiceRecordStart: String get() = inboxStrings.voiceRecordStart
+    val voiceRecordStop: String get() = inboxStrings.voiceRecordStop
+    val voiceRecordingHint: String get() = inboxStrings.voiceRecordingHint
+    val audioPlay: String get() = inboxStrings.audioPlay
+    val audioPause: String get() = inboxStrings.audioPause
+    val microSessionRescueMode: String get() = inboxStrings.microSessionRescueMode
+    val microSessionGeekSwipe: String get() = inboxStrings.microSessionGeekSwipe
+    val microSessionSwipeHint: String get() = inboxStrings.microSessionSwipeHint
+    val microSessionCompleteTitle: String get() = inboxStrings.microSessionCompleteTitle
+    val microSessionAnotherRound: String get() = inboxStrings.microSessionAnotherRound
+    val microSessionStopToday: String get() = inboxStrings.microSessionStopToday
+    val microSessionTapToFlip: String get() = inboxStrings.microSessionTapToFlip
+    val microSessionRemainingMinPrefix: String get() = inboxStrings.microSessionRemainingMinPrefix
+    val microSessionRemainingMinSuffix: String get() = inboxStrings.microSessionRemainingMinSuffix
+    val slicePreviewTitle: String get() = inboxStrings.slicePreviewTitle
+    val enterFullPage: String get() = inboxStrings.enterFullPage
+    val compactCanvasPreviewHint: String get() = inboxStrings.compactCanvasPreviewHint
+    val compactMarkdownEdit: String get() = inboxStrings.compactMarkdownEdit
+    val meteredNetworkWarning: String get() = inboxStrings.meteredNetworkWarning
+    val unmeteredNetworkBanner: String get() = inboxStrings.unmeteredNetworkBanner
+    val deferredAssetsPrefix: String get() = inboxStrings.deferredAssetsPrefix
+    val defaultAudioLabel: String get() = inboxStrings.defaultAudioLabel
+    val defaultAudioChip: String get() = inboxStrings.defaultAudioChip
+    val saltRelayTitle: String get() = inboxStrings.saltRelayTitle
+    val saltRelaySubtitle: String get() = inboxStrings.saltRelaySubtitle
+    val localWhisperUrlLabel: String get() = inboxStrings.localWhisperUrlLabel
+    val relayBadgeLabel: String get() = inboxStrings.relayBadgeLabel
+    val micPermissionPrompt: String get() = inboxStrings.micPermissionPrompt
+    val grantMicPermission: String get() = inboxStrings.grantMicPermission
+}
+
+data class SaltInboxStrings(
+    val navInbox: String,
+    val hubTitle: String,
+    val hubMicroReviewTitle: String,
+    val hubReadyStart: String,
+    val hubNoCardsDue: String,
+    val capturePhoto: String,
+    val captureVoice: String,
+    val captureText: String,
+    val inboxTitle: String,
+    val inboxEmptyHint: String,
+    val inboxShowArchived: String,
+    val inboxEnrichAction: String,
+    val inboxStatusPending: String,
+    val inboxStatusProcessing: String,
+    val inboxStatusWaitingLan: String,
+    val inboxStatusCompleted: String,
+    val inboxStatusFailed: String,
+    val inboxCapturedToast: String,
+    val inboxConsumedToast: String,
+    val saltTrayTitle: String,
+    val insertIntoPage: String,
+    val haloExtractPromptTitle: String,
+    val cameraModeBoard: String,
+    val cameraModeJournal: String,
+    val captureShutterDesc: String,
+    val voiceRecordStart: String,
+    val voiceRecordStop: String,
+    val voiceRecordingHint: String,
+    val audioPlay: String,
+    val audioPause: String,
+    val microSessionRescueMode: String,
+    val microSessionGeekSwipe: String,
+    val microSessionSwipeHint: String,
+    val microSessionCompleteTitle: String,
+    val microSessionAnotherRound: String,
+    val microSessionStopToday: String,
+    val microSessionTapToFlip: String,
+    val microSessionRemainingMinPrefix: String,
+    val microSessionRemainingMinSuffix: String,
+    val slicePreviewTitle: String,
+    val enterFullPage: String,
+    val compactCanvasPreviewHint: String,
+    val compactMarkdownEdit: String,
+    val meteredNetworkWarning: String,
+    val unmeteredNetworkBanner: String,
+    val deferredAssetsPrefix: String,
+    val defaultAudioLabel: String,
+    val defaultAudioChip: String,
+    val saltRelayTitle: String,
+    val saltRelaySubtitle: String,
+    val localWhisperUrlLabel: String,
+    val relayBadgeLabel: String,
+    val micPermissionPrompt: String,
+    val grantMicPermission: String,
+)
+
+private val ZhCnInboxStrings = SaltInboxStrings(
+    navInbox = "盐池",
+    hubTitle = "碎片中枢",
+    hubMicroReviewTitle = "5 分钟碎片复习",
+    hubReadyStart = "开始微复习",
+    hubNoCardsDue = "当前无待复习卡片，去采集新灵感吧",
+    capturePhoto = "拍照入池",
+    captureVoice = "语音入池",
+    captureText = "速记",
+    inboxTitle = "盐池时间流",
+    inboxEmptyHint = "随手拍板书或录一段语音，零阻力丢入盐池",
+    inboxShowArchived = "显示已归档",
+    inboxEnrichAction = "AI 解析",
+    inboxStatusPending = "待解析",
+    inboxStatusProcessing = "解析中…",
+    inboxStatusWaitingLan = "等待局域网算力",
+    inboxStatusCompleted = "已转写",
+    inboxStatusFailed = "解析失败 · 重试",
+    inboxCapturedToast = "已丢入 SaltNote 盐池",
+    inboxConsumedToast = "已融入当前笔记并归档",
+    saltTrayTitle = "盐池抽屉",
+    insertIntoPage = "拖入当前页",
+    haloExtractPromptTitle = "随手圈直出",
+    cameraModeBoard = "板书 / 文档",
+    cameraModeJournal = "手账生活",
+    captureShutterDesc = "拍摄",
+    voiceRecordStart = "点击开始录音",
+    voiceRecordStop = "停止并入池",
+    voiceRecordingHint = "Opus 16kHz 极速落盘中…",
+    audioPlay = "播放",
+    audioPause = "暂停",
+    microSessionRescueMode = "温和抢救模式",
+    microSessionGeekSwipe = "极客手势",
+    microSessionSwipeHint = "左滑重来 · 右滑良好 · 上滑简单",
+    microSessionCompleteTitle = "本轮微复习完成",
+    microSessionAnotherRound = "再来 3 分钟",
+    microSessionStopToday = "今天到此为止",
+    microSessionTapToFlip = "轻触卡片翻转查看答案",
+    microSessionRemainingMinPrefix = "约剩 ",
+    microSessionRemainingMinSuffix = " 分钟",
+    slicePreviewTitle = "原位切片回溯",
+    enterFullPage = "进入完整页面",
+    compactCanvasPreviewHint = "手机端高清浏览 · 双指缩放与平移",
+    compactMarkdownEdit = "轻量修订",
+    meteredNetworkWarning = "蜂窝省流模式：仅同步增量、缩略图与语音，>2MB 大附件连 Wi-Fi 后补齐",
+    unmeteredNetworkBanner = "Wi-Fi 已就绪：支持全量附件同步与局域网算力接力",
+    deferredAssetsPrefix = "已挂起大附件：",
+    defaultAudioLabel = "默认语音",
+    defaultAudioChip = "默认语音",
+    saltRelayTitle = "SaltRelay 局域网算力接力",
+    saltRelaySubtitle = "允许已配对手机将 #private 语音与板书转发至本机 Ollama / Whisper",
+    localWhisperUrlLabel = "本地 Whisper 地址 (可选)",
+    relayBadgeLabel = "可接力算力",
+    micPermissionPrompt = "需要麦克风权限以录制语音速记",
+    grantMicPermission = "授予麦克风权限",
+)
+
+private val ZhTwInboxStrings = SaltInboxStrings(
+    navInbox = "鹽池",
+    hubTitle = "碎片中樞",
+    hubMicroReviewTitle = "5 分鐘碎片複習",
+    hubReadyStart = "開始微複習",
+    hubNoCardsDue = "目前無待複習卡片，去採集新靈感吧",
+    capturePhoto = "拍照入池",
+    captureVoice = "語音入池",
+    captureText = "速記",
+    inboxTitle = "鹽池時間流",
+    inboxEmptyHint = "隨手拍板書或錄一段語音，零阻力丟入鹽池",
+    inboxShowArchived = "顯示已封存",
+    inboxEnrichAction = "AI 解析",
+    inboxStatusPending = "待解析",
+    inboxStatusProcessing = "解析中…",
+    inboxStatusWaitingLan = "等待區域網路算力",
+    inboxStatusCompleted = "已轉寫",
+    inboxStatusFailed = "解析失敗 · 重試",
+    inboxCapturedToast = "已丟入 SaltNote 鹽池",
+    inboxConsumedToast = "已融入目前筆記並封存",
+    saltTrayTitle = "鹽池抽屜",
+    insertIntoPage = "拖入目前頁面",
+    haloExtractPromptTitle = "隨手圈直出",
+    cameraModeBoard = "板書 / 文件",
+    cameraModeJournal = "手帳生活",
+    captureShutterDesc = "拍攝",
+    voiceRecordStart = "點擊開始錄音",
+    voiceRecordStop = "停止並入池",
+    voiceRecordingHint = "Opus 16kHz 極速寫入中…",
+    audioPlay = "播放",
+    audioPause = "暫停",
+    microSessionRescueMode = "溫和搶救模式",
+    microSessionGeekSwipe = "極客手勢",
+    microSessionSwipeHint = "左滑重來 · 右滑良好 · 上滑簡單",
+    microSessionCompleteTitle = "本輪微複習完成",
+    microSessionAnotherRound = "再來 3 分鐘",
+    microSessionStopToday = "今天到此為止",
+    microSessionTapToFlip = "輕觸卡片翻轉查看答案",
+    microSessionRemainingMinPrefix = "約剩 ",
+    microSessionRemainingMinSuffix = " 分鐘",
+    slicePreviewTitle = "原位切片回溯",
+    enterFullPage = "進入完整頁面",
+    compactCanvasPreviewHint = "手機端高清瀏覽 · 雙指縮放與平移",
+    compactMarkdownEdit = "輕量修訂",
+    meteredNetworkWarning = "行動網路省流模式：僅同步增量、縮圖與語音，>2MB 大附件連 Wi-Fi 後補齊",
+    unmeteredNetworkBanner = "Wi-Fi 已就緒：支援全量附件同步與區域網路算力接力",
+    deferredAssetsPrefix = "已暫緩大附件：",
+    defaultAudioLabel = "預設語音",
+    defaultAudioChip = "預設語音",
+    saltRelayTitle = "SaltRelay 區域網路算力接力",
+    saltRelaySubtitle = "允許已配對手機將 #private 語音與板書轉發至本機 Ollama / Whisper",
+    localWhisperUrlLabel = "本地 Whisper 位址 (可選)",
+    relayBadgeLabel = "可接力算力",
+    micPermissionPrompt = "需要麥克風權限以錄製語音速記",
+    grantMicPermission = "授予麥克風權限",
+)
+
+private val EnInboxStrings = SaltInboxStrings(
+    navInbox = "Inbox",
+    hubTitle = "Fragment Hub",
+    hubMicroReviewTitle = "5-Min Micro Review",
+    hubReadyStart = "Start Session",
+    hubNoCardsDue = "No cards due right now — capture something new",
+    capturePhoto = "Photo",
+    captureVoice = "Voice",
+    captureText = "Quick Note",
+    inboxTitle = "Salt Inbox",
+    inboxEmptyHint = "Snap a whiteboard or record a voice memo with zero friction",
+    inboxShowArchived = "Show Archived",
+    inboxEnrichAction = "Enrich",
+    inboxStatusPending = "Pending",
+    inboxStatusProcessing = "Processing…",
+    inboxStatusWaitingLan = "Waiting for LAN Relay",
+    inboxStatusCompleted = "Transcribed",
+    inboxStatusFailed = "Failed · Retry",
+    inboxCapturedToast = "Saved to Salt Inbox",
+    inboxConsumedToast = "Inserted into note & archived",
+    saltTrayTitle = "Salt Tray",
+    insertIntoPage = "Insert",
+    haloExtractPromptTitle = "Direct Salt Halo",
+    cameraModeBoard = "Board / Doc",
+    cameraModeJournal = "Journal",
+    captureShutterDesc = "Capture",
+    voiceRecordStart = "Tap to Record",
+    voiceRecordStop = "Stop & Save",
+    voiceRecordingHint = "Recording Opus 16kHz…",
+    audioPlay = "Play",
+    audioPause = "Pause",
+    microSessionRescueMode = "Gentle Rescue",
+    microSessionGeekSwipe = "Swipe Gestures",
+    microSessionSwipeHint = "Swipe Left Again · Right Good · Up Easy",
+    microSessionCompleteTitle = "Micro-Session Complete",
+    microSessionAnotherRound = "3 More Minutes",
+    microSessionStopToday = "Done for Today",
+    microSessionTapToFlip = "Tap card to reveal answer",
+    microSessionRemainingMinPrefix = "~",
+    microSessionRemainingMinSuffix = " min left",
+    slicePreviewTitle = "In-Place Note Slice",
+    enterFullPage = "Open Full Page",
+    compactCanvasPreviewHint = "HD preview · Pinch to zoom & pan",
+    compactMarkdownEdit = "Quick Edit",
+    meteredNetworkWarning = "Metered cellular guard: syncing deltas, thumbnails & audio; >2MB assets wait for Wi-Fi",
+    unmeteredNetworkBanner = "Wi-Fi ready: full asset sync & LAN SaltRelay available",
+    deferredAssetsPrefix = "Deferred large assets: ",
+    defaultAudioLabel = "Default Audio",
+    defaultAudioChip = "Audio",
+    saltRelayTitle = "SaltRelay LAN Compute",
+    saltRelaySubtitle = "Allow paired phones to relay #private audio/photos to local Ollama & Whisper",
+    localWhisperUrlLabel = "Local Whisper URL (optional)",
+    relayBadgeLabel = "Relay Ready",
+    micPermissionPrompt = "Microphone permission is required for voice memos",
+    grantMicPermission = "Grant Mic",
+)
+
+private val JaInboxStrings = EnInboxStrings.copy(
+    navInbox = "受信箱",
+    hubTitle = "ハブ",
+    hubMicroReviewTitle = "5分マイクロ復習",
+    hubReadyStart = "復習を開始",
+    capturePhoto = "写真",
+    captureVoice = "音声",
+    captureText = "メモ",
+    inboxTitle = "Salt 受信箱",
+    saltTrayTitle = "受信トレイ",
+    insertIntoPage = "挿入",
+    cameraModeBoard = "黒板・文書",
+    cameraModeJournal = "手帳",
+    voiceRecordStart = "録音開始",
+    voiceRecordStop = "停止して保存",
+    microSessionRescueMode = "レスキュー",
+    microSessionGeekSwipe = "スワイプ",
+    microSessionCompleteTitle = "マイクロ復習完了",
+    microSessionAnotherRound = "もう3分",
+    microSessionStopToday = "今日はここまで",
+    enterFullPage = "ページを開く",
+)
+
+private val KoInboxStrings = EnInboxStrings.copy(
+    navInbox = "인박스",
+    hubTitle = "조각 허브",
+    hubMicroReviewTitle = "5분 조각 복습",
+    hubReadyStart = "복습 시작",
+    capturePhoto = "사진",
+    captureVoice = "음성",
+    captureText = "메모",
+    inboxTitle = "Salt 인박스",
+    saltTrayTitle = "인박스 서랍",
+    insertIntoPage = "삽입",
+    cameraModeBoard = "칠판/문서",
+    cameraModeJournal = "저널",
+    voiceRecordStart = "녹음 시작",
+    voiceRecordStop = "중지 및 저장",
+    microSessionRescueMode = "구출 모드",
+    microSessionGeekSwipe = "스와이프",
+    microSessionCompleteTitle = "조각 복습 완료",
+    microSessionAnotherRound = "3분 더하기",
+    microSessionStopToday = "오늘 복습 끝",
+    enterFullPage = "전체 페이지 열기",
 )
 
 private val ZhCnStrings = SaltStrings(
@@ -521,6 +851,7 @@ private val ZhCnStrings = SaltStrings(
     showSecretDesc = "显示密钥",
     hideSecretDesc = "隐藏密钥",
     connectionFailed = "连接失败",
+    inboxStrings = ZhCnInboxStrings,
 )
 
 private val ZhTwStrings = ZhCnStrings.copy(
@@ -717,6 +1048,7 @@ private val ZhTwStrings = ZhCnStrings.copy(
     showSecretDesc = "顯示金鑰",
     hideSecretDesc = "隱藏金鑰",
     connectionFailed = "連線失敗",
+    inboxStrings = ZhTwInboxStrings,
 )
 
 private val EnStrings = SaltStrings(
@@ -942,6 +1274,7 @@ private val EnStrings = SaltStrings(
     showSecretDesc = "Show Key",
     hideSecretDesc = "Hide Key",
     connectionFailed = "Connection failed",
+    inboxStrings = EnInboxStrings,
 )
 
 private val JaStrings = EnStrings.copy(
@@ -1048,6 +1381,7 @@ private val JaStrings = EnStrings.copy(
     defaultVisionChip = "ビジョン",
     testConnectionAction = "接続テスト",
     testingAction = "テスト中…",
+    inboxStrings = JaInboxStrings,
 )
 
 private val KoStrings = EnStrings.copy(
@@ -1128,6 +1462,7 @@ private val KoStrings = EnStrings.copy(
     saveAllConfig = "모두 저장",
     testConnectionAction = "연결 테스트",
     testingAction = "테스트 중…",
+    inboxStrings = KoInboxStrings,
 )
 
 fun stringsFor(lang: AppLanguage): SaltStrings = when (lang) {

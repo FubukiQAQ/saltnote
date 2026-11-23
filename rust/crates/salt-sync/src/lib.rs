@@ -1,5 +1,7 @@
 pub mod p2p;
 pub mod webdav;
 
-pub use p2p::{LanP2pNode, P2pSyncResult};
+pub use p2p::{
+    LanP2pNode, P2pSyncResult, RelayEnrichRequest, RelayEnrichResponse, SaltRelayHandler,
+};
 pub use webdav::{BackoffSchedule, WebDavSyncClient};

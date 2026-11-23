@@ -13,11 +13,16 @@ import com.saltnote.bridge.FsrsCardStateDto
 import com.saltnote.bridge.HaloAnnotationDto
 import com.saltnote.bridge.HaloPresetDto
 import com.saltnote.bridge.HaloStreamListener
+import com.saltnote.bridge.InboxCaptureInputDto
+import com.saltnote.bridge.InboxItemViewDto
+import com.saltnote.bridge.InboxKindDto
 import com.saltnote.bridge.LanNodeInfoDto
 import com.saltnote.bridge.LanPeerInfoDto
+import com.saltnote.bridge.MicroSessionPlanDto
 import com.saltnote.bridge.PageSnapshotDto
 import com.saltnote.bridge.PageSummaryDto
 import com.saltnote.bridge.RenderStrokeDto
+import com.saltnote.bridge.ReviewCardViewDto
 import com.saltnote.bridge.RouterConfigDto
 import com.saltnote.bridge.SaltNoteClient
 import com.saltnote.bridge.SearchHitDto
@@ -32,6 +37,12 @@ import com.saltnote.ui.i18n.SaltStrings
 import com.saltnote.ui.i18n.resolveAiOutputLanguageCode
 import com.saltnote.ui.i18n.resolveAppLanguage
 import com.saltnote.ui.i18n.stringsFor
+import com.saltnote.ui.platform.PlatformAudioPlaybackHandle
+import com.saltnote.ui.platform.RecordedAudioClip
+import com.saltnote.ui.platform.isNetworkMetered
+import com.saltnote.ui.platform.observeNetworkMetered
+import com.saltnote.ui.platform.playVaultAudio
+import com.saltnote.ui.platform.readVaultAssetBytes
 import com.saltnote.ui.platform.saveLastVaultDirectory
 import com.saltnote.ui.platform.setLanMulticastLock
 import com.saltnote.ui.platform.systemLanguageTag
@@ -45,10 +56,18 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 enum class NavTab(val label: String) {
+    Hub("盐池"),
     Notes("笔记"),
     Review("复习"),
     Sync("同步"),
     Settings("设置"),
+}
+
+enum class LaunchRoute {
+    None,
+    CameraCapture,
+    VoiceCapture,
+    MicroReview,
 }
 
 enum class EditorViewMode(val label: String) {
@@ -83,7 +102,17 @@ class SaltAppState(
     var darkTheme by mutableStateOf(false)
     var showOnboarding by mutableStateOf(false)
     var selectedTab by mutableStateOf(NavTab.Notes)
+    var initialTabResolved by mutableStateOf(false)
     var editorMode by mutableStateOf(EditorViewMode.Canvas)
+
+    // v0.2-alpha Adaptive Modals, Salt Tray & Widget/Tile Launch Triggers
+    var showSaltTray by mutableStateOf(true)
+    var showCameraCaptureModal by mutableStateOf(false)
+    var showVoiceCaptureModal by mutableStateOf(false)
+    var showQuickTextCaptureModal by mutableStateOf(false)
+    var showCompactSyncModal by mutableStateOf(false)
+    var showCompactSettingsModal by mutableStateOf(false)
+    var pendingLaunchRoute by mutableStateOf(LaunchRoute.None)
 
     var snackbarMessage by mutableStateOf<String?>(null)
     var deviceState by mutableStateOf(DeviceStateDto())
@@ -129,18 +158,34 @@ class SaltAppState(
     var activeCrystal by mutableStateOf<ActiveCrystalBubble?>(null)
     private var activeCancelHandle: CancelHandle? = null
 
-    // FSRS Review State
+    // FSRS Review & v0.2 Micro-Session State
     val dueCards = mutableStateListOf<FsrsCardStateDto>()
     val allCards = mutableStateListOf<FsrsCardStateDto>()
     var currentCardRevealed by mutableStateOf(false)
     private var cardShownAtMs: Long = System.currentTimeMillis()
+    var microSessionPlan by mutableStateOf<MicroSessionPlanDto?>(null)
+    var microSessionIndex by mutableStateOf(0)
+    var microSessionBudgetSecs by mutableStateOf(300)
+    var microSessionRescueMode by mutableStateOf(true)
+    var microSessionEnergyLevel by mutableStateOf(2)
+    var geekSwipeEnabled by mutableStateOf(true)
+    var isMicroSessionFinished by mutableStateOf(false)
+    var activeSlicePreviewCard by mutableStateOf<ReviewCardViewDto?>(null)
 
-    // Settings / BYOK / Sync
+    // Salt Inbox (盐池) State
+    val inboxItems = mutableStateListOf<InboxItemViewDto>()
+    var showArchivedInbox by mutableStateOf(false)
+    val enrichingInboxIds = mutableStateListOf<String>()
+    var playingAudioInboxId by mutableStateOf<String?>(null)
+    private var activeAudioHandle: PlatformAudioPlaybackHandle? = null
+
+    // Settings / BYOK / Sync / Metered Guard
     var routerConfig by mutableStateOf<RouterConfigDto?>(null)
     var routerSecretEpoch by mutableStateOf(0)
     var testingProviderId by mutableStateOf<String?>(null)
     val connectivityResults = mutableStateOf<Map<String, ConnectivityTestResultDto>>(emptyMap())
     var webDavConfig by mutableStateOf(WebDavConfigDto())
+    var isMeteredNetwork by mutableStateOf(isNetworkMetered())
     var isSyncingWebDav by mutableStateOf(false)
     var isSyncingLan by mutableStateOf(false)
     var lastSyncReport by mutableStateOf<SyncReportDto?>(null)
@@ -151,11 +196,43 @@ class SaltAppState(
     private var pendingBodyDirty: Boolean = false
     private var periodicFlushJob: Job? = null
     private var lanObserverJob: Job? = null
+    private var networkObserverDispose: (() -> Unit)? = null
     private var lastObservedSyncRevision: Long = 0L
 
     init {
         bootstrapVault(checkOnboarding = true)
         startPeriodicDeltaFlusher()
+        networkObserverDispose = observeNetworkMetered { metered ->
+            scope.launch {
+                val wasMetered = isMeteredNetwork
+                isMeteredNetwork = metered
+                if (wasMetered && !metered) {
+                    if (webDavConfig.enabled && (lastSyncReport?.deferredAssets ?: 0) > 0) {
+                        triggerWebDavSync()
+                    }
+                    retryPendingInboxEnrichments()
+                }
+            }
+        }
+    }
+
+    fun applyLaunchRoute(route: LaunchRoute) {
+        if (route == LaunchRoute.None) return
+        pendingLaunchRoute = LaunchRoute.None
+        when (route) {
+            LaunchRoute.CameraCapture -> showCameraCaptureModal = true
+            LaunchRoute.VoiceCapture -> showVoiceCaptureModal = true
+            LaunchRoute.MicroReview -> {
+                selectedTab = NavTab.Review
+                startMicroReviewSession()
+            }
+            LaunchRoute.None -> Unit
+        }
+    }
+
+    fun onExternalVaultMutated() {
+        refreshInboxOnly()
+        refreshCardsOnly()
     }
 
     private fun startPeriodicDeltaFlusher() {
@@ -188,6 +265,11 @@ class SaltAppState(
                     refreshAll()
                     activePage?.meta?.pageId?.let { reloadCurrentPageInPlace(it) }
                     showToast(strings.lanIncomingSyncToast)
+                }
+                if (peers.any { it.relayAvailable } &&
+                    inboxItems.any { it.transcriptStatus == "waiting_for_lan_relay" }
+                ) {
+                    retryPendingInboxEnrichments()
                 }
                 delay(1_800L)
             }
@@ -229,10 +311,13 @@ class SaltAppState(
                 }
             }.onSuccess { newClient ->
                 saveLastVaultDirectory(newVaultPath)
+                stopInboxAudioPlayback()
                 client = newClient
                 activePage = null
                 selectedImageId = null
                 activeCrystal = null
+                microSessionPlan = null
+                activeSlicePreviewCard = null
                 bootstrapVault(checkOnboarding = false)
                 showToast(strings.vaultSwitchedToast)
             }.onFailure { err ->
@@ -251,8 +336,9 @@ class SaltAppState(
                 val all = runCatching { client.listAllCards() }.getOrDefault(emptyList())
                 val rcfg = runCatching { client.getRouterConfig() }.getOrNull()
                 val dav = runCatching { client.getWebDavConfig() }.getOrDefault(WebDavConfigDto())
-                Triple(Triple(dev, list, presets), Triple(due, all, rcfg), dav)
-            }.let { (first, second, dav) ->
+                val inbox = runCatching { client.listInboxItems(showArchivedInbox, 80) }.getOrDefault(emptyList())
+                Triple(Triple(dev, list, presets), Triple(due, all, rcfg), Triple(dav, inbox, Unit))
+            }.let { (first, second, third) ->
                 deviceState = first.first
                 pages.clear()
                 pages.addAll(first.second)
@@ -268,7 +354,9 @@ class SaltAppState(
                     uiLanguage = rcfg.uiLanguage.ifBlank { "system" }
                     aiOutputLanguage = rcfg.aiOutputLanguage.ifBlank { "follow_ui" }
                 }
-                webDavConfig = dav
+                webDavConfig = third.first
+                inboxItems.clear()
+                inboxItems.addAll(third.second)
             }
         }
     }
@@ -1232,13 +1320,14 @@ class SaltAppState(
         scope.launch {
             flushPendingBodyImmediately()
             runCatching {
-                withContext(Dispatchers.IO) { client.syncWebDavNow() }
+                withContext(Dispatchers.IO) { client.syncWebDavNow(isMetered = isMeteredNetwork) }
             }.onSuccess { report ->
                 lastSyncReport = report
                 syncUiVersion++
                 refreshAll()
                 activePage?.meta?.pageId?.let { reloadCurrentPageInPlace(it) }
-                showToast("${strings.lanSyncedToast} (↑${report.uploadedDeltas} · ↓${report.downloadedDeltas})")
+                val deferredSuffix = if (report.deferredAssets > 0) " · ⏳${report.deferredAssets}" else ""
+                showToast("${strings.lanSyncedToast} (↑${report.uploadedDeltas} · ↓${report.downloadedDeltas}$deferredSuffix)")
             }.onFailure { err ->
                 showToast("${strings.syncFailedPrefix}${err.message}")
             }
@@ -1372,5 +1461,369 @@ class SaltAppState(
             allCards.clear()
             allCards.addAll(all)
         }
+    }
+
+    // ------------------------------------------------------------------------
+    // Salt Inbox (盐池) & Micro-Session FSRS Actions (v0.2-alpha)
+    // ------------------------------------------------------------------------
+
+    fun refreshInboxOnly() {
+        scope.launch {
+            val list = withContext(Dispatchers.IO) {
+                runCatching { client.listInboxItems(showArchivedInbox, 80) }.getOrDefault(emptyList())
+            }
+            inboxItems.clear()
+            inboxItems.addAll(list)
+        }
+    }
+
+    fun toggleShowArchivedInbox(show: Boolean) {
+        showArchivedInbox = show
+        refreshInboxOnly()
+    }
+
+    fun captureInboxText(text: String, isPrivate: Boolean, kind: InboxKindDto = InboxKindDto.QuickText) {
+        val cleaned = text.trim()
+        if (cleaned.isEmpty()) return
+        scope.launch {
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    client.captureInboxItem(
+                        InboxCaptureInputDto(
+                            kind = kind,
+                            textNote = cleaned,
+                            isPrivate = isPrivate,
+                        ),
+                    )
+                }
+            }.onSuccess {
+                refreshInboxOnly()
+                showToast(strings.inboxCapturedToast)
+            }.onFailure { err ->
+                showToast("${strings.saveFailedPrefix}${err.message}")
+            }
+        }
+    }
+
+    fun captureInboxPhoto(
+        primaryWebp: ByteArray,
+        thumbWebp: ByteArray,
+        isPrivate: Boolean,
+        noteText: String?,
+    ) {
+        scope.launch {
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    client.captureInboxItem(
+                        InboxCaptureInputDto(
+                            kind = InboxKindDto.PhotoNote,
+                            textNote = noteText?.trim()?.ifBlank { null },
+                            primaryMediaBytes = primaryWebp,
+                            primaryMediaExt = "webp",
+                            thumbWebpBytes = thumbWebp,
+                            audioDurationMs = 0,
+                            isPrivate = isPrivate,
+                        ),
+                    )
+                }
+            }.onSuccess {
+                refreshInboxOnly()
+                showToast(strings.inboxCapturedToast)
+            }.onFailure { err ->
+                showToast("${strings.saveFailedPrefix}${err.message}")
+            }
+        }
+    }
+
+    fun captureInboxVoice(clip: RecordedAudioClip, isPrivate: Boolean, noteText: String?) {
+        scope.launch {
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    client.captureInboxItem(
+                        InboxCaptureInputDto(
+                            kind = InboxKindDto.VoiceMemo,
+                            textNote = noteText?.trim()?.ifBlank { null },
+                            primaryMediaBytes = clip.bytes,
+                            primaryMediaExt = clip.ext,
+                            thumbWebpBytes = null,
+                            audioDurationMs = clip.durationMs,
+                            isPrivate = isPrivate,
+                        ),
+                    )
+                }
+            }.onSuccess { newId ->
+                refreshInboxOnly()
+                showToast(strings.inboxCapturedToast)
+                enrichInboxItem(newId)
+            }.onFailure { err ->
+                showToast("${strings.saveFailedPrefix}${err.message}")
+            }
+        }
+    }
+
+    fun enrichInboxItem(inboxId: String) {
+        if (inboxId in enrichingInboxIds) return
+        enrichingInboxIds.add(inboxId)
+        scope.launch {
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    client.enrichInboxItem(inboxId)
+                }
+            }.onSuccess {
+                refreshInboxOnly()
+            }.onFailure {
+                refreshInboxOnly()
+            }
+            enrichingInboxIds.remove(inboxId)
+        }
+    }
+
+    fun retryPendingInboxEnrichments() {
+        val candidates = inboxItems.filter {
+            it.state == "unprocessed" &&
+                (it.transcriptStatus == "pending" || it.transcriptStatus == "waiting_for_lan_relay")
+        }
+        candidates.forEach { enrichInboxItem(it.inboxId) }
+    }
+
+    fun toggleInboxItemPrivate(item: InboxItemViewDto) {
+        scope.launch {
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    client.setInboxItemPrivate(item.inboxId, !item.isPrivate)
+                }
+            }.onSuccess {
+                refreshInboxOnly()
+            }
+        }
+    }
+
+    fun deleteInboxItem(inboxId: String) {
+        if (playingAudioInboxId == inboxId) {
+            stopInboxAudioPlayback()
+        }
+        scope.launch {
+            runCatching {
+                withContext(Dispatchers.IO) { client.deleteInboxItem(inboxId) }
+            }.onSuccess {
+                refreshInboxOnly()
+            }
+        }
+    }
+
+    fun togglePlayInboxAudio(item: InboxItemViewDto) {
+        val rel = item.primaryAssetPath ?: return
+        if (playingAudioInboxId == item.inboxId) {
+            stopInboxAudioPlayback()
+            return
+        }
+        stopInboxAudioPlayback()
+        playingAudioInboxId = item.inboxId
+        activeAudioHandle = playVaultAudio(
+            vaultPath = client.vaultPath,
+            relPath = rel,
+            onCompleted = {
+                scope.launch {
+                    if (playingAudioInboxId == item.inboxId) {
+                        playingAudioInboxId = null
+                        activeAudioHandle = null
+                    }
+                }
+            },
+            onError = { msg ->
+                scope.launch {
+                    playingAudioInboxId = null
+                    activeAudioHandle = null
+                    showToast(msg)
+                }
+            },
+        )
+    }
+
+    fun stopInboxAudioPlayback() {
+        activeAudioHandle?.stop()
+        activeAudioHandle = null
+        playingAudioInboxId = null
+    }
+
+    fun consumeInboxIntoActivePage(item: InboxItemViewDto) {
+        val page = activePage
+        if (page == null) {
+            val firstId = pages.firstOrNull()?.meta?.pageId ?: return
+            openPage(firstId)
+            return
+        }
+        val pid = page.meta.pageId
+        scope.launch {
+            flushPendingBodyImmediately()
+            runCatching {
+                if (editorMode == EditorViewMode.Canvas &&
+                    item.kind == InboxKindDto.PhotoNote &&
+                    !item.primaryAssetPath.isNullOrBlank()
+                ) {
+                    val rawBytes = withContext(Dispatchers.IO) {
+                        readVaultAssetBytes(client.vaultPath, item.primaryAssetPath!!)
+                    } ?: error("Image asset missing locally")
+                    val inserted = withContext(Dispatchers.IO) {
+                        val node = client.insertCanvasImage(
+                            pageId = pid,
+                            canvasId = activeCanvasId,
+                            rawImageBytes = rawBytes,
+                            x = (96f - panX) / zoom,
+                            y = (96f - panY) / zoom,
+                            maxWidth = 360f,
+                        )
+                        client.consumeInboxIntoPage(item.inboxId, pid, node.imageId)
+                        node
+                    }
+                    selectedImageId = inserted.imageId
+                    reloadCurrentPageInPlace(pid)
+                } else {
+                    val blockId = "inbx_blk_${System.currentTimeMillis()}"
+                    val blockMd = buildInboxMarkdownInsert(item)
+                    val updatedMd = if (editableBody.isBlank()) {
+                        blockMd
+                    } else {
+                        "${editableBody.trimEnd()}\n\n$blockMd\n"
+                    }
+                    withContext(Dispatchers.IO) {
+                        client.updatePageBody(pid, updatedMd)
+                        client.consumeInboxIntoPage(item.inboxId, pid, blockId)
+                    }
+                    editableBody = updatedMd
+                    reloadCurrentPageInPlace(pid)
+                }
+            }.onSuccess {
+                refreshInboxOnly()
+                refreshPageListOnly()
+                showToast(strings.inboxConsumedToast)
+            }.onFailure { err ->
+                showToast("${strings.saveFailedPrefix}${err.message}")
+            }
+        }
+    }
+
+    fun triggerInboxDirectHalo(item: InboxItemViewDto, presetId: String) {
+        val pageId = activePage?.meta?.pageId ?: pages.firstOrNull()?.meta?.pageId ?: return
+        cancelActiveCrystalStream()
+        val preset = haloPresets.firstOrNull { it.presetId == presetId }
+        activeCrystal = ActiveCrystalBubble(
+            presetId = presetId,
+            presetName = preset?.name ?: presetId,
+            accentHex = preset?.colorHex ?: "#8D99AE",
+            isStreaming = true,
+        )
+        val listener = buildHaloStreamListener(pageId, presetId)
+        scope.launch {
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    client.triggerInboxHalo(
+                        inboxId = item.inboxId,
+                        pageId = pageId,
+                        presetId = presetId,
+                        providerId = null,
+                        outputLanguageHint = effectiveAiLanguageCode,
+                        listener = listener,
+                    )
+                }
+            }.onSuccess { handle ->
+                activeCancelHandle = handle
+            }.onFailure { err ->
+                val isPrivacy = err::class.simpleName == "PrivacyBlocked" ||
+                    err.message?.contains("PrivacyBlocked", ignoreCase = true) == true ||
+                    err.message?.contains("#private", ignoreCase = true) == true
+                activeCrystal = activeCrystal?.copy(
+                    isStreaming = false,
+                    errorCode = if (isPrivacy) "PRIVACY_BLOCKED" else "ROUTER_ERROR",
+                    errorMessage = if (isPrivacy) strings.privateBlockError else (err.message ?: strings.requestFailed),
+                )
+            }
+        }
+    }
+
+    private fun buildInboxMarkdownInsert(item: InboxItemViewDto): String = buildString {
+        when (item.kind) {
+            InboxKindDto.PhotoNote -> {
+                val imgPath = item.primaryAssetPath ?: item.thumbAssetPath
+                if (!imgPath.isNullOrBlank()) {
+                    append("![${item.textNote ?: "Salt Inbox"}]($imgPath)\n")
+                }
+                item.textNote?.takeIf { it.isNotBlank() }?.let { append("> $it\n") }
+                item.transcriptText?.takeIf { it.isNotBlank() }?.let {
+                    append("\n> [!salt-mineral] ${strings.calloutMineralTitle}\n> ${it.replace("\n", "\n> ")}\n")
+                }
+            }
+            InboxKindDto.VoiceMemo -> {
+                val secs = (item.audioDurationMs / 1000).coerceAtLeast(1)
+                append("> [!note] 🎙️ ${strings.captureVoice} (${secs}s)\n")
+                item.summaryText?.takeIf { it.isNotBlank() }?.let {
+                    append("> **${it}**\n>\n")
+                }
+                item.transcriptText?.takeIf { it.isNotBlank() }?.let {
+                    append("> ${it.replace("\n", "\n> ")}\n")
+                } ?: item.textNote?.takeIf { it.isNotBlank() }?.let {
+                    append("> $it\n")
+                }
+            }
+            InboxKindDto.QuickText, InboxKindDto.WebClip -> {
+                val txt = item.textNote ?: item.summaryText ?: ""
+                append("> $txt\n")
+            }
+        }
+    }.trimEnd()
+
+    fun startMicroReviewSession(
+        budgetSeconds: Int = microSessionBudgetSecs,
+        energyLevel: Int = microSessionEnergyLevel,
+        rescueMode: Boolean = microSessionRescueMode,
+    ) {
+        microSessionBudgetSecs = budgetSeconds
+        microSessionEnergyLevel = energyLevel
+        microSessionRescueMode = rescueMode
+        scope.launch {
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    client.buildMicroReviewSession(budgetSeconds, energyLevel, rescueMode)
+                }
+            }.onSuccess { plan ->
+                microSessionPlan = plan
+                microSessionIndex = 0
+                isMicroSessionFinished = plan.cards.isEmpty()
+                currentCardRevealed = false
+                cardShownAtMs = System.currentTimeMillis()
+            }.onFailure { err ->
+                showToast("${strings.requestFailed}: ${err.message}")
+            }
+        }
+    }
+
+    fun submitMicroCardRating(card: ReviewCardViewDto, rating: Int) {
+        val elapsedMs = (System.currentTimeMillis() - cardShownAtMs).coerceIn(500L, 600_000L).toInt()
+        scope.launch {
+            withContext(Dispatchers.IO) {
+                runCatching { client.submitCardReview(card.pageId, card.cardId, rating, elapsedMs) }
+            }
+            currentCardRevealed = false
+            cardShownAtMs = System.currentTimeMillis()
+            val plan = microSessionPlan
+            if (plan != null && microSessionIndex + 1 < plan.cards.size) {
+                microSessionIndex += 1
+            } else {
+                isMicroSessionFinished = true
+            }
+            refreshCardsOnly()
+        }
+    }
+
+    fun jumpToCardAnchor(card: ReviewCardViewDto) {
+        activeSlicePreviewCard = null
+        selectedTab = NavTab.Notes
+        openPage(card.pageId, targetHaloId = card.anchorHaloId)
+    }
+
+    fun dispose() {
+        stopInboxAudioPlayback()
+        networkObserverDispose?.invoke()
+        networkObserverDispose = null
     }
 }

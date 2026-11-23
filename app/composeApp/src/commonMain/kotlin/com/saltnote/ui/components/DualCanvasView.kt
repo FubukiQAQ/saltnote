@@ -7,6 +7,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -58,6 +59,7 @@ import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.withTransform
@@ -175,105 +177,18 @@ fun DualCanvasView(
             .onSizeChanged { viewportSize = it },
     ) {
         // Layer 1: WYSIWYG Native-DPI Smooth Dry-Ink, Placed Images & Active Halo Anchor Region
-        Canvas(modifier = Modifier.fillMaxSize()) {
-            val spacing = 32f * zoom
-            if (spacing >= 10f) {
-                val startX = ((panX % spacing) + spacing) % spacing
-                val startY = ((panY % spacing) + spacing) % spacing
-                var gx = startX
-                while (gx < size.width) {
-                    var gy = startY
-                    while (gy < size.height) {
-                        drawCircle(color = dotColor, radius = 1.25f, center = Offset(gx, gy))
-                        gy += spacing
-                    }
-                    gx += spacing
-                }
-            }
-
-            val viewportMinX = -panX / zoom - 64f
-            val viewportMinY = -panY / zoom - 64f
-            val viewportMaxX = (size.width - panX) / zoom + 64f
-            val viewportMaxY = (size.height - panY) / zoom + 64f
-
-            for ((node, bmp) in decodedImages) {
-                val rect = if (node.imageId == activeGestureImageId && previewImageRect != null) {
-                    previewImageRect!!
-                } else {
-                    ImageWorldRect(node.x, node.y, node.width, node.height)
-                }
-                val leftPx = (rect.x * zoom + panX).roundToInt()
-                val topPx = (rect.y * zoom + panY).roundToInt()
-                val rightPx = ((rect.x + rect.w) * zoom + panX).roundToInt()
-                val bottomPx = ((rect.y + rect.h) * zoom + panY).roundToInt()
-                drawImage(
-                    image = bmp,
-                    dstOffset = IntOffset(leftPx, topPx),
-                    dstSize = IntSize(
-                        (rightPx - leftPx).coerceAtLeast(1),
-                        (bottomPx - topPx).coerceAtLeast(1),
-                    ),
-                )
-            }
-
-            withTransform({
-                translate(left = panX, top = panY)
-                scale(scaleX = zoom, scaleY = zoom, pivot = Offset.Zero)
-            }) {
-                drawWysiwygStrokes(
-                    strokes = strokes,
-                    viewportMinX = viewportMinX,
-                    viewportMinY = viewportMinY,
-                    viewportMaxX = viewportMaxX,
-                    viewportMaxY = viewportMaxY,
-                )
-
-                val bbox = activeHalo?.anchorBbox
-                if (activeHalo != null && bbox != null) {
-                    val accent = haloPinColor(activeHalo.presetId, defaultPrimaryColor)
-                    val safeZ = zoom.coerceAtLeast(0.25f)
-                    val pad = 8f / safeZ
-                    val left = bbox.minX - pad
-                    val top = bbox.minY - pad
-                    val width = (bbox.maxX - bbox.minX).coerceAtLeast(16f) + pad * 2f
-                    val height = (bbox.maxY - bbox.minY).coerceAtLeast(16f) + pad * 2f
-                    val corner = CornerRadius(10f / safeZ, 10f / safeZ)
-
-                    drawRoundRect(
-                        color = accent.copy(alpha = 0.14f),
-                        topLeft = Offset(left, top),
-                        size = Size(width, height),
-                        cornerRadius = corner,
-                    )
-                    drawRoundRect(
-                        color = accent.copy(alpha = 0.85f),
-                        topLeft = Offset(left, top),
-                        size = Size(width, height),
-                        cornerRadius = corner,
-                        style = Stroke(
-                            width = 2f / safeZ,
-                            pathEffect = PathEffect.dashPathEffect(floatArrayOf(10f / safeZ, 6f / safeZ)),
-                        ),
-                    )
-
-                    val pinWorldX = activeHalo.pinX ?: (bbox.maxX + 10f)
-                    val pinWorldY = activeHalo.pinY ?: bbox.minY
-                    val anchorX = pinWorldX.coerceIn(left, left + width)
-                    val anchorY = pinWorldY.coerceIn(top, top + height)
-                    val dx = pinWorldX - anchorX
-                    val dy = pinWorldY - anchorY
-                    if (dx * dx + dy * dy > 4f) {
-                        drawLine(
-                            color = accent.copy(alpha = 0.72f),
-                            start = Offset(anchorX, anchorY),
-                            end = Offset(pinWorldX, pinWorldY),
-                            strokeWidth = 1.6f / safeZ,
-                            pathEffect = PathEffect.dashPathEffect(floatArrayOf(8f / safeZ, 5f / safeZ)),
-                        )
-                    }
-                }
-            }
-        }
+        CanvasDryContentLayer(
+            strokes = strokes,
+            decodedImages = decodedImages,
+            activeGestureImageId = activeGestureImageId,
+            previewImageRect = previewImageRect,
+            activeHalo = activeHalo,
+            panX = panX,
+            panY = panY,
+            zoom = zoom,
+            dotColor = dotColor,
+            defaultPrimaryColor = defaultPrimaryColor,
+        )
 
         // Layer 2: Platform low-latency wet-ink layer with palm rejection
         PlatformInkSurface(
@@ -592,6 +507,251 @@ fun DualCanvasView(
                         Spacer(Modifier.width(4.dp))
                         Text(strings.done)
                     }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Compact (<600dp) phone HD read-only canvas preview rendered purely via Compose [Canvas]
+ * without a `SurfaceView` overlay, eliminating Android surface Z-order glitches while
+ * supporting pinch-zoom, panning, and clickable Salt Halo crystal pins.
+ */
+@Composable
+fun CompactCanvasPreview(
+    vaultPath: String,
+    strokes: List<RenderStrokeDto>,
+    images: List<CanvasImageNodeDto>,
+    halos: List<HaloAnnotationDto>,
+    panX: Float,
+    panY: Float,
+    zoom: Float,
+    onPanZoom: (Float, Float, Float, Float, Float) -> Unit,
+    onResetViewport: () -> Unit,
+    onOpenHalo: (HaloAnnotationDto) -> Unit,
+    modifier: Modifier = Modifier,
+    activeCanvasId: String = "main",
+    activeHaloId: String? = null,
+) {
+    val strings = LocalSaltStrings.current
+    val density = LocalDensity.current
+    var viewportSize by remember { mutableStateOf(IntSize.Zero) }
+
+    val decodedImages = remember(vaultPath, images) {
+        images.filter { !it.deleted }.mapNotNull { node ->
+            loadImageBitmapFromVault(vaultPath, node.assetRelPath)?.let { bmp -> node to bmp }
+        }
+    }
+    val visibleHalos = remember(halos, activeCanvasId) {
+        halos.filter { it.canvasId == null || it.canvasId == activeCanvasId }
+    }
+    val activeHalo = remember(visibleHalos, activeHaloId) {
+        if (activeHaloId == null) null else visibleHalos.firstOrNull { it.haloId == activeHaloId }
+    }
+
+    val dotColor = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.55f)
+    val paperBg = MaterialTheme.colorScheme.surfaceContainerLowest
+    val defaultPrimaryColor = MaterialTheme.colorScheme.primary
+
+    Box(
+        modifier = modifier
+            .fillMaxSize()
+            .background(paperBg)
+            .clipToBounds()
+            .onSizeChanged { viewportSize = it }
+            .pointerInput(activeCanvasId) {
+                detectTransformGestures { centroid, pan, gestureZoom, _ ->
+                    onPanZoom(pan.x, pan.y, gestureZoom, centroid.x, centroid.y)
+                }
+            },
+    ) {
+        CanvasDryContentLayer(
+            strokes = strokes,
+            decodedImages = decodedImages,
+            activeGestureImageId = null,
+            previewImageRect = null,
+            activeHalo = activeHalo,
+            panX = panX,
+            panY = panY,
+            zoom = zoom,
+            dotColor = dotColor,
+            defaultPrimaryColor = defaultPrimaryColor,
+        )
+
+        visibleHalos.forEach { halo ->
+            val bbox = halo.anchorBbox ?: return@forEach
+            val pinWorldX = halo.pinX ?: (bbox.maxX + 10f)
+            val pinWorldY = halo.pinY ?: bbox.minY
+            DraggableHaloPin(
+                halo = halo,
+                worldX = pinWorldX,
+                worldY = pinWorldY,
+                panX = panX,
+                panY = panY,
+                zoom = zoom,
+                viewportSize = viewportSize,
+                pinColor = haloPinColor(halo.presetId, defaultPrimaryColor),
+                isActive = halo.haloId == activeHaloId,
+                openDescription = strings.openHaloPinDesc,
+                pinHalfPx = with(density) { 14.dp.toPx() },
+                onOpen = { onOpenHalo(halo) },
+                onMoveCommit = { _, _ -> },
+            )
+        }
+
+        Surface(
+            modifier = Modifier
+                .align(Alignment.TopStart)
+                .padding(10.dp),
+            shape = RoundedCornerShape(16.dp),
+            color = MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.9f),
+            tonalElevation = 1.dp,
+        ) {
+            Text(
+                text = strings.compactCanvasPreviewHint,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+            )
+        }
+
+        Surface(
+            modifier = Modifier
+                .align(Alignment.BottomEnd)
+                .padding(12.dp),
+            shape = RoundedCornerShape(20.dp),
+            color = MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.94f),
+            tonalElevation = 2.dp,
+        ) {
+            Row(
+                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(2.dp),
+            ) {
+                Text(
+                    text = "${(zoom * 100).roundToInt()}%",
+                    style = MaterialTheme.typography.labelMedium,
+                    modifier = Modifier
+                        .clickable { onResetViewport() }
+                        .padding(horizontal = 6.dp),
+                )
+                IconButton(onClick = onResetViewport, modifier = Modifier.size(28.dp)) {
+                    Icon(Icons.Rounded.CenterFocusStrong, strings.resetViewportDesc, modifier = Modifier.size(16.dp))
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun CanvasDryContentLayer(
+    strokes: List<RenderStrokeDto>,
+    decodedImages: List<Pair<CanvasImageNodeDto, ImageBitmap>>,
+    activeGestureImageId: String?,
+    previewImageRect: ImageWorldRect?,
+    activeHalo: HaloAnnotationDto?,
+    panX: Float,
+    panY: Float,
+    zoom: Float,
+    dotColor: Color,
+    defaultPrimaryColor: Color,
+) {
+    Canvas(modifier = Modifier.fillMaxSize()) {
+        val spacing = 32f * zoom
+        if (spacing >= 10f) {
+            val startX = ((panX % spacing) + spacing) % spacing
+            val startY = ((panY % spacing) + spacing) % spacing
+            var gx = startX
+            while (gx < size.width) {
+                var gy = startY
+                while (gy < size.height) {
+                    drawCircle(color = dotColor, radius = 1.25f, center = Offset(gx, gy))
+                    gy += spacing
+                }
+                gx += spacing
+            }
+        }
+
+        val viewportMinX = -panX / zoom - 64f
+        val viewportMinY = -panY / zoom - 64f
+        val viewportMaxX = (size.width - panX) / zoom + 64f
+        val viewportMaxY = (size.height - panY) / zoom + 64f
+
+        for ((node, bmp) in decodedImages) {
+            val rect = if (node.imageId == activeGestureImageId && previewImageRect != null) {
+                previewImageRect
+            } else {
+                ImageWorldRect(node.x, node.y, node.width, node.height)
+            }
+            val leftPx = (rect.x * zoom + panX).roundToInt()
+            val topPx = (rect.y * zoom + panY).roundToInt()
+            val rightPx = ((rect.x + rect.w) * zoom + panX).roundToInt()
+            val bottomPx = ((rect.y + rect.h) * zoom + panY).roundToInt()
+            drawImage(
+                image = bmp,
+                dstOffset = IntOffset(leftPx, topPx),
+                dstSize = IntSize(
+                    (rightPx - leftPx).coerceAtLeast(1),
+                    (bottomPx - topPx).coerceAtLeast(1),
+                ),
+            )
+        }
+
+        withTransform({
+            translate(left = panX, top = panY)
+            scale(scaleX = zoom, scaleY = zoom, pivot = Offset.Zero)
+        }) {
+            drawWysiwygStrokes(
+                strokes = strokes,
+                viewportMinX = viewportMinX,
+                viewportMinY = viewportMinY,
+                viewportMaxX = viewportMaxX,
+                viewportMaxY = viewportMaxY,
+            )
+
+            val bbox = activeHalo?.anchorBbox
+            if (activeHalo != null && bbox != null) {
+                val accent = haloPinColor(activeHalo.presetId, defaultPrimaryColor)
+                val safeZ = zoom.coerceAtLeast(0.25f)
+                val pad = 8f / safeZ
+                val left = bbox.minX - pad
+                val top = bbox.minY - pad
+                val width = (bbox.maxX - bbox.minX).coerceAtLeast(16f) + pad * 2f
+                val height = (bbox.maxY - bbox.minY).coerceAtLeast(16f) + pad * 2f
+                val corner = CornerRadius(10f / safeZ, 10f / safeZ)
+
+                drawRoundRect(
+                    color = accent.copy(alpha = 0.14f),
+                    topLeft = Offset(left, top),
+                    size = Size(width, height),
+                    cornerRadius = corner,
+                )
+                drawRoundRect(
+                    color = accent.copy(alpha = 0.85f),
+                    topLeft = Offset(left, top),
+                    size = Size(width, height),
+                    cornerRadius = corner,
+                    style = Stroke(
+                        width = 2f / safeZ,
+                        pathEffect = PathEffect.dashPathEffect(floatArrayOf(10f / safeZ, 6f / safeZ)),
+                    ),
+                )
+
+                val pinWorldX = activeHalo.pinX ?: (bbox.maxX + 10f)
+                val pinWorldY = activeHalo.pinY ?: bbox.minY
+                val anchorX = pinWorldX.coerceIn(left, left + width)
+                val anchorY = pinWorldY.coerceIn(top, top + height)
+                val dx = pinWorldX - anchorX
+                val dy = pinWorldY - anchorY
+                if (dx * dx + dy * dy > 4f) {
+                    drawLine(
+                        color = accent.copy(alpha = 0.72f),
+                        start = Offset(anchorX, anchorY),
+                        end = Offset(pinWorldX, pinWorldY),
+                        strokeWidth = 1.6f / safeZ,
+                        pathEffect = PathEffect.dashPathEffect(floatArrayOf(8f / safeZ, 5f / safeZ)),
+                    )
                 }
             }
         }

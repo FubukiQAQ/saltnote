@@ -562,6 +562,8 @@ pub struct HaloAnnotation {
     #[serde(default)]
     pub pin_y: Option<f32>,
     pub slice_cache_path: Option<String>,
+    #[serde(default)]
+    pub slice_asset_rel_path: Option<String>,
     pub context_excerpt: String,
     pub response_markdown: String,
     pub collapsed: bool,
@@ -598,6 +600,10 @@ fn default_ai_output_language() -> String {
     "follow_ui".into()
 }
 
+fn default_audio_provider() -> String {
+    "gemini-byok".into()
+}
+
 pub fn ai_language_display_name(code: &str) -> Option<&'static str> {
     let norm = code.trim().to_ascii_lowercase();
     match norm.as_str() {
@@ -615,6 +621,12 @@ pub fn ai_language_display_name(code: &str) -> Option<&'static str> {
 pub struct RouterConfig {
     pub default_text_provider: String,
     pub default_vision_provider: String,
+    #[serde(default = "default_audio_provider")]
+    pub default_audio_provider: String,
+    #[serde(default)]
+    pub local_whisper_url: String,
+    #[serde(default)]
+    pub salt_relay_enabled: bool,
     #[serde(default = "default_ui_language")]
     pub ui_language: String,
     #[serde(default = "default_ai_output_language")]
@@ -627,6 +639,9 @@ impl Default for RouterConfig {
         Self {
             default_text_provider: "ollama-local".into(),
             default_vision_provider: "ollama-local".into(),
+            default_audio_provider: default_audio_provider(),
+            local_whisper_url: String::new(),
+            salt_relay_enabled: false,
             ui_language: default_ui_language(),
             ai_output_language: default_ai_output_language(),
             providers: vec![
@@ -836,8 +851,39 @@ pub struct SyncReport {
     pub downloaded_deltas: u32,
     pub uploaded_assets: u32,
     pub downloaded_assets: u32,
+    #[serde(default)]
+    pub deferred_assets: u32,
     pub retried_429_count: u32,
     pub errors: Vec<String>,
+}
+
+pub const METERED_MAX_ASSET_BYTES: u64 = 2 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncNetworkPolicy {
+    pub allow_large_assets: bool,
+    pub max_asset_bytes: u64,
+    pub prefer_lightweight: bool,
+}
+
+impl Default for SyncNetworkPolicy {
+    fn default() -> Self {
+        Self {
+            allow_large_assets: true,
+            max_asset_bytes: METERED_MAX_ASSET_BYTES,
+            prefer_lightweight: false,
+        }
+    }
+}
+
+impl SyncNetworkPolicy {
+    pub fn metered_guard() -> Self {
+        Self {
+            allow_large_assets: false,
+            max_asset_bytes: METERED_MAX_ASSET_BYTES,
+            prefer_lightweight: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -847,6 +893,8 @@ pub struct LanPeerInfo {
     pub host: String,
     pub port: u16,
     pub cert_fingerprint: String,
+    #[serde(default)]
+    pub relay_available: bool,
 }
 
 // ============================================================================
@@ -920,6 +968,169 @@ pub struct SearchHit {
     pub snippet: String,
     pub score: f64,
     pub is_private: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReviewCardView {
+    pub card_id: String,
+    pub page_id: String,
+    pub anchor_halo_id: Option<String>,
+    pub front: String,
+    pub back: String,
+    pub stability: f64,
+    pub difficulty: f64,
+    pub reps: u32,
+    pub lapses: u32,
+    pub state: u8,
+    pub last_review_utc: Option<i64>,
+    pub due_at_utc: i64,
+    pub retrievability: f64,
+    pub source_page_title: String,
+    pub slice_asset_path: Option<String>,
+    pub context_excerpt: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MicroSessionPlan {
+    pub session_id: String,
+    pub budget_seconds: u32,
+    pub estimated_seconds: u32,
+    pub cards: Vec<ReviewCardView>,
+    pub total_due_count: u32,
+}
+
+// ============================================================================
+// Salt Inbox (盐池) Models (v0.2-alpha)
+// ============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InboxKind {
+    QuickText,
+    PhotoNote,
+    VoiceMemo,
+    WebClip,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InboxState {
+    Unprocessed,
+    Archived,
+    Deleted,
+}
+
+impl InboxState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            InboxState::Unprocessed => "unprocessed",
+            InboxState::Archived => "archived",
+            InboxState::Deleted => "deleted",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TranscriptStatus {
+    NotApplicable,
+    Pending,
+    Processing,
+    WaitingForLanRelay,
+    Completed,
+    Failed,
+}
+
+impl TranscriptStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TranscriptStatus::NotApplicable => "not_applicable",
+            TranscriptStatus::Pending => "pending",
+            TranscriptStatus::Processing => "processing",
+            TranscriptStatus::WaitingForLanRelay => "waiting_for_lan_relay",
+            TranscriptStatus::Completed => "completed",
+            TranscriptStatus::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboxPayload {
+    pub text_note: Option<String>,
+    pub image_asset_hash: Option<String>,
+    #[serde(default)]
+    pub image_asset_rel_path: Option<String>,
+    pub thumb_asset_hash: Option<String>,
+    #[serde(default)]
+    pub thumb_asset_rel_path: Option<String>,
+    pub audio_asset_hash: Option<String>,
+    #[serde(default)]
+    pub audio_asset_rel_path: Option<String>,
+    #[serde(default)]
+    pub audio_duration_ms: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboxAiEnrichment {
+    pub transcript_status: TranscriptStatus,
+    pub transcript_text: Option<String>,
+    #[serde(default)]
+    pub summary_text: Option<String>,
+    #[serde(default)]
+    pub auto_tags: Vec<String>,
+}
+
+impl Default for InboxAiEnrichment {
+    fn default() -> Self {
+        Self {
+            transcript_status: TranscriptStatus::NotApplicable,
+            transcript_text: None,
+            summary_text: None,
+            auto_tags: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboxConsumption {
+    pub consumed_page_id: Option<String>,
+    pub consumed_block_id: Option<String>,
+    pub consumed_at_utc: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboxItem {
+    pub inbox_id: String,
+    pub kind: InboxKind,
+    pub created_at_utc: i64,
+    pub source_device_id: String,
+    pub is_private: bool,
+    pub state: InboxState,
+    pub payload: InboxPayload,
+    #[serde(default)]
+    pub ai_enrichment: InboxAiEnrichment,
+    #[serde(default)]
+    pub consumption: InboxConsumption,
+}
+
+pub fn content_addressed_asset_rel_path(bytes: &[u8], ext: &str) -> (String, String) {
+    let full_hash = sha256_hex(bytes);
+    let bucket = &full_hash[..2];
+    let short_name = &full_hash[..16];
+    let clean_ext: String = ext
+        .trim()
+        .trim_start_matches('.')
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    let final_ext = if clean_ext.is_empty() {
+        "bin".to_string()
+    } else {
+        clean_ext
+    };
+    let rel_path = format!("assets/{bucket}/{short_name}.{final_ext}");
+    (full_hash, rel_path)
 }
 
 #[cfg(test)]

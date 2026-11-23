@@ -28,6 +28,7 @@ fun main() = application {
 
     Window(
         onCloseRequest = {
+            appState.dispose()
             runCatching { appState.client.flushDeltas() }
             runCatching { appState.client.stopLanP2p() }
             exitApplication()

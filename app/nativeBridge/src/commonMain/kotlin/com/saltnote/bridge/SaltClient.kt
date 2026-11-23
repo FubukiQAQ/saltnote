@@ -128,6 +128,15 @@ interface SaltNoteClient {
         listener: HaloStreamListener,
     ): CancelHandle
 
+    fun triggerInboxHalo(
+        inboxId: String,
+        pageId: String,
+        presetId: String,
+        providerId: String? = null,
+        outputLanguageHint: String? = null,
+        listener: HaloStreamListener,
+    ): CancelHandle
+
     fun updateHaloPin(pageId: String, haloId: String, pinX: Float, pinY: Float): HaloAnnotationDto
 
     fun fuseHaloIntoBody(pageId: String, haloId: String): String
@@ -167,12 +176,25 @@ interface SaltNoteClient {
 
     fun getWebDavConfig(): WebDavConfigDto
     fun saveWebDavConfig(config: WebDavConfigDto)
-    fun syncWebDavNow(): SyncReportDto
+    fun syncWebDavNow(isMetered: Boolean = false): SyncReportDto
 
     fun startLanP2p(enableMdns: Boolean = true): LanNodeInfoDto
     fun stopLanP2p()
     fun listLanPeers(): List<LanPeerInfoDto>
     fun syncWithLanPeer(host: String, port: Int, expectedFingerprint: String): P2pSyncResultDto
+
+    // Salt Inbox & Micro-Session FSRS (v0.2-alpha)
+    fun captureInboxItem(input: InboxCaptureInputDto): String
+    fun listInboxItems(includeArchived: Boolean = false, limit: Int = 50): List<InboxItemViewDto>
+    suspend fun enrichInboxItem(inboxId: String): InboxItemViewDto
+    fun consumeInboxIntoPage(inboxId: String, targetPageId: String, targetBlockId: String)
+    fun setInboxItemPrivate(inboxId: String, isPrivate: Boolean): InboxItemViewDto
+    fun deleteInboxItem(inboxId: String)
+    suspend fun buildMicroReviewSession(
+        budgetSeconds: Int = 300,
+        energyLevel: Int = 2,
+        rescueMode: Boolean = true,
+    ): MicroSessionPlanDto
 
     fun redactLogText(raw: String): String
 }

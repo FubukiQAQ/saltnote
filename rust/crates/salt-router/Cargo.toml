@@ -8,7 +8,7 @@ license = "Apache-2.0"
 base64 = "0.22"
 futures-util = "0.3"
 image = { version = "0.25", default-features = false, features = ["png", "webp"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "json", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "json", "stream", "multipart"] }
 salt-types = { path = "../salt-types" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

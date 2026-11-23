@@ -5,7 +5,7 @@ use reqwest::Client;
 pub use salt_types::{parse_flashcard_drafts, FlashcardDraft};
 use salt_types::{
     ai_language_display_name, is_local_or_rfc1918_endpoint, redact_sensitive_text, AiProviderKind,
-    HaloOutputMode, HaloPreset, ProviderConfig, SaltError, SaltResult, VisionPolicy,
+    HaloOutputMode, HaloPreset, InboxKind, ProviderConfig, SaltError, SaltResult, VisionPolicy,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -41,6 +41,23 @@ pub struct ConnectivityTestResult {
     pub ok: bool,
     pub latency_ms: u64,
     pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InboxEnrichmentRequest {
+    pub is_private: bool,
+    pub kind: InboxKind,
+    pub text_note: Option<String>,
+    pub media_bytes: Option<Vec<u8>>,
+    pub media_ext: Option<String>,
+    pub output_language: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboxEnrichmentOutput {
+    pub transcript_text: Option<String>,
+    pub summary_text: Option<String>,
+    pub auto_tags: Vec<String>,
 }
 
 /// Normalizes an OpenAI-compatible base URL: removes accidental whitespace/newlines and trailing endpoint paths.
@@ -754,6 +771,538 @@ impl SaltRouter {
             },
         }
     }
+
+    /// Transcribes/summarizes a Salt Inbox item (`VoiceMemo`, `PhotoNote`, `QuickText`, `WebClip`)
+    /// with strict `#private` local-endpoint enforcement before resolving secrets or touching sockets.
+    pub async fn enrich_inbox_item(
+        &self,
+        provider: &ProviderConfig,
+        whisper_provider: Option<&ProviderConfig>,
+        req: &InboxEnrichmentRequest,
+    ) -> SaltResult<InboxEnrichmentOutput> {
+        let provider = sanitize_provider(provider);
+        Self::enforce_privacy_guard(req.is_private, &provider)?;
+
+        if let Some(wp) = whisper_provider {
+            let wp_clean = sanitize_provider(wp);
+            Self::enforce_privacy_guard(req.is_private, &wp_clean)?;
+        }
+
+        let api_key = self.resolve_api_key(&provider)?;
+        let lang_instruction = req
+            .output_language
+            .as_deref()
+            .and_then(ai_language_display_name)
+            .map(|l| format!(" Write summary and tags in {l}."))
+            .unwrap_or_default();
+
+        match req.kind {
+            InboxKind::VoiceMemo => {
+                let audio_bytes = req.media_bytes.as_deref().ok_or_else(|| {
+                    SaltError::InvalidInput("Voice memo has no audio asset".into())
+                })?;
+                let ext = req.media_ext.as_deref().unwrap_or("ogg");
+                if provider.kind == AiProviderKind::Gemini && whisper_provider.is_none() {
+                    let mime = audio_mime_for_ext(ext);
+                    let prompt = format!(
+                        "Transcribe this voice memo accurately, write a concise 1-sentence summary, and suggest 1-3 short topic tags.{lang_instruction} \
+                        Respond ONLY with JSON: {{\"transcript_text\":\"...\",\"summary_text\":\"...\",\"auto_tags\":[\"...\"]}}"
+                    );
+                    let raw = self
+                        .gemini_generate_inline(&provider, &api_key, &prompt, mime, audio_bytes)
+                        .await?;
+                    Ok(parse_enrichment_json(&raw, true))
+                } else {
+                    let wp_sanitized = whisper_provider
+                        .map(sanitize_provider)
+                        .unwrap_or_else(|| provider.clone());
+                    Self::enforce_privacy_guard(req.is_private, &wp_sanitized)?;
+                    if wp_sanitized.base_url.trim().is_empty() {
+                        return Err(SaltError::InvalidInput(
+                            "No Whisper or Gemini audio provider configured".into(),
+                        ));
+                    }
+                    if wp_sanitized.kind == AiProviderKind::Anthropic {
+                        return Err(SaltError::InvalidInput(
+                            "Anthropic does not support audio transcription; configure Gemini or Whisper".into(),
+                        ));
+                    }
+                    let wp_key = self.resolve_api_key(&wp_sanitized)?;
+                    let transcript = self
+                        .openai_whisper_transcribe(&wp_sanitized, &wp_key, audio_bytes, ext)
+                        .await?;
+                    let mut out = if !provider.base_url.trim().is_empty()
+                        && !provider.model.trim().is_empty()
+                        && provider.id != "whisper-local"
+                    {
+                        let sum_prompt = format!(
+                            "Summarize the following voice note transcript in 1 concise sentence and suggest 1-3 short topic tags.{lang_instruction} \
+                            Respond ONLY with JSON: {{\"summary_text\":\"...\",\"auto_tags\":[\"...\"]}}\n\nTranscript:\n{transcript}"
+                        );
+                        match self
+                            .simple_text_completion(&provider, &api_key, &sum_prompt)
+                            .await
+                        {
+                            Ok(raw) => parse_enrichment_json(&raw, false),
+                            Err(_) => InboxEnrichmentOutput::default(),
+                        }
+                    } else {
+                        InboxEnrichmentOutput::default()
+                    };
+                    out.transcript_text = Some(transcript);
+                    Ok(out)
+                }
+            }
+            InboxKind::PhotoNote => {
+                let img_bytes = req.media_bytes.as_deref().ok_or_else(|| {
+                    SaltError::InvalidInput("Photo note has no image asset".into())
+                })?;
+                let note_ctx = req
+                    .text_note
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|s| format!(" User note: {s}."))
+                    .unwrap_or_default();
+                let prompt = format!(
+                    "Transcribe any visible text/formulas in this photo verbatim (using Markdown & LaTeX $...$/$$...$$), provide a concise 1-sentence summary, and suggest 1-3 short topic tags.{note_ctx}{lang_instruction} \
+                    Respond ONLY with JSON: {{\"transcript_text\":\"...\",\"summary_text\":\"...\",\"auto_tags\":[\"...\"]}}"
+                );
+                let raw = match provider.kind {
+                    AiProviderKind::Gemini => {
+                        self.gemini_generate_inline(&provider, &api_key, &prompt, "image/webp", img_bytes)
+                            .await?
+                    }
+                    AiProviderKind::Anthropic => {
+                        self.anthropic_vision_once(&provider, &api_key, &prompt, img_bytes)
+                            .await?
+                    }
+                    AiProviderKind::OpenAiCompatible | AiProviderKind::OllamaLocal => {
+                        self.openai_vision_once(&provider, &api_key, &prompt, img_bytes)
+                            .await?
+                    }
+                };
+                Ok(parse_enrichment_json(&raw, true))
+            }
+            InboxKind::QuickText | InboxKind::WebClip => {
+                let text = req.text_note.as_deref().unwrap_or("").trim();
+                if text.is_empty() {
+                    return Ok(InboxEnrichmentOutput::default());
+                }
+                let prompt = format!(
+                    "Write a concise 1-sentence summary and suggest 1-3 short topic tags for this note.{lang_instruction} \
+                    Respond ONLY with JSON: {{\"summary_text\":\"...\",\"auto_tags\":[\"...\"]}}\n\nNote:\n{text}"
+                );
+                let raw = self
+                    .simple_text_completion(&provider, &api_key, &prompt)
+                    .await?;
+                Ok(parse_enrichment_json(&raw, false))
+            }
+        }
+    }
+
+    async fn openai_whisper_transcribe(
+        &self,
+        provider: &ProviderConfig,
+        api_key: &str,
+        audio_bytes: &[u8],
+        ext: &str,
+    ) -> SaltResult<String> {
+        let base = normalize_openai_base_url(&provider.base_url);
+        let url = if base.ends_with("/audio/transcriptions") {
+            base
+        } else {
+            format!("{base}/audio/transcriptions")
+        };
+        let clean_ext = ext.trim().trim_start_matches('.').to_ascii_lowercase();
+        let filename = if clean_ext.is_empty() {
+            "memo.ogg".to_string()
+        } else {
+            format!("memo.{clean_ext}")
+        };
+        let mime = audio_mime_for_ext(&clean_ext);
+        let part = reqwest::multipart::Part::bytes(audio_bytes.to_vec())
+            .file_name(filename)
+            .mime_str(mime)
+            .map_err(|e| SaltError::InvalidInput(e.to_string()))?;
+        let model_name = if provider.model.trim().is_empty() {
+            "whisper-1".to_string()
+        } else {
+            provider.model.clone()
+        };
+        let form = reqwest::multipart::Form::new()
+            .part("file", part)
+            .text("model", model_name);
+
+        let mut builder = self.http.post(&url).multipart(form);
+        if !api_key.is_empty() {
+            builder = builder.bearer_auth(api_key);
+        }
+        let resp = builder
+            .send()
+            .await
+            .map_err(|e| SaltError::Network(redact_sensitive_text(&e.to_string())))?;
+        let status = resp.status();
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| SaltError::Network(redact_sensitive_text(&e.to_string())))?;
+        if !status.is_success() {
+            let detail = extract_api_error_message(&body).unwrap_or(body);
+            return Err(SaltError::Network(redact_sensitive_text(&format!(
+                "Whisper HTTP {status}: {detail}"
+            ))));
+        }
+        if let Ok(v) = serde_json::from_str::<Value>(&body) {
+            if let Some(txt) = v.get("text").and_then(Value::as_str) {
+                return Ok(txt.trim().to_string());
+            }
+        }
+        Ok(body.trim().to_string())
+    }
+
+    async fn gemini_generate_inline(
+        &self,
+        provider: &ProviderConfig,
+        api_key: &str,
+        prompt: &str,
+        mime: &str,
+        media_bytes: &[u8],
+    ) -> SaltResult<String> {
+        let base = provider.base_url.trim_end_matches('/');
+        let url = format!("{base}/v1beta/models/{}:generateContent", provider.model);
+        let payload = json!({
+            "contents": [{
+                "role": "user",
+                "parts": [
+                    { "text": prompt },
+                    { "inline_data": { "mime_type": mime, "data": BASE64.encode(media_bytes) } }
+                ]
+            }]
+        });
+        let resp = self
+            .http
+            .post(&url)
+            .header("x-goog-api-key", api_key)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| SaltError::Network(redact_sensitive_text(&e.to_string())))?;
+        let status = resp.status();
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| SaltError::Network(redact_sensitive_text(&e.to_string())))?;
+        if !status.is_success() {
+            let detail = extract_api_error_message(&body).unwrap_or(body);
+            return Err(SaltError::Network(redact_sensitive_text(&format!(
+                "Gemini HTTP {status}: {detail}"
+            ))));
+        }
+        let v: Value = serde_json::from_str(&body)
+            .map_err(|e| SaltError::Network(format!("Invalid Gemini JSON: {e}")))?;
+        let mut acc = String::new();
+        if let Some(parts) = v
+            .get("candidates")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("content"))
+            .and_then(|c| c.get("parts"))
+            .and_then(Value::as_array)
+        {
+            for p in parts {
+                if let Some(t) = p.get("text").and_then(Value::as_str) {
+                    acc.push_str(t);
+                }
+            }
+        }
+        Ok(acc)
+    }
+
+    async fn openai_vision_once(
+        &self,
+        provider: &ProviderConfig,
+        api_key: &str,
+        prompt: &str,
+        webp_bytes: &[u8],
+    ) -> SaltResult<String> {
+        let base = normalize_openai_base_url(&provider.base_url);
+        let url = format!("{base}/chat/completions");
+        let (mime, img_bytes) = convert_webp_to_png(webp_bytes);
+        let b64 = BASE64.encode(&img_bytes);
+        let payload = json!({
+            "model": provider.model,
+            "stream": false,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": prompt },
+                    { "type": "image_url", "image_url": { "url": format!("data:{mime};base64,{b64}") } }
+                ]
+            }]
+        });
+        let mut builder = self.http.post(&url).json(&payload);
+        if !api_key.is_empty() {
+            builder = builder.bearer_auth(api_key);
+        }
+        let resp = builder
+            .send()
+            .await
+            .map_err(|e| SaltError::Network(redact_sensitive_text(&e.to_string())))?;
+        let status = resp.status();
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| SaltError::Network(redact_sensitive_text(&e.to_string())))?;
+        if !status.is_success() {
+            let detail = extract_api_error_message(&body).unwrap_or(body);
+            return Err(SaltError::Network(redact_sensitive_text(&format!(
+                "OpenAI HTTP {status}: {detail}"
+            ))));
+        }
+        extract_openai_non_stream_text(&body)
+            .ok_or_else(|| SaltError::Network("OpenAI returned empty response".into()))
+    }
+
+    async fn anthropic_vision_once(
+        &self,
+        provider: &ProviderConfig,
+        api_key: &str,
+        prompt: &str,
+        webp_bytes: &[u8],
+    ) -> SaltResult<String> {
+        let base = provider.base_url.trim_end_matches('/');
+        let url = if base.ends_with("/v1") {
+            format!("{base}/messages")
+        } else {
+            format!("{base}/v1/messages")
+        };
+        let (mime, img_bytes) = convert_webp_to_png(webp_bytes);
+        let payload = json!({
+            "model": provider.model,
+            "max_tokens": 1024,
+            "stream": false,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": prompt },
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": mime,
+                            "data": BASE64.encode(&img_bytes)
+                        }
+                    }
+                ]
+            }]
+        });
+        let resp = self
+            .http
+            .post(&url)
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01")
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| SaltError::Network(redact_sensitive_text(&e.to_string())))?;
+        let status = resp.status();
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| SaltError::Network(redact_sensitive_text(&e.to_string())))?;
+        if !status.is_success() {
+            let detail = extract_api_error_message(&body).unwrap_or(body);
+            return Err(SaltError::Network(redact_sensitive_text(&format!(
+                "Anthropic HTTP {status}: {detail}"
+            ))));
+        }
+        let v: Value = serde_json::from_str(&body)
+            .map_err(|e| SaltError::Network(format!("Invalid Anthropic JSON: {e}")))?;
+        let mut acc = String::new();
+        if let Some(arr) = v.get("content").and_then(Value::as_array) {
+            for block in arr {
+                if let Some(t) = block.get("text").and_then(Value::as_str) {
+                    acc.push_str(t);
+                }
+            }
+        }
+        Ok(acc)
+    }
+
+    async fn simple_text_completion(
+        &self,
+        provider: &ProviderConfig,
+        api_key: &str,
+        prompt: &str,
+    ) -> SaltResult<String> {
+        match provider.kind {
+            AiProviderKind::Gemini => {
+                let base = provider.base_url.trim_end_matches('/');
+                let url = format!("{base}/v1beta/models/{}:generateContent", provider.model);
+                let payload = json!({
+                    "contents": [{ "role": "user", "parts": [{ "text": prompt }] }]
+                });
+                let resp = self
+                    .http
+                    .post(&url)
+                    .header("x-goog-api-key", api_key)
+                    .json(&payload)
+                    .send()
+                    .await
+                    .map_err(|e| SaltError::Network(redact_sensitive_text(&e.to_string())))?;
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                if !status.is_success() {
+                    return Err(SaltError::Network(format!("Gemini HTTP {status}")));
+                }
+                let v: Value = serde_json::from_str(&body)
+                    .map_err(|e| SaltError::Network(e.to_string()))?;
+                let text = v
+                    .get("candidates")
+                    .and_then(|c| c.get(0))
+                    .and_then(|c| c.get("content"))
+                    .and_then(|c| c.get("parts"))
+                    .and_then(|p| p.get(0))
+                    .and_then(|p| p.get("text"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                Ok(text)
+            }
+            AiProviderKind::Anthropic => {
+                let base = provider.base_url.trim_end_matches('/');
+                let url = if base.ends_with("/v1") {
+                    format!("{base}/messages")
+                } else {
+                    format!("{base}/v1/messages")
+                };
+                let payload = json!({
+                    "model": provider.model,
+                    "max_tokens": 512,
+                    "stream": false,
+                    "messages": [{ "role": "user", "content": prompt }]
+                });
+                let resp = self
+                    .http
+                    .post(&url)
+                    .header("x-api-key", api_key)
+                    .header("anthropic-version", "2023-06-01")
+                    .json(&payload)
+                    .send()
+                    .await
+                    .map_err(|e| SaltError::Network(redact_sensitive_text(&e.to_string())))?;
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                if !status.is_success() {
+                    return Err(SaltError::Network(format!("Anthropic HTTP {status}")));
+                }
+                let v: Value = serde_json::from_str(&body)
+                    .map_err(|e| SaltError::Network(e.to_string()))?;
+                let text = v
+                    .get("content")
+                    .and_then(|c| c.get(0))
+                    .and_then(|c| c.get("text"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                Ok(text)
+            }
+            AiProviderKind::OpenAiCompatible | AiProviderKind::OllamaLocal => {
+                let base = normalize_openai_base_url(&provider.base_url);
+                let url = format!("{base}/chat/completions");
+                let payload = json!({
+                    "model": provider.model,
+                    "stream": false,
+                    "messages": [{ "role": "user", "content": prompt }]
+                });
+                let mut builder = self.http.post(&url).json(&payload);
+                if !api_key.is_empty() {
+                    builder = builder.bearer_auth(api_key);
+                }
+                let resp = builder
+                    .send()
+                    .await
+                    .map_err(|e| SaltError::Network(redact_sensitive_text(&e.to_string())))?;
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                if !status.is_success() {
+                    return Err(SaltError::Network(format!("OpenAI HTTP {status}")));
+                }
+                extract_openai_non_stream_text(&body)
+                    .ok_or_else(|| SaltError::Network("Empty completion response".into()))
+            }
+        }
+    }
+}
+
+fn audio_mime_for_ext(ext: &str) -> &'static str {
+    match ext.trim().trim_start_matches('.').to_ascii_lowercase().as_str() {
+        "opus" => "audio/ogg",
+        "ogg" => "audio/ogg",
+        "m4a" | "mp4" => "audio/mp4",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "webm" => "audio/webm",
+        _ => "audio/ogg",
+    }
+}
+
+pub fn parse_enrichment_json(raw: &str, expect_transcript: bool) -> InboxEnrichmentOutput {
+    let trimmed = raw.trim();
+    let candidate = if let (Some(s), Some(e)) = (trimmed.find('{'), trimmed.rfind('}')) {
+        if e > s {
+            &trimmed[s..=e]
+        } else {
+            trimmed
+        }
+    } else {
+        trimmed
+    };
+
+    if let Ok(v) = serde_json::from_str::<Value>(candidate) {
+        let transcript_text = v
+            .get("transcript_text")
+            .and_then(Value::as_str)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let summary_text = v
+            .get("summary_text")
+            .and_then(Value::as_str)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let auto_tags = v
+            .get("auto_tags")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(Value::as_str)
+                    .map(|s| s.trim().trim_start_matches('#').to_string())
+                    .filter(|s| !s.is_empty())
+                    .take(5)
+                    .collect()
+            })
+            .unwrap_or_default();
+        return InboxEnrichmentOutput {
+            transcript_text,
+            summary_text,
+            auto_tags,
+        };
+    }
+
+    if trimmed.is_empty() {
+        InboxEnrichmentOutput::default()
+    } else if expect_transcript {
+        InboxEnrichmentOutput {
+            transcript_text: Some(trimmed.to_string()),
+            summary_text: None,
+            auto_tags: Vec::new(),
+        }
+    } else {
+        InboxEnrichmentOutput {
+            transcript_text: None,
+            summary_text: Some(trimmed.to_string()),
+            auto_tags: Vec::new(),
+        }
+    }
 }
 
 fn process_openai_sse_line(
@@ -1144,5 +1693,36 @@ mod tests {
         assert!(!ocr_sys.contains("Language requirement: Write the entire response in English"));
         assert!(!ocr_user.contains("Unrelated note body"));
         assert!(ocr_user.contains("verbatim"));
+    }
+
+    #[tokio::test]
+    async fn private_inbox_item_blocks_cloud_audio_and_vision_endpoints() {
+        let router = SaltRouter::new(Arc::new(DummySecrets)).unwrap();
+        let gemini_cloud = ProviderConfig {
+            id: "gemini-byok".into(),
+            name: "Gemini".into(),
+            kind: AiProviderKind::Gemini,
+            base_url: "https://generativelanguage.googleapis.com".into(),
+            model: "gemini-2.5-flash".into(),
+            api_key_ref: "vault://gemini_api_key".into(),
+        };
+        let voice_req = InboxEnrichmentRequest {
+            is_private: true,
+            kind: InboxKind::VoiceMemo,
+            text_note: None,
+            media_bytes: Some(vec![1, 2, 3, 4]),
+            media_ext: Some("ogg".into()),
+            output_language: Some("zh-CN".into()),
+        };
+        let res = router.enrich_inbox_item(&gemini_cloud, None, &voice_req).await;
+        assert!(matches!(res, Err(SaltError::PrivacyBlocked { .. })));
+
+        let parsed = parse_enrichment_json(
+            "```json\n{\"transcript_text\":\"格林公式\",\"summary_text\":\"曲线积分转化\",\"auto_tags\":[\"#高数\",\"微积分\"]}\n```",
+            true,
+        );
+        assert_eq!(parsed.transcript_text.as_deref(), Some("格林公式"));
+        assert_eq!(parsed.summary_text.as_deref(), Some("曲线积分转化"));
+        assert_eq!(parsed.auto_tags, vec!["高数", "微积分"]);
     }
 }

@@ -165,4 +165,55 @@ class SaltUiComponentsTest {
         assertEquals("API Key", zhStrings.apiKeyLabel)
         assertEquals("局域网同步", zhStrings.lanSyncTitle)
     }
+
+    @Test
+    fun v02LocalizedStringsCoverAllLanguages() {
+        val languages = listOf(
+            AppLanguage.ZhCn,
+            AppLanguage.ZhTw,
+            AppLanguage.En,
+            AppLanguage.Ja,
+            AppLanguage.Ko,
+        )
+        languages.forEach { lang ->
+            val s = stringsFor(lang)
+            val required = listOf(
+                s.navInbox,
+                s.hubTitle,
+                s.hubMicroReviewTitle,
+                s.capturePhoto,
+                s.captureVoice,
+                s.captureText,
+                s.inboxTitle,
+                s.saltTrayTitle,
+                s.insertIntoPage,
+                s.haloExtractPromptTitle,
+                s.microSessionRescueMode,
+                s.microSessionGeekSwipe,
+                s.microSessionSwipeHint,
+                s.microSessionCompleteTitle,
+                s.slicePreviewTitle,
+                s.enterFullPage,
+                s.compactCanvasPreviewHint,
+                s.compactMarkdownEdit,
+                s.meteredNetworkWarning,
+                s.unmeteredNetworkBanner,
+                s.deferredAssetsPrefix,
+                s.defaultAudioLabel,
+                s.defaultAudioChip,
+                s.saltRelayTitle,
+                s.localWhisperUrlLabel,
+                s.relayBadgeLabel,
+                s.micPermissionPrompt,
+                s.grantMicPermission,
+            )
+            assertTrue(
+                required.all { it.isNotBlank() },
+                "All v0.2 strings must be non-blank for language $lang",
+            )
+        }
+        assertEquals("Inbox", stringsFor(AppLanguage.En).navInbox)
+        assertEquals("盐池", stringsFor(AppLanguage.ZhCn).navInbox)
+        assertEquals("鹽池", stringsFor(AppLanguage.ZhTw).navInbox)
+    }
 }

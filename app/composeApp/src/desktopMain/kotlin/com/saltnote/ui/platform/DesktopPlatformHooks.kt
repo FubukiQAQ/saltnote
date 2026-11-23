@@ -5,13 +5,23 @@ import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.Lock
+import androidx.compose.material.icons.rounded.LockOpen
+import androidx.compose.material.icons.rounded.PhotoLibrary
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -21,6 +31,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
@@ -44,13 +55,21 @@ import com.google.zxing.RGBLuminanceSource
 import com.google.zxing.common.HybridBinarizer
 import com.saltnote.bridge.SaltNoteClient
 import com.saltnote.bridge.StrokeSample
+import com.saltnote.ui.components.SaltFilterChip
 import com.saltnote.ui.components.StrokeGeometry
 import com.saltnote.ui.i18n.LocalSaltStrings
 import com.saltnote.ui.i18n.SaltStrings
+import org.jetbrains.skia.Canvas as SkiaCanvas
+import org.jetbrains.skia.EncodedImageFormat
 import org.jetbrains.skia.Image as SkiaImage
+import org.jetbrains.skia.Rect as SkiaRect
+import org.jetbrains.skia.Surface as SkiaSurface
+import java.awt.Desktop
 import java.awt.Toolkit
 import java.awt.datatransfer.DataFlavor
 import java.awt.datatransfer.StringSelection
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.net.InetAddress
 import java.time.Instant
@@ -58,9 +77,18 @@ import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.Locale
 import javax.imageio.ImageIO
+import javax.sound.sampled.AudioFileFormat
+import javax.sound.sampled.AudioFormat
+import javax.sound.sampled.AudioSystem
+import javax.sound.sampled.Clip
+import javax.sound.sampled.DataLine
+import javax.sound.sampled.LineEvent
+import javax.sound.sampled.TargetDataLine
 import javax.swing.JFileChooser
 import javax.swing.filechooser.FileNameExtensionFilter
+import kotlin.concurrent.thread
 import kotlin.math.hypot
+import kotlin.math.roundToInt
 
 private fun saltNoteDesktopConfigDir(): File {
     val os = (System.getProperty("os.name") ?: "").lowercase()
@@ -111,6 +139,12 @@ actual fun loadImageBitmapFromVault(vaultPath: String, relPath: String): ImageBi
         val bytes = file.readBytes()
         SkiaImage.makeFromEncoded(bytes).toComposeImageBitmap()
     }.getOrNull()
+}
+
+actual fun readVaultAssetBytes(vaultPath: String, relPath: String): ByteArray? {
+    val file = File(vaultPath, relPath)
+    if (!file.isFile) return null
+    return runCatching { file.readBytes() }.getOrNull()
 }
 
 actual fun pickLocalImageBytes(): ByteArray? {
@@ -193,6 +227,256 @@ actual fun readTextFromClipboard(): String? = runCatching {
 }.getOrNull()
 
 actual fun supportsLiveCameraQrScan(): Boolean = false
+
+actual fun supportsInboxCameraCapture(): Boolean = false
+
+actual fun hasMicrophonePermission(): Boolean = true
+
+actual fun requestMicrophonePermission(onResult: (Boolean) -> Unit) {
+    onResult(true)
+}
+
+actual fun isNetworkMetered(): Boolean = false
+
+actual fun observeNetworkMetered(onChange: (Boolean) -> Unit): () -> Unit {
+    onChange(false)
+    return {}
+}
+
+actual fun startVoiceRecording(onError: (String) -> Unit): PlatformVoiceRecorderSession? {
+    return runCatching {
+        val format = AudioFormat(16_000f, 16, 1, true, false)
+        val info = DataLine.Info(TargetDataLine::class.java, format)
+        if (!AudioSystem.isLineSupported(info)) {
+            onError("No supported microphone input found on desktop")
+            return null
+        }
+        val line = (AudioSystem.getLine(info) as TargetDataLine).apply {
+            open(format)
+            start()
+        }
+        val startedAtMs = System.currentTimeMillis()
+        val pcmBuffer = ByteArrayOutputStream()
+        val stopped = java.util.concurrent.atomic.AtomicBoolean(false)
+        val worker = thread(isDaemon = true, name = "saltnote-desktop-rec") {
+            val buf = ByteArray(4096)
+            while (!stopped.get()) {
+                val n = runCatching { line.read(buf, 0, buf.size) }.getOrDefault(-1)
+                if (n > 0) {
+                    synchronized(pcmBuffer) { pcmBuffer.write(buf, 0, n) }
+                }
+            }
+        }
+        object : PlatformVoiceRecorderSession {
+            override fun stopAndRead(): RecordedAudioClip? {
+                stopped.set(true)
+                runCatching {
+                    line.stop()
+                    line.close()
+                }
+                runCatching { worker.join(500) }
+                val pcmBytes = synchronized(pcmBuffer) { pcmBuffer.toByteArray() }
+                if (pcmBytes.isEmpty()) return null
+                val wavOut = ByteArrayOutputStream()
+                val ais = javax.sound.sampled.AudioInputStream(
+                    ByteArrayInputStream(pcmBytes),
+                    format,
+                    (pcmBytes.size / format.frameSize).toLong(),
+                )
+                AudioSystem.write(ais, AudioFileFormat.Type.WAVE, wavOut)
+                val durationMs = (System.currentTimeMillis() - startedAtMs).coerceAtLeast(100L).toInt()
+                return RecordedAudioClip(wavOut.toByteArray(), "wav", durationMs)
+            }
+
+            override fun cancel() {
+                stopped.set(true)
+                runCatching {
+                    line.stop()
+                    line.close()
+                }
+            }
+        }
+    }.getOrElse { err ->
+        onError(err.message ?: "Failed to start microphone")
+        null
+    }
+}
+
+actual fun playVaultAudio(
+    vaultPath: String,
+    relPath: String,
+    onCompleted: () -> Unit,
+    onError: (String) -> Unit,
+): PlatformAudioPlaybackHandle? {
+    val file = File(vaultPath, relPath)
+    if (!file.exists()) {
+        onError("Audio file not found: $relPath")
+        return null
+    }
+    if (file.extension.equals("wav", ignoreCase = true) ||
+        file.extension.equals("aiff", ignoreCase = true)
+    ) {
+        return runCatching {
+            val stream = AudioSystem.getAudioInputStream(file)
+            val clip: Clip = AudioSystem.getClip().apply {
+                open(stream)
+                addLineListener { ev ->
+                    if (ev.type == LineEvent.Type.STOP && microsecondPosition >= microsecondLength - 10_000) {
+                        close()
+                        onCompleted()
+                    }
+                }
+                start()
+            }
+            object : PlatformAudioPlaybackHandle {
+                override fun isPlaying(): Boolean = clip.isRunning
+                override fun pause() {
+                    if (clip.isRunning) clip.stop()
+                }
+                override fun resume() {
+                    if (!clip.isRunning) clip.start()
+                }
+                override fun stop() {
+                    runCatching {
+                        clip.stop()
+                        clip.close()
+                    }
+                }
+            }
+        }.getOrElse {
+            openWithSystemPlayer(file, onCompleted, onError)
+            null
+        }
+    }
+    // Option 2.A: Lightweight OS media handoff for .opus/.ogg/.m4a on Desktop (zero C-toolchain bloat)
+    openWithSystemPlayer(file, onCompleted, onError)
+    return null
+}
+
+private fun openWithSystemPlayer(
+    file: File,
+    onCompleted: () -> Unit,
+    onError: (String) -> Unit,
+) {
+    runCatching {
+        if (Desktop.isDesktopSupported()) {
+            Desktop.getDesktop().open(file)
+            onCompleted()
+        } else {
+            onError("Desktop media opener not supported on this OS")
+        }
+    }.onFailure { err ->
+        onError(err.message ?: "Failed to open audio file")
+    }
+}
+
+private fun encodeSkiaWebpScaled(rawBytes: ByteArray, maxLongEdge: Int, quality: Int): ByteArray? = runCatching {
+    val src = SkiaImage.makeFromEncoded(rawBytes)
+    val srcW = src.width.coerceAtLeast(1)
+    val srcH = src.height.coerceAtLeast(1)
+    val longEdge = maxOf(srcW, srcH)
+    val scale = if (longEdge > maxLongEdge) maxLongEdge.toFloat() / longEdge.toFloat() else 1f
+    val dstW = (srcW * scale).roundToInt().coerceAtLeast(1)
+    val dstH = (srcH * scale).roundToInt().coerceAtLeast(1)
+    val surface = SkiaSurface.makeRasterN32Premul(dstW, dstH)
+    val canvas: SkiaCanvas = surface.canvas
+    canvas.drawImageRect(
+        src,
+        SkiaRect.makeWH(srcW.toFloat(), srcH.toFloat()),
+        SkiaRect.makeWH(dstW.toFloat(), dstH.toFloat()),
+    )
+    val snapshot = surface.makeImageSnapshot()
+    snapshot.encodeToData(EncodedImageFormat.WEBP, quality)?.bytes
+}.getOrNull()
+
+@Composable
+actual fun PlatformInboxCameraCaptureDialog(
+    initialPrivate: Boolean,
+    onCaptured: (primaryWebp: ByteArray, thumbWebp: ByteArray, isPrivate: Boolean, noteText: String?) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val strings = LocalSaltStrings.current
+    var isBoardMode by remember { mutableStateOf(true) }
+    var isPrivate by remember { mutableStateOf(initialPrivate) }
+    var noteText by remember { mutableStateOf("") }
+    var pickedBytes by remember { mutableStateOf<ByteArray?>(null) }
+    var errorText by remember { mutableStateOf<String?>(null) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(strings.capturePhoto) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    SaltFilterChip(
+                        selected = isBoardMode,
+                        onClick = { isBoardMode = true },
+                        label = { Text(strings.cameraModeBoard) },
+                    )
+                    SaltFilterChip(
+                        selected = !isBoardMode,
+                        onClick = { isBoardMode = false },
+                        label = { Text(strings.cameraModeJournal) },
+                    )
+                }
+                FilledTonalButton(
+                    onClick = {
+                        val bytes = pickLocalImageBytes()
+                        if (bytes != null) {
+                            pickedBytes = bytes
+                            errorText = null
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Icon(Icons.Rounded.PhotoLibrary, null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text(if (pickedBytes == null) strings.insertImageDesc else "${strings.insertImageDesc} ✓")
+                }
+                OutlinedTextField(
+                    value = noteText,
+                    onValueChange = { noteText = it },
+                    label = { Text(strings.captureText) },
+                    singleLine = false,
+                    maxLines = 3,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        imageVector = if (isPrivate) Icons.Rounded.Lock else Icons.Rounded.LockOpen,
+                        contentDescription = null,
+                        modifier = Modifier.size(16.dp),
+                    )
+                    Spacer(Modifier.width(6.dp))
+                    Text(strings.privateLabel, modifier = Modifier.weight(1f))
+                    Switch(checked = isPrivate, onCheckedChange = { isPrivate = it })
+                }
+                if (errorText != null) {
+                    Text(errorText!!, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                enabled = pickedBytes != null,
+                onClick = {
+                    val raw = pickedBytes ?: return@Button
+                    val maxEdge = if (isBoardMode) 1600 else 1280
+                    val primary = encodeSkiaWebpScaled(raw, maxEdge, 82)
+                    val thumb = encodeSkiaWebpScaled(raw, 320, 75)
+                    if (primary != null && thumb != null) {
+                        onCaptured(primary, thumb, isPrivate, noteText.trim().ifBlank { null })
+                    } else {
+                        errorText = "Failed to encode WebP image"
+                    }
+                },
+            ) { Text(strings.save) }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text(strings.cancel) }
+        },
+    )
+}
 
 private fun decodeQrFromImageFile(file: File): String? = runCatching {
     val img = ImageIO.read(file) ?: return null

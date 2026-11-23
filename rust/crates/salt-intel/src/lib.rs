@@ -1,10 +1,11 @@
 use fsrs::{MemoryState, DEFAULT_PARAMETERS, FSRS};
 use parking_lot::Mutex;
 use rusqlite::{params, Connection};
+use salt_canvas::extract_markdown_context;
 use salt_crdt::{DocChangeEvent, VaultStore};
 use salt_types::{
-    now_utc_ms, FlashCard, FsrsCardState, PageMeta, ReviewLog, ReviewRating, SaltError, SaltResult,
-    SearchHit,
+    new_ulid, now_utc_ms, FlashCard, FsrsCardState, MicroSessionPlan, PageMeta, PageSnapshot,
+    ReviewCardView, ReviewLog, ReviewRating, SaltError, SaltResult, SearchHit,
 };
 use std::collections::HashMap;
 use std::path::Path;
@@ -132,6 +133,7 @@ impl IntelEngine {
                     }) => {
                         let _ = engine.replay_and_store_fsrs(&cards, &review_logs);
                     }
+                    Ok(DocChangeEvent::InboxUpdated) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         let _ = engine.rebuild_from_vault(&vault);
                     }
@@ -371,6 +373,197 @@ impl IntelEngine {
         Self::collect_cards(stmt.query_map([], Self::map_card_row))
     }
 
+    /// Builds an anti-frustration time-boxed FSRS micro-review session (v0.2-alpha Section 3.1).
+    pub fn build_micro_review_plan(
+        &self,
+        vault: &VaultStore,
+        budget_seconds: u32,
+        energy_level: u8,
+        rescue_mode: bool,
+        as_of_utc_ms: Option<i64>,
+    ) -> SaltResult<MicroSessionPlan> {
+        let now = as_of_utc_ms.unwrap_or_else(now_utc_ms);
+        let budget = if budget_seconds == 0 {
+            300
+        } else {
+            budget_seconds.clamp(60, 1800)
+        };
+        let (_, all_logs) = vault.get_all_cards_and_logs();
+        let avg_card_secs = estimate_avg_card_duration_secs(&all_logs);
+        let target_count = (budget / avg_card_secs.max(1)).clamp(5, 30) as usize;
+
+        let due = self.list_due_cards(Some(now))?;
+        let total_due_count = due.len() as u32;
+        if due.is_empty() {
+            return Ok(MicroSessionPlan {
+                session_id: format!("msess_{}", new_ulid()),
+                budget_seconds: budget,
+                estimated_seconds: 0,
+                cards: Vec::new(),
+                total_due_count: 0,
+            });
+        }
+
+        let mut page_cache: HashMap<String, Option<PageSnapshot>> = HashMap::new();
+        let mut views: Vec<ReviewCardView> = Vec::with_capacity(due.len());
+        for card in due {
+            let snap_opt = page_cache
+                .entry(card.page_id.clone())
+                .or_insert_with(|| vault.get_page_snapshot(&card.page_id).ok())
+                .as_ref();
+            let source_page_title = snap_opt
+                .map(|s| s.meta.title.clone())
+                .unwrap_or_else(|| "SaltNote".into());
+
+            let halo_opt = snap_opt.and_then(|snap| {
+                card.anchor_halo_id
+                    .as_deref()
+                    .and_then(|hid| snap.halos.iter().find(|h| h.halo_id == hid))
+            });
+
+            let slice_asset_path = halo_opt.and_then(|h| {
+                h.slice_asset_rel_path
+                    .clone()
+                    .filter(|p| !p.is_empty())
+                    .or_else(|| {
+                        h.slice_cache_path
+                            .clone()
+                            .filter(|p| !p.is_empty() && Path::new(p).exists())
+                    })
+            });
+
+            let context_excerpt = snap_opt.and_then(|snap| {
+                if let Some(halo) = halo_opt {
+                    if !halo.context_excerpt.trim().is_empty() {
+                        return Some(halo.context_excerpt.clone());
+                    }
+                    let ctx = extract_markdown_context(
+                        &snap.body_markdown,
+                        halo.anchor_text_offset.map(|o| o as usize),
+                    );
+                    if ctx.trim().is_empty() {
+                        None
+                    } else {
+                        Some(ctx)
+                    }
+                } else {
+                    let trimmed = snap.body_markdown.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed.chars().take(240).collect())
+                    }
+                }
+            });
+
+            let retrievability = compute_retrievability(card.stability, card.last_review_utc, now);
+            views.push(ReviewCardView {
+                card_id: card.card_id,
+                page_id: card.page_id,
+                anchor_halo_id: card.anchor_halo_id,
+                front: card.front,
+                back: card.back,
+                stability: card.stability,
+                difficulty: card.difficulty,
+                reps: card.reps,
+                lapses: card.lapses,
+                state: card.state,
+                last_review_utc: card.last_review_utc,
+                due_at_utc: card.due_at_utc,
+                retrievability,
+                source_page_title,
+                slice_asset_path,
+                context_excerpt,
+            });
+        }
+
+        let mut critical_rescue: Vec<ReviewCardView> = Vec::new();
+        let mut standard_due: Vec<ReviewCardView> = Vec::new();
+        let mut deep_forgotten: Vec<ReviewCardView> = Vec::new();
+
+        for v in views {
+            if v.reps > 0 && v.retrievability >= 0.70 && v.retrievability <= 0.90 {
+                critical_rescue.push(v);
+            } else if v.reps > 0 && v.retrievability < 0.50 {
+                deep_forgotten.push(v);
+            } else {
+                standard_due.push(v);
+            }
+        }
+
+        critical_rescue.sort_by(|a, b| {
+            a.retrievability
+                .partial_cmp(&b.retrievability)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.due_at_utc.cmp(&b.due_at_utc))
+        });
+        standard_due.sort_by(|a, b| a.due_at_utc.cmp(&b.due_at_utc));
+        deep_forgotten.sort_by(|a, b| {
+            b.retrievability
+                .partial_cmp(&a.retrievability)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.due_at_utc.cmp(&b.due_at_utc))
+        });
+
+        let prioritize_rescue = rescue_mode || energy_level <= 2;
+        let max_deep = (target_count as f64 * 0.20).floor() as usize;
+        let mut selected: Vec<ReviewCardView> = Vec::with_capacity(target_count);
+
+        if prioritize_rescue {
+            for item in critical_rescue.into_iter() {
+                if selected.len() >= target_count {
+                    break;
+                }
+                selected.push(item);
+            }
+            for item in standard_due.into_iter() {
+                if selected.len() >= target_count {
+                    break;
+                }
+                selected.push(item);
+            }
+        } else {
+            let mut merged = critical_rescue;
+            merged.extend(standard_due);
+            merged.sort_by(|a, b| a.due_at_utc.cmp(&b.due_at_utc));
+            for item in merged.into_iter() {
+                if selected.len() >= target_count {
+                    break;
+                }
+                selected.push(item);
+            }
+        }
+
+        let mut deep_used = 0usize;
+        let mut remaining_deep = Vec::new();
+        for item in deep_forgotten {
+            if selected.len() < target_count && deep_used < max_deep {
+                selected.push(item);
+                deep_used += 1;
+            } else {
+                remaining_deep.push(item);
+            }
+        }
+
+        // If non-deep cards were fewer than minimum viable session (5), top up from remaining_deep
+        let min_viable = 5.min(total_due_count as usize);
+        for item in remaining_deep {
+            if selected.len() >= min_viable {
+                break;
+            }
+            selected.push(item);
+        }
+
+        let estimated_seconds = (selected.len() as u32) * avg_card_secs;
+        Ok(MicroSessionPlan {
+            session_id: format!("msess_{}", new_ulid()),
+            budget_seconds: budget,
+            estimated_seconds,
+            cards: selected,
+            total_due_count,
+        })
+    }
+
     fn map_card_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FsrsCardState> {
         Ok(FsrsCardState {
             card_id: row.get(0)?,
@@ -509,6 +702,38 @@ pub fn compute_fsrs_state_for_card(
         last_review_utc,
         due_at_utc,
     })
+}
+
+/// Computes FSRS memory retrievability $R(t, S) = (1 + (19/81) * (t/S))^{-0.5}$.
+pub fn compute_retrievability(
+    stability: f64,
+    last_review_utc: Option<i64>,
+    now_utc_ms: i64,
+) -> f64 {
+    let Some(last) = last_review_utc else {
+        return 0.0;
+    };
+    if stability <= 0.0 {
+        return 0.0;
+    }
+    let elapsed_days = ((now_utc_ms - last).max(0) as f64) / MS_PER_DAY;
+    (1.0 + (19.0 / 81.0) * (elapsed_days / stability)).powf(-0.5)
+}
+
+/// Estimates recent per-card review time in seconds (cold-start default = 18s).
+pub fn estimate_avg_card_duration_secs(logs: &[ReviewLog]) -> u32 {
+    let mut recent: Vec<&ReviewLog> = logs.iter().filter(|l| l.duration_ms > 0).collect();
+    if recent.is_empty() {
+        return 18;
+    }
+    recent.sort_by(|a, b| b.reviewed_at_utc.cmp(&a.reviewed_at_utc));
+    recent.truncate(50);
+    let total_ms: u64 = recent
+        .iter()
+        .map(|l| (l.duration_ms as u64).clamp(2_000, 120_000))
+        .sum();
+    let avg_secs = ((total_ms as f64 / recent.len() as f64) / 1000.0).round() as u32;
+    avg_secs.clamp(5, 90)
 }
 
 // ============================================================================
@@ -695,5 +920,86 @@ mod tests {
         assert!(engine.search("量子", 10).unwrap().is_empty());
 
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn micro_session_time_budget_and_critical_rescue_sorting() {
+        let base = std::env::temp_dir().join(format!("saltnote_micro_{}", new_ulid()));
+        let vault = VaultStore::open(&base, Some("Phone".into())).unwrap();
+        let engine = IntelEngine::open(vault.paths().sqlite_path()).unwrap();
+        let page = vault
+            .create_page("高数", PageMode::Study, false, vec![], "# 微积分\n\n格林公式例题")
+            .unwrap();
+
+        let now = 1_760_000_000_000_i64;
+        // 1. Cold start default = 18s => 300s / 18s = 16 cards; 180s / 18s = 10 cards
+        for i in 0..12 {
+            let card = FlashCard {
+                card_id: format!("c_rescue_{i}"),
+                page_id: page.page_id.clone(),
+                anchor_halo_id: None,
+                front: format!("Q rescue {i}"),
+                back: format!("A rescue {i}"),
+                created_at_utc: now - 20 * 86_400_000,
+                archived: false,
+            };
+            vault.upsert_card(&card).unwrap();
+            vault
+                .append_review_log(
+                    &page.page_id,
+                    &ReviewLog {
+                        log_id: format!("l_r_{i}"),
+                        card_id: card.card_id,
+                        rating: ReviewRating::Good,
+                        reviewed_at_utc: now - 5 * 86_400_000, // ~5 days ago => R in [0.70, 0.90]
+                        duration_ms: 0, // zero duration keeps cold-start 18s for first check
+                        device_id: "phone".into(),
+                    },
+                )
+                .unwrap();
+        }
+        // Deep forgotten cards (R < 0.50)
+        for i in 0..8 {
+            let card = FlashCard {
+                card_id: format!("c_deep_{i}"),
+                page_id: page.page_id.clone(),
+                anchor_halo_id: None,
+                front: format!("Q deep {i}"),
+                back: format!("A deep {i}"),
+                created_at_utc: now - 120 * 86_400_000,
+                archived: false,
+            };
+            vault.upsert_card(&card).unwrap();
+            vault
+                .append_review_log(
+                    &page.page_id,
+                    &ReviewLog {
+                        log_id: format!("l_d_{i}"),
+                        card_id: card.card_id,
+                        rating: ReviewRating::Again,
+                        reviewed_at_utc: now - 60 * 86_400_000, // R << 0.50
+                        duration_ms: 0,
+                        device_id: "phone".into(),
+                    },
+                )
+                .unwrap();
+        }
+
+        engine.rebuild_from_vault(&vault).unwrap();
+        let plan = engine
+            .build_micro_review_plan(&vault, 300, 1, true, Some(now))
+            .unwrap();
+        // 300 / 18 = 16 target; 12 rescue + max 20% of 16 (=3) deep = 15 cards
+        assert_eq!(plan.total_due_count, 20);
+        assert_eq!(plan.cards.len(), 15);
+        assert!(plan.cards[0].retrievability >= 0.70 && plan.cards[0].retrievability <= 0.90);
+        let deep_in_plan = plan
+            .cards
+            .iter()
+            .filter(|c| c.card_id.starts_with("c_deep_"))
+            .count();
+        assert!(deep_in_plan <= 3, "Deep forgotten cards capped at <=20%");
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

@@ -6,12 +6,19 @@ use salt_canvas::{
 };
 use salt_crdt::VaultStore;
 use salt_intel::IntelEngine;
-use salt_router::{parse_flashcard_drafts, HaloInferenceRequest, SaltRouter, SecretResolver, StreamSink};
-use salt_sync::{BackoffSchedule, LanP2pNode, WebDavSyncClient};
+use salt_router::{
+    parse_flashcard_drafts, HaloInferenceRequest, InboxEnrichmentRequest, SaltRouter,
+    SecretResolver, StreamSink,
+};
+use salt_sync::{
+    BackoffSchedule, LanP2pNode, RelayEnrichRequest, SaltRelayHandler, WebDavSyncClient,
+};
 use salt_types::{
-    decode_raw_points_le, new_ulid, now_utc_ms, redact_sensitive_text, BrushKind, CanvasImageNode,
-    CanvasSnapshot, FlashCard, HaloAnnotation, PageMode, RectF, ReviewLog, ReviewRating,
-    RouterConfig, SaltError, SaltResult, StrokeTransform, VisionPolicy, WebDavConfig,
+    content_addressed_asset_rel_path, decode_raw_points_le, is_local_or_rfc1918_endpoint,
+    new_ulid, now_utc_ms, redact_sensitive_text, AiProviderKind, BrushKind, CanvasImageNode,
+    CanvasSnapshot, FlashCard, HaloAnnotation, InboxItem, PageMode, ProviderConfig, RectF,
+    ReviewLog, ReviewRating, RouterConfig, SaltError, SaltResult, StrokeTransform,
+    SyncNetworkPolicy, TranscriptStatus, VisionPolicy, WebDavConfig,
 };
 use serde::Serialize;
 use std::collections::HashMap;
@@ -154,6 +161,260 @@ struct StrokeIngestResponse {
     render_stroke: salt_types::RenderStroke,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum InboxKind {
+    QuickText,
+    PhotoNote,
+    VoiceMemo,
+    WebClip,
+}
+
+impl From<InboxKind> for salt_types::InboxKind {
+    fn from(v: InboxKind) -> Self {
+        match v {
+            InboxKind::QuickText => salt_types::InboxKind::QuickText,
+            InboxKind::PhotoNote => salt_types::InboxKind::PhotoNote,
+            InboxKind::VoiceMemo => salt_types::InboxKind::VoiceMemo,
+            InboxKind::WebClip => salt_types::InboxKind::WebClip,
+        }
+    }
+}
+
+impl From<salt_types::InboxKind> for InboxKind {
+    fn from(v: salt_types::InboxKind) -> Self {
+        match v {
+            salt_types::InboxKind::QuickText => InboxKind::QuickText,
+            salt_types::InboxKind::PhotoNote => InboxKind::PhotoNote,
+            salt_types::InboxKind::VoiceMemo => InboxKind::VoiceMemo,
+            salt_types::InboxKind::WebClip => InboxKind::WebClip,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct InboxCaptureInput {
+    pub kind: InboxKind,
+    pub text_note: Option<String>,
+    pub primary_media_bytes: Option<Vec<u8>>,
+    pub primary_media_ext: Option<String>,
+    pub thumb_webp_bytes: Option<Vec<u8>>,
+    pub audio_duration_ms: u32,
+    pub is_private: bool,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct InboxItemView {
+    pub inbox_id: String,
+    pub kind: InboxKind,
+    pub created_at_utc: i64,
+    pub is_private: bool,
+    pub state: String,
+    pub text_note: Option<String>,
+    pub transcript_text: Option<String>,
+    pub summary_text: Option<String>,
+    pub auto_tags: Vec<String>,
+    pub transcript_status: String,
+    pub thumb_asset_path: Option<String>,
+    pub primary_asset_path: Option<String>,
+    pub audio_duration_ms: u32,
+    pub consumed_page_id: Option<String>,
+    pub consumed_block_id: Option<String>,
+}
+
+impl From<InboxItem> for InboxItemView {
+    fn from(it: InboxItem) -> Self {
+        let primary_asset_path = match it.kind {
+            salt_types::InboxKind::VoiceMemo => it.payload.audio_asset_rel_path,
+            _ => it.payload.image_asset_rel_path,
+        };
+        Self {
+            inbox_id: it.inbox_id,
+            kind: it.kind.into(),
+            created_at_utc: it.created_at_utc,
+            is_private: it.is_private,
+            state: it.state.as_str().to_string(),
+            text_note: it.payload.text_note,
+            transcript_text: it.ai_enrichment.transcript_text,
+            summary_text: it.ai_enrichment.summary_text,
+            auto_tags: it.ai_enrichment.auto_tags,
+            transcript_status: it.ai_enrichment.transcript_status.as_str().to_string(),
+            thumb_asset_path: it.payload.thumb_asset_rel_path,
+            primary_asset_path,
+            audio_duration_ms: it.payload.audio_duration_ms,
+            consumed_page_id: it.consumption.consumed_page_id,
+            consumed_block_id: it.consumption.consumed_block_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ReviewCardView {
+    pub card_id: String,
+    pub page_id: String,
+    pub anchor_halo_id: Option<String>,
+    pub front: String,
+    pub back: String,
+    pub stability: f64,
+    pub difficulty: f64,
+    pub reps: u32,
+    pub lapses: u32,
+    pub state: u8,
+    pub last_review_utc: Option<i64>,
+    pub due_at_utc: i64,
+    pub retrievability: f64,
+    pub source_page_title: String,
+    pub slice_asset_path: Option<String>,
+    pub context_excerpt: Option<String>,
+}
+
+impl From<salt_types::ReviewCardView> for ReviewCardView {
+    fn from(v: salt_types::ReviewCardView) -> Self {
+        Self {
+            card_id: v.card_id,
+            page_id: v.page_id,
+            anchor_halo_id: v.anchor_halo_id,
+            front: v.front,
+            back: v.back,
+            stability: v.stability,
+            difficulty: v.difficulty,
+            reps: v.reps,
+            lapses: v.lapses,
+            state: v.state,
+            last_review_utc: v.last_review_utc,
+            due_at_utc: v.due_at_utc,
+            retrievability: v.retrievability,
+            source_page_title: v.source_page_title,
+            slice_asset_path: v.slice_asset_path,
+            context_excerpt: v.context_excerpt,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct MicroSessionPlan {
+    pub session_id: String,
+    pub budget_seconds: u32,
+    pub estimated_seconds: u32,
+    pub cards: Vec<ReviewCardView>,
+    pub total_due_count: u32,
+}
+
+impl From<salt_types::MicroSessionPlan> for MicroSessionPlan {
+    fn from(p: salt_types::MicroSessionPlan) -> Self {
+        Self {
+            session_id: p.session_id,
+            budget_seconds: p.budget_seconds,
+            estimated_seconds: p.estimated_seconds,
+            cards: p.cards.into_iter().map(Into::into).collect(),
+            total_due_count: p.total_due_count,
+        }
+    }
+}
+
+/// Salt Inbox (盐池) UniFFI service handle (`SaltEngine::inbox()`).
+#[derive(uniffi::Object)]
+pub struct InboxService {
+    vault: Arc<VaultStore>,
+    router: Arc<SaltRouter>,
+    p2p_node: Arc<Mutex<Option<Arc<LanP2pNode>>>>,
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+impl InboxService {
+    /// Zero-friction capture into Vault-root CRDT `inbox` map in milliseconds.
+    pub fn capture_item(&self, input: InboxCaptureInput) -> Result<String, FfiError> {
+        let item = self.vault.capture_inbox_item(
+            input.kind.into(),
+            input.text_note,
+            input.primary_media_bytes.as_deref(),
+            input.primary_media_ext.as_deref(),
+            input.thumb_webp_bytes.as_deref(),
+            input.audio_duration_ms,
+            input.is_private,
+        )?;
+        Ok(item.inbox_id)
+    }
+
+    pub fn list_items(
+        &self,
+        include_archived: bool,
+        limit: u32,
+    ) -> Result<Vec<InboxItemView>, FfiError> {
+        let items = self.vault.list_inbox_items(include_archived, limit as usize);
+        Ok(items.into_iter().map(Into::into).collect())
+    }
+
+    /// Triggers async transcription/OCR/summarization subject to `#private` & `SaltRelay` guard.
+    pub async fn enrich_item(&self, inbox_id: String) -> Result<InboxItemView, FfiError> {
+        let vault = Arc::clone(&self.vault);
+        let router = Arc::clone(&self.router);
+        let p2p_slot = Arc::clone(&self.p2p_node);
+
+        GLOBAL_RUNTIME
+            .spawn(async move { enrich_inbox_item_impl(vault, router, p2p_slot, inbox_id).await })
+            .await
+            .map_err(|e| FfiError::Internal {
+                detail: format!("Enrichment task failed: {e}"),
+            })?
+    }
+
+    /// Marks an inbox item as consumed/archived and binds bidirectional provenance to target page/block.
+    pub fn consume_into_page(
+        &self,
+        inbox_id: String,
+        target_page_id: String,
+        target_block_id: String,
+    ) -> Result<(), FfiError> {
+        self.vault
+            .consume_inbox_into_page(&inbox_id, &target_page_id, &target_block_id)?;
+        Ok(())
+    }
+
+    pub fn set_private(
+        &self,
+        inbox_id: String,
+        is_private: bool,
+    ) -> Result<InboxItemView, FfiError> {
+        let updated = self.vault.set_inbox_private(&inbox_id, is_private)?;
+        Ok(updated.into())
+    }
+
+    pub fn delete_item(&self, inbox_id: String) -> Result<(), FfiError> {
+        self.vault.delete_inbox_item(&inbox_id)?;
+        Ok(())
+    }
+}
+
+/// FSRS micro-session scheduler UniFFI service handle (`SaltEngine::intel()`).
+#[derive(uniffi::Object)]
+pub struct IntelService {
+    vault: Arc<VaultStore>,
+    intel: Arc<IntelEngine>,
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+impl IntelService {
+    pub async fn build_micro_review_session(
+        &self,
+        budget_seconds: u32,
+        energy_level: u8,
+        rescue_mode: bool,
+    ) -> Result<MicroSessionPlan, FfiError> {
+        let vault = Arc::clone(&self.vault);
+        let intel = Arc::clone(&self.intel);
+        GLOBAL_RUNTIME
+            .spawn_blocking(move || {
+                intel.build_micro_review_plan(&vault, budget_seconds, energy_level, rescue_mode, None)
+            })
+            .await
+            .map_err(|e| FfiError::Internal {
+                detail: format!("Micro session task failed: {e}"),
+            })?
+            .map(Into::into)
+            .map_err(Into::into)
+    }
+}
+
 /// Main SaltNote core facade exposed to Android & Desktop Compose Multiplatform apps.
 #[derive(uniffi::Object)]
 pub struct SaltEngine {
@@ -162,7 +423,7 @@ pub struct SaltEngine {
     router: Arc<SaltRouter>,
     secrets: Arc<dyn SecretResolver>,
     spatial_cache: Arc<RwLock<HashMap<(String, String), CanvasSpatialIndex>>>,
-    p2p_node: Mutex<Option<LanP2pNode>>,
+    p2p_node: Arc<Mutex<Option<Arc<LanP2pNode>>>>,
 }
 
 #[uniffi::export]
@@ -191,8 +452,23 @@ impl SaltEngine {
             router,
             secrets,
             spatial_cache: Arc::new(RwLock::new(HashMap::new())),
-            p2p_node: Mutex::new(None),
+            p2p_node: Arc::new(Mutex::new(None)),
         }))
+    }
+
+    pub fn inbox(&self) -> Arc<InboxService> {
+        Arc::new(InboxService {
+            vault: Arc::clone(&self.vault),
+            router: Arc::clone(&self.router),
+            p2p_node: Arc::clone(&self.p2p_node),
+        })
+    }
+
+    pub fn intel(&self) -> Arc<IntelService> {
+        Arc::new(IntelService {
+            vault: Arc::clone(&self.vault),
+            intel: Arc::clone(&self.intel),
+        })
     }
 
     // ------------------------------------------------------------------------
@@ -599,6 +875,7 @@ impl SaltEngine {
 
         let halo_id = new_ulid();
         let mut slice_cache_path = None;
+        let mut slice_asset_rel_path = None;
         let webp_slice = if need_webp {
             let dense = snap.meta.mode == PageMode::Study
                 || preset.vision_policy == VisionPolicy::ForceWebpSlice;
@@ -615,6 +892,11 @@ impl SaltEngine {
                 .join(format!("{halo_id}.webp"));
             let _ = std::fs::write(&slice_path, &bytes);
             slice_cache_path = Some(slice_path.to_string_lossy().to_string());
+
+            // Persist a content-addressed copy under `assets/` so mobile commute review sees the slice!
+            let (_, rel_path) = content_addressed_asset_rel_path(&bytes, "webp");
+            let _ = self.vault.store_asset_bytes(&rel_path, &bytes);
+            slice_asset_rel_path = Some(rel_path);
             Some(bytes)
         } else {
             None
@@ -644,6 +926,7 @@ impl SaltEngine {
             pin_x: Some(pin_x),
             pin_y: Some(pin_y),
             slice_cache_path,
+            slice_asset_rel_path,
             context_excerpt: context_markdown.clone(),
             response_markdown: String::new(),
             collapsed: false,
@@ -716,6 +999,7 @@ impl SaltEngine {
             pin_x: None,
             pin_y: None,
             slice_cache_path: None,
+            slice_asset_rel_path: None,
             context_excerpt: selected_text.clone(),
             response_markdown: String::new(),
             collapsed: false,
@@ -731,6 +1015,90 @@ impl SaltEngine {
             context_markdown,
             user_prompt_extra: Some(format!("Highlighted excerpt:\n{selected_text}")),
             webp_slice: None,
+            output_language,
+        };
+
+        let sink = Arc::new(FfiStreamBridge {
+            callback,
+            vault: Arc::clone(&self.vault),
+            base_halo: Mutex::new(base_halo),
+        });
+        let router = Arc::clone(&self.router);
+        let token_clone = cancel_token.clone();
+        GLOBAL_RUNTIME.spawn(async move {
+            let _ = router
+                .stream_halo(&provider, &req, token_clone, sink)
+                .await;
+        });
+
+        Ok(Arc::new(HaloCancelHandle {
+            token: cancel_token,
+        }))
+    }
+
+    /// Directly triggers a Salt Halo preset (OCR / Flashcard / Expand) on a Salt Inbox photo
+    /// without pasting it onto a canvas first (v0.2-alpha Section 2.4).
+    pub fn trigger_inbox_halo(
+        &self,
+        inbox_id: String,
+        page_id: String,
+        preset_id: String,
+        provider_id: Option<String>,
+        output_language_hint: Option<String>,
+        callback: Box<dyn HaloStreamCallback>,
+    ) -> Result<Arc<HaloCancelHandle>, FfiError> {
+        let item = self.vault.get_inbox_item(&inbox_id)?;
+        let snap = self.vault.get_page_snapshot(&page_id)?;
+        let presets = self.vault.load_halo_presets()?;
+        let preset = presets
+            .into_iter()
+            .find(|p| p.preset_id == preset_id)
+            .ok_or_else(|| FfiError::NotFound {
+                detail: format!("Halo preset {preset_id} not found"),
+            })?;
+
+        let img_rel = item
+            .payload
+            .image_asset_rel_path
+            .clone()
+            .or(item.payload.thumb_asset_rel_path.clone());
+        let webp_slice = img_rel
+            .as_deref()
+            .and_then(|rel| std::fs::read(self.vault.paths().root.join(rel)).ok());
+
+        let effective_private = snap.meta.is_private || item.is_private;
+        let provider = self.resolve_provider(provider_id.as_deref(), webp_slice.is_some())?;
+        let output_language = self.resolve_effective_output_language(output_language_hint.as_deref());
+        SaltRouter::enforce_privacy_guard(effective_private, &provider)?;
+
+        let halo_id = new_ulid();
+        let context_markdown = item.payload.text_note.clone().unwrap_or_default();
+        let base_halo = HaloAnnotation {
+            halo_id,
+            page_id: page_id.clone(),
+            canvas_id: None,
+            preset_id: preset.preset_id.clone(),
+            anchor_bbox: None,
+            anchor_text_offset: Some(snap.body_markdown.chars().count() as u32),
+            pin_x: None,
+            pin_y: None,
+            slice_cache_path: None,
+            slice_asset_rel_path: img_rel,
+            context_excerpt: context_markdown.clone(),
+            response_markdown: String::new(),
+            collapsed: false,
+            fused: false,
+            created_at_utc: now_utc_ms(),
+        };
+        let _ = self.vault.upsert_halo(&base_halo);
+
+        let cancel_token = CancellationToken::new();
+        let req = HaloInferenceRequest {
+            page_is_private: effective_private,
+            preset,
+            context_markdown,
+            user_prompt_extra: Some("Extracted directly from Salt Inbox item".into()),
+            webp_slice,
             output_language,
         };
 
@@ -940,6 +1308,10 @@ impl SaltEngine {
     }
 
     pub fn sync_webdav_now_json(&self) -> Result<String, FfiError> {
+        self.sync_webdav_with_policy_json(false)
+    }
+
+    pub fn sync_webdav_with_policy_json(&self, is_metered: bool) -> Result<String, FfiError> {
         let cfg = self.vault.load_webdav_config()?;
         if !cfg.enabled {
             return Err(FfiError::InvalidInput {
@@ -948,7 +1320,12 @@ impl SaltEngine {
         }
         let client =
             WebDavSyncClient::from_config(&cfg, self.secrets.as_ref(), BackoffSchedule::default())?;
-        let report = GLOBAL_RUNTIME.block_on(client.sync_once(&self.vault))?;
+        let policy = if is_metered {
+            SyncNetworkPolicy::metered_guard()
+        } else {
+            SyncNetworkPolicy::default()
+        };
+        let report = GLOBAL_RUNTIME.block_on(client.sync_once_with_policy(&self.vault, policy))?;
         self.intel.rebuild_from_vault(&self.vault)?;
         self.spatial_cache.write().clear();
         Ok(serde_json::to_string(&report).unwrap_or_else(|_| "{}".into()))
@@ -967,7 +1344,13 @@ impl SaltEngine {
             return Ok(serde_json::to_string(&info).unwrap_or_else(|_| "{}".into()));
         }
         let hook = self.make_remote_sync_hook();
-        let node = LanP2pNode::start(Arc::clone(&self.vault), enable_mdns, Some(hook))?;
+        let relay = self.make_salt_relay_handler();
+        let node = Arc::new(LanP2pNode::start_with_relay(
+            Arc::clone(&self.vault),
+            enable_mdns,
+            Some(hook),
+            Some(relay),
+        )?);
         let info = LanNodeInfoJson {
             device_id: self.vault.device_state().device_id,
             host_ip: node.local_ip().to_string(),
@@ -1007,16 +1390,22 @@ impl SaltEngine {
                     detail: e.to_string(),
                 })?;
 
-        let res = {
+        let node = {
             let _guard = GLOBAL_RUNTIME.enter();
             let mut slot = self.p2p_node.lock();
             if slot.is_none() {
                 let hook = self.make_remote_sync_hook();
-                *slot = Some(LanP2pNode::start(Arc::clone(&self.vault), false, Some(hook))?);
+                let relay = self.make_salt_relay_handler();
+                *slot = Some(Arc::new(LanP2pNode::start_with_relay(
+                    Arc::clone(&self.vault),
+                    false,
+                    Some(hook),
+                    Some(relay),
+                )?));
             }
-            let node = slot.as_ref().unwrap();
-            GLOBAL_RUNTIME.block_on(node.sync_with_peer(addr, &expected_fingerprint, &self.vault))?
+            Arc::clone(slot.as_ref().unwrap())
         };
+        let res = GLOBAL_RUNTIME.block_on(node.sync_with_peer(addr, &expected_fingerprint, &self.vault))?;
         self.intel.rebuild_from_vault(&self.vault)?;
         self.spatial_cache.write().clear();
         Ok(serde_json::to_string(&res).unwrap_or_else(|_| "{}".into()))
@@ -1036,6 +1425,40 @@ impl SaltEngine {
             let _ = intel.rebuild_from_vault(&vault);
             spatial.write().clear();
             vault.bump_sync_revision();
+        })
+    }
+
+    fn make_salt_relay_handler(&self) -> SaltRelayHandler {
+        let vault = Arc::clone(&self.vault);
+        let router = Arc::clone(&self.router);
+        Arc::new(move |req: RelayEnrichRequest| {
+            let vault = Arc::clone(&vault);
+            let router = Arc::clone(&router);
+            Box::pin(async move {
+                let cfg = vault.load_router_config()?;
+                if !cfg.salt_relay_enabled {
+                    return Err(SaltError::PrivacyBlocked {
+                        endpoint: "salt_relay".into(),
+                        reason: "SaltRelay is disabled in desktop settings".into(),
+                    });
+                }
+                let local_provider = find_local_provider_for_kind(&cfg, req.kind)?;
+                let whisper_provider = build_local_whisper_provider(&cfg);
+                router
+                    .enrich_inbox_item(
+                        &local_provider,
+                        whisper_provider.as_ref(),
+                        &InboxEnrichmentRequest {
+                            is_private: true,
+                            kind: req.kind,
+                            text_note: req.text_note,
+                            media_bytes: req.media_bytes,
+                            media_ext: req.media_ext,
+                            output_language: req.output_language,
+                        },
+                    )
+                    .await
+            })
         })
     }
 
@@ -1185,6 +1608,269 @@ fn stroke_hits_circle(points_xyp: &[f32], cx: f32, cy: f32, radius: f32) -> bool
     false
 }
 
+fn find_local_provider_for_kind(
+    cfg: &RouterConfig,
+    kind: salt_types::InboxKind,
+) -> SaltResult<ProviderConfig> {
+    let preferred_id = match kind {
+        salt_types::InboxKind::PhotoNote => cfg.default_vision_provider.as_str(),
+        salt_types::InboxKind::VoiceMemo => cfg.default_audio_provider.as_str(),
+        _ => cfg.default_text_provider.as_str(),
+    };
+    if let Some(p) = cfg.providers.iter().find(|p| p.id == preferred_id) {
+        if is_local_or_rfc1918_endpoint(&p.base_url) {
+            return Ok(p.clone());
+        }
+    }
+    if let Some(local) = cfg
+        .providers
+        .iter()
+        .find(|p| is_local_or_rfc1918_endpoint(&p.base_url))
+    {
+        return Ok(local.clone());
+    }
+    Err(SaltError::PrivacyBlocked {
+        endpoint: preferred_id.into(),
+        reason: "No local/RFC1918 Ollama provider available for #private SaltRelay".into(),
+    })
+}
+
+fn build_local_whisper_provider(cfg: &RouterConfig) -> Option<ProviderConfig> {
+    let url = cfg.local_whisper_url.trim();
+    if url.is_empty() || !is_local_or_rfc1918_endpoint(url) {
+        return None;
+    }
+    Some(ProviderConfig {
+        id: "whisper-local".into(),
+        name: "Local Whisper".into(),
+        kind: AiProviderKind::OpenAiCompatible,
+        base_url: url.to_string(),
+        model: "whisper-1".into(),
+        api_key_ref: String::new(),
+    })
+}
+
+async fn enrich_inbox_item_impl(
+    vault: Arc<VaultStore>,
+    router: Arc<SaltRouter>,
+    p2p_slot: Arc<Mutex<Option<Arc<LanP2pNode>>>>,
+    inbox_id: String,
+) -> Result<InboxItemView, FfiError> {
+    let item = vault.get_inbox_item(&inbox_id)?;
+    let cfg = vault.load_router_config()?;
+
+    let (media_rel, media_ext) = match item.kind {
+        salt_types::InboxKind::VoiceMemo => (
+            item.payload.audio_asset_rel_path.clone(),
+            item.payload
+                .audio_asset_rel_path
+                .as_deref()
+                .and_then(|p| p.rsplit('.').next())
+                .map(str::to_string)
+                .or_else(|| Some("ogg".into())),
+        ),
+        salt_types::InboxKind::PhotoNote => (
+            item.payload.image_asset_rel_path.clone(),
+            Some("webp".into()),
+        ),
+        _ => (None, None),
+    };
+    let media_bytes = match media_rel {
+        Some(rel) => Some(
+            std::fs::read(vault.paths().root.join(&rel))
+                .map_err(|e| FfiError::Internal { detail: e.to_string() })?,
+        ),
+        None => None,
+    };
+
+    let output_language = {
+        let ai_pref = cfg.ai_output_language.trim();
+        if ai_pref.is_empty() || ai_pref.eq_ignore_ascii_case("follow_ui") {
+            let ui_pref = cfg.ui_language.trim();
+            if ui_pref.is_empty() || ui_pref.eq_ignore_ascii_case("system") {
+                None
+            } else {
+                Some(ui_pref.to_string())
+            }
+        } else {
+            Some(ai_pref.to_string())
+        }
+    };
+
+    if item.is_private {
+        // 1. Try direct local RFC1918 endpoint if running on PC or configured to LAN Ollama + Whisper
+        let local_provider_opt = find_local_provider_for_kind(&cfg, item.kind).ok();
+        let local_whisper_opt = build_local_whisper_provider(&cfg);
+        let can_run_direct_local = match item.kind {
+            salt_types::InboxKind::VoiceMemo => {
+                local_whisper_opt.is_some()
+                    || local_provider_opt
+                        .as_ref()
+                        .map(|p| p.kind != AiProviderKind::OllamaLocal)
+                        .unwrap_or(false)
+            }
+            _ => local_provider_opt.is_some(),
+        };
+
+        if can_run_direct_local {
+            if let Some(local_p) = local_provider_opt {
+                let _ = vault.update_inbox_enrichment(
+                    &inbox_id,
+                    TranscriptStatus::Processing,
+                    None,
+                    None,
+                    None,
+                );
+                match router
+                    .enrich_inbox_item(
+                        &local_p,
+                        local_whisper_opt.as_ref(),
+                        &InboxEnrichmentRequest {
+                            is_private: true,
+                            kind: item.kind,
+                            text_note: item.payload.text_note.clone(),
+                            media_bytes: media_bytes.clone(),
+                            media_ext: media_ext.clone(),
+                            output_language: output_language.clone(),
+                        },
+                    )
+                    .await
+                {
+                    Ok(out) => {
+                        let updated = vault.update_inbox_enrichment(
+                            &inbox_id,
+                            TranscriptStatus::Completed,
+                            out.transcript_text,
+                            out.summary_text,
+                            Some(out.auto_tags),
+                        )?;
+                        return Ok(updated.into());
+                    }
+                    Err(_) => {
+                        // Fall through to LAN relay peer if local endpoint isn't reachable directly
+                    }
+                }
+            }
+        }
+
+        // 2. Try paired/discovered LAN SaltRelay peer over pinned QUIC
+        let node_opt = p2p_slot.lock().clone();
+        if let Some(node) = node_opt {
+            if let Some(relay_peer) = node
+                .discovered_peers()
+                .into_iter()
+                .find(|p| p.relay_available)
+            {
+                if let Ok(addr) = format!("{}:{}", relay_peer.host, relay_peer.port).parse::<SocketAddr>() {
+                    let _ = vault.update_inbox_enrichment(
+                        &inbox_id,
+                        TranscriptStatus::Processing,
+                        None,
+                        None,
+                        None,
+                    );
+                    if let Ok(out) = node
+                        .relay_enrich_with_peer(
+                            addr,
+                            &relay_peer.cert_fingerprint,
+                            RelayEnrichRequest {
+                                relay_request_id: new_ulid(),
+                                kind: item.kind,
+                                is_private: true,
+                                text_note: item.payload.text_note.clone(),
+                                media_bytes,
+                                media_ext,
+                                output_language,
+                            },
+                        )
+                        .await
+                    {
+                        let updated = vault.update_inbox_enrichment(
+                            &inbox_id,
+                            TranscriptStatus::Completed,
+                            out.transcript_text,
+                            out.summary_text,
+                            Some(out.auto_tags),
+                        )?;
+                        return Ok(updated.into());
+                    }
+                }
+            }
+        }
+
+        // 3. Privacy-first fallback: NEVER touch cloud API; keep waiting for LAN SaltRelay
+        let waiting = vault.update_inbox_enrichment(
+            &inbox_id,
+            TranscriptStatus::WaitingForLanRelay,
+            None,
+            None,
+            None,
+        )?;
+        return Ok(waiting.into());
+    }
+
+    // Non-private item: route through configured audio/vision/text BYOK provider
+    let target_id = match item.kind {
+        salt_types::InboxKind::VoiceMemo => cfg.default_audio_provider.as_str(),
+        salt_types::InboxKind::PhotoNote => cfg.default_vision_provider.as_str(),
+        _ => cfg.default_text_provider.as_str(),
+    };
+    let provider = cfg
+        .providers
+        .iter()
+        .find(|p| p.id == target_id)
+        .or_else(|| cfg.providers.iter().find(|p| p.id == cfg.default_text_provider))
+        .cloned()
+        .ok_or_else(|| FfiError::NotFound {
+            detail: format!("AI provider '{target_id}' is not configured"),
+        })?;
+    let whisper_opt = build_local_whisper_provider(&cfg);
+
+    let _ = vault.update_inbox_enrichment(
+        &inbox_id,
+        TranscriptStatus::Processing,
+        None,
+        None,
+        None,
+    );
+    match router
+        .enrich_inbox_item(
+            &provider,
+            whisper_opt.as_ref(),
+            &InboxEnrichmentRequest {
+                is_private: false,
+                kind: item.kind,
+                text_note: item.payload.text_note,
+                media_bytes,
+                media_ext,
+                output_language,
+            },
+        )
+        .await
+    {
+        Ok(out) => {
+            let updated = vault.update_inbox_enrichment(
+                &inbox_id,
+                TranscriptStatus::Completed,
+                out.transcript_text,
+                out.summary_text,
+                Some(out.auto_tags),
+            )?;
+            Ok(updated.into())
+        }
+        Err(e) => {
+            let _ = vault.update_inbox_enrichment(
+                &inbox_id,
+                TranscriptStatus::Failed,
+                None,
+                None,
+                None,
+            );
+            Err(e.into())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1299,6 +1985,7 @@ mod tests {
             pin_x: Some(50.0),
             pin_y: Some(0.0),
             slice_cache_path: None,
+            slice_asset_rel_path: None,
             context_excerpt: String::new(),
             response_markdown: "hi".into(),
             collapsed: false,
@@ -1310,6 +1997,65 @@ mod tests {
             .update_halo_pin(meta.page_id.clone(), "h-ffi-1".into(), 180.0, 95.0)
             .unwrap();
         assert!(moved_json.contains("180.0"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn inbox_service_and_intel_service_uniffi_roundtrip() {
+        let tmp = std::env::temp_dir().join(format!("saltnote_ffi_v02_{}", new_ulid()));
+        let engine = SaltEngine::open(
+            tmp.to_string_lossy().to_string(),
+            "UnitTest-Phone".into(),
+            Box::new(TestSecrets),
+        )
+        .unwrap();
+
+        let page_json = engine
+            .create_page("Linear Algebra".into(), "study".into(), false, "[]".into(), "# Eigenvalues".into())
+            .unwrap();
+        let page: salt_types::PageMeta = serde_json::from_str(&page_json).unwrap();
+
+        let inbox = engine.inbox();
+        let id = inbox
+            .capture_item(InboxCaptureInput {
+                kind: InboxKind::VoiceMemo,
+                text_note: Some("Private voice note".into()),
+                primary_media_bytes: Some(b"OGG_BYTES".to_vec()),
+                primary_media_ext: Some("ogg".into()),
+                thumb_webp_bytes: None,
+                audio_duration_ms: 6_200,
+                is_private: true,
+            })
+            .unwrap();
+        assert!(id.starts_with("inbx_"));
+
+        let listed = inbox.list_items(false, 20).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].transcript_status, "waiting_for_lan_relay");
+
+        // Enrich on #private offline must stay waiting_for_lan_relay without touching cloud
+        let enriched = inbox.enrich_item(id.clone()).await.unwrap();
+        assert_eq!(enriched.transcript_status, "waiting_for_lan_relay");
+
+        inbox
+            .consume_into_page(id.clone(), page.page_id.clone(), "blk_test".into())
+            .unwrap();
+        assert!(inbox.list_items(false, 20).unwrap().is_empty());
+        assert_eq!(inbox.list_items(true, 20).unwrap()[0].state, "archived");
+
+        engine
+            .create_flashcard(page.page_id.clone(), None, "Eigenvalue def?".into(), "Av = lambda v".into())
+            .unwrap();
+        let plan = engine
+            .intel()
+            .build_micro_review_session(300, 2, true)
+            .await
+            .unwrap();
+        assert_eq!(plan.budget_seconds, 300);
+        assert_eq!(plan.total_due_count, 1);
+        assert_eq!(plan.cards.len(), 1);
+        assert_eq!(plan.cards[0].source_page_title, "Linear Algebra");
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
