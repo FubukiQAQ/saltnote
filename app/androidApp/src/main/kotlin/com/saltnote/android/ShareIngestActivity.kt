@@ -98,6 +98,9 @@ class ShareIngestActivity : ComponentActivity() {
 
             if (savedId != null) {
                 SaltClientRegistry.notifyIngested()
+                if (!SaltClientRegistry.isMainActivityActive.get()) {
+                    SaltClientRegistry.triggerBestEffortBackgroundSync(applicationContext)
+                }
                 Toast.makeText(applicationContext, savedId.second, Toast.LENGTH_SHORT).show()
             }
             finish()

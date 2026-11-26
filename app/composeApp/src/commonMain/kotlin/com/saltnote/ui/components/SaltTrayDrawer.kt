@@ -88,13 +88,22 @@ fun SaltTrayDrawer(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween,
         ) {
-            Column {
+            Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 Text(strings.saltTrayTitle, style = MaterialTheme.typography.titleMedium)
-                Text(
-                    text = "${unprocessed.size} ${strings.notesCountSuffix}",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    Text(
+                        text = "${unprocessed.size} ${strings.notesCountSuffix}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    AutoSyncStatusPill(
+                        status = state.autoSyncStatus,
+                        onClick = { state.triggerManualAutoSync() },
+                    )
+                }
             }
             IconButton(onClick = onClose, modifier = Modifier.size(30.dp)) {
                 Icon(Icons.Rounded.Close, contentDescription = strings.close, modifier = Modifier.size(18.dp))

@@ -1,6 +1,8 @@
 package com.saltnote.ui.screens
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -10,6 +12,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -18,11 +21,14 @@ import androidx.compose.material.icons.rounded.Bolt
 import androidx.compose.material.icons.rounded.CloudSync
 import androidx.compose.material.icons.rounded.ContentCopy
 import androidx.compose.material.icons.rounded.ContentPaste
+import androidx.compose.material.icons.rounded.DeleteOutline
 import androidx.compose.material.icons.rounded.Devices
+import androidx.compose.material.icons.rounded.Lock
 import androidx.compose.material.icons.rounded.QrCodeScanner
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.SignalCellularAlt
 import androidx.compose.material.icons.rounded.Wifi
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ElevatedCard
@@ -36,6 +42,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -43,15 +50,21 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
+import com.saltnote.bridge.LanPeerInfoDto
 import com.saltnote.bridge.WebDavConfigDto
+import com.saltnote.ui.components.AutoSyncStatusPill
 import com.saltnote.ui.components.LanPairingCodec
 import com.saltnote.ui.components.SaltQrCodeView
 import com.saltnote.ui.i18n.LocalSaltStrings
 import com.saltnote.ui.platform.PlatformQrScannerDialog
 import com.saltnote.ui.platform.copyTextToClipboard
 import com.saltnote.ui.platform.exportMarkdownBackupWithPicker
+import com.saltnote.ui.platform.formatUtcTimestamp
 import com.saltnote.ui.platform.readTextFromClipboard
 import com.saltnote.ui.platform.supportsLiveCameraQrScan
 import com.saltnote.ui.state.SaltAppState
@@ -68,7 +81,10 @@ fun SyncScreen(state: SaltAppState) {
     var manualHost by remember { mutableStateOf("") }
     var manualPort by remember { mutableStateOf("47821") }
     var manualFp by remember { mutableStateOf("") }
+    var manualPin by remember { mutableStateOf("") }
     var showQrScannerDialog by remember { mutableStateOf(false) }
+    var pendingPairPeer by remember { mutableStateOf<LanPeerInfoDto?>(null) }
+    var pairPinInput by remember { mutableStateOf("") }
 
     Column(
         modifier = Modifier
@@ -77,7 +93,17 @@ fun SyncScreen(state: SaltAppState) {
             .padding(20.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
-        Text(strings.syncTitle, style = MaterialTheme.typography.headlineMedium)
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            Text(strings.syncTitle, style = MaterialTheme.typography.headlineMedium)
+            AutoSyncStatusPill(
+                status = state.autoSyncStatus,
+                onClick = { state.triggerManualAutoSync() },
+            )
+        }
 
         // Metered vs Wi-Fi Sync Guard Status Banner (v0.2-alpha Section 4.4)
         Surface(
@@ -116,6 +142,43 @@ fun SyncScreen(state: SaltAppState) {
                         MaterialTheme.colorScheme.onSecondaryContainer
                     },
                 )
+            }
+        }
+
+        // Card 0: Auto-Sync Policy
+        ElevatedCard(modifier = Modifier.fillMaxWidth(), shape = MaterialTheme.shapes.large) {
+            Column(
+                modifier = Modifier.padding(20.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Text(strings.autoSyncSettingsTitle, style = MaterialTheme.typography.titleMedium)
+                SyncPrefSwitchRow(
+                    label = strings.lanAutoStartLabel,
+                    checked = state.syncPrefs.lanAutoStart,
+                    onCheckedChange = { state.saveSyncPrefs(state.syncPrefs.copy(lanAutoStart = it)) },
+                )
+                SyncPrefSwitchRow(
+                    label = strings.autoSyncCaptureLabel,
+                    checked = state.syncPrefs.autoSyncOnCapture,
+                    onCheckedChange = { state.saveSyncPrefs(state.syncPrefs.copy(autoSyncOnCapture = it)) },
+                )
+                SyncPrefSwitchRow(
+                    label = strings.autoSyncEditLabel,
+                    checked = state.syncPrefs.autoSyncOnEdit,
+                    onCheckedChange = { state.saveSyncPrefs(state.syncPrefs.copy(autoSyncOnEdit = it)) },
+                )
+                SyncPrefSwitchRow(
+                    label = strings.autoSyncWebdavLabel,
+                    checked = state.syncPrefs.autoSyncWebdav,
+                    onCheckedChange = { state.saveSyncPrefs(state.syncPrefs.copy(autoSyncWebdav = it)) },
+                )
+                if (webDavEnabled) {
+                    SyncPrefSwitchRow(
+                        label = strings.mirrorWebdavAfterLanLabel,
+                        checked = state.syncPrefs.mirrorWebdavAfterLan,
+                        onCheckedChange = { state.saveSyncPrefs(state.syncPrefs.copy(mirrorWebdavAfterLan = it)) },
+                    )
+                }
             }
         }
 
@@ -263,6 +326,8 @@ fun SyncScreen(state: SaltAppState) {
                             port = node.port,
                             fingerprint = node.fingerprint,
                             deviceName = state.deviceState.deviceName,
+                            token = node.pairingToken,
+                            deviceId = node.deviceId,
                         )
                     }
 
@@ -295,6 +360,35 @@ fun SyncScreen(state: SaltAppState) {
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 )
+                                if (node.pairingPin.isNotBlank()) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                    ) {
+                                        Surface(
+                                            color = MaterialTheme.colorScheme.secondaryContainer,
+                                            shape = RoundedCornerShape(8.dp),
+                                        ) {
+                                            Text(
+                                                text = "${strings.pairingPinLabel}: ${node.pairingPin}",
+                                                style = MaterialTheme.typography.labelLarge,
+                                                fontWeight = FontWeight.SemiBold,
+                                                color = MaterialTheme.colorScheme.onSecondaryContainer,
+                                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
+                                            )
+                                        }
+                                        IconButton(
+                                            onClick = { state.rotateLanPairingInfo() },
+                                            modifier = Modifier.size(28.dp),
+                                        ) {
+                                            Icon(
+                                                Icons.Rounded.Refresh,
+                                                contentDescription = strings.refreshPinDesc,
+                                                modifier = Modifier.size(16.dp),
+                                            )
+                                        }
+                                    }
+                                }
                                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                     FilledTonalButton(
                                         onClick = {
@@ -318,19 +412,52 @@ fun SyncScreen(state: SaltAppState) {
                             }
                         }
                     }
+                }
 
+                // Trusted mTLS Paired Devices Section
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                ) {
                     Row(
-                        modifier = Modifier.fillMaxWidth(),
                         verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
                     ) {
-                        Text("${strings.nearbyDevicesLabel} (${state.lanPeers.size})", style = MaterialTheme.typography.titleSmall)
+                        Icon(
+                            Icons.Rounded.Lock,
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp),
+                            tint = MaterialTheme.colorScheme.primary,
+                        )
+                        Text(
+                            "${strings.pairedDevicesLabel} (${state.pairedPeers.size})",
+                            style = MaterialTheme.typography.titleSmall,
+                        )
+                    }
+                    if (state.lanNodeInfo != null) {
                         IconButton(onClick = { state.refreshLanPeers() }) {
                             Icon(Icons.Rounded.Refresh, strings.refreshDesc)
                         }
                     }
+                }
 
-                    state.lanPeers.forEach { peer ->
+                if (state.pairedPeers.isEmpty()) {
+                    Text(
+                        text = strings.noPairedDevicesHint,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                } else {
+                    state.pairedPeers.forEach { paired ->
+                        val livePeer = state.lanPeers.firstOrNull {
+                            it.deviceId == paired.deviceId ||
+                                it.certFingerprint.equals(paired.certFingerprint, ignoreCase = true)
+                        }
+                        val isOnline = livePeer != null
+                        val targetHost = livePeer?.host ?: paired.lastHost
+                        val targetPort = livePeer?.port ?: paired.lastPort
+
                         OutlinedCard(modifier = Modifier.fillMaxWidth(), shape = MaterialTheme.shapes.small) {
                             Row(
                                 modifier = Modifier
@@ -338,15 +465,43 @@ fun SyncScreen(state: SaltAppState) {
                                     .padding(12.dp),
                                 verticalAlignment = Alignment.CenterVertically,
                             ) {
-                                Icon(Icons.Rounded.Devices, null)
+                                Box(
+                                    modifier = Modifier
+                                        .size(9.dp)
+                                        .clip(CircleShape)
+                                        .background(
+                                            if (isOnline) Color(0xFF2E7D32) else MaterialTheme.colorScheme.outline,
+                                        ),
+                                )
+                                Spacer(Modifier.width(8.dp))
+                                Icon(
+                                    Icons.Rounded.Devices,
+                                    null,
+                                    tint = if (isOnline) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
                                 Spacer(Modifier.width(10.dp))
                                 Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                                     Row(
                                         verticalAlignment = Alignment.CenterVertically,
                                         horizontalArrangement = Arrangement.spacedBy(6.dp),
                                     ) {
-                                        Text(peer.deviceName, style = MaterialTheme.typography.titleSmall)
-                                        if (peer.relayAvailable) {
+                                        Text(paired.deviceName, style = MaterialTheme.typography.titleSmall)
+                                        Surface(
+                                            color = if (isOnline) {
+                                                Color(0xFF2E7D32).copy(alpha = 0.14f)
+                                            } else {
+                                                MaterialTheme.colorScheme.surfaceContainerHighest
+                                            },
+                                            shape = RoundedCornerShape(50),
+                                        ) {
+                                            Text(
+                                                text = if (isOnline) strings.onlineLabel else strings.offlineLabel,
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = if (isOnline) Color(0xFF2E7D32) else MaterialTheme.colorScheme.onSurfaceVariant,
+                                                modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp),
+                                            )
+                                        }
+                                        if (livePeer?.relayAvailable == true) {
                                             Surface(
                                                 color = MaterialTheme.colorScheme.primaryContainer,
                                                 shape = RoundedCornerShape(50),
@@ -372,26 +527,102 @@ fun SyncScreen(state: SaltAppState) {
                                         }
                                     }
                                     Text(
-                                        text = "${peer.host}:${peer.port}",
+                                        text = "$targetHost:$targetPort · ${strings.lastSyncPrefix}${formatUtcTimestamp(paired.lastSyncUtc)}",
                                         style = MaterialTheme.typography.bodySmall,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                                     )
                                 }
+                                Switch(
+                                    checked = paired.autoSync,
+                                    onCheckedChange = { state.setPairedPeerAutoSync(paired.deviceId, it) },
+                                )
+                                Spacer(Modifier.width(6.dp))
                                 Button(
                                     onClick = {
-                                        state.syncWithLanPeer(peer.host, peer.port, peer.certFingerprint)
+                                        state.syncWithLanPeer(targetHost, targetPort, paired.certFingerprint)
                                     },
-                                    enabled = !state.isSyncingLan,
+                                    enabled = !state.isSyncingLan && targetHost.isNotBlank(),
                                 ) {
-                                    if (state.isSyncingLan) {
-                                        CircularProgressIndicator(
-                                            modifier = Modifier.size(14.dp),
-                                            strokeWidth = 2.dp,
-                                            color = MaterialTheme.colorScheme.onPrimary,
-                                        )
-                                        Spacer(Modifier.width(6.dp))
-                                    }
                                     Text(strings.syncAction)
+                                }
+                                IconButton(
+                                    onClick = { state.removePairedPeer(paired.deviceId) },
+                                ) {
+                                    Icon(
+                                        Icons.Rounded.DeleteOutline,
+                                        contentDescription = strings.unpairAction,
+                                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+
+                state.lanNodeInfo?.let {
+                    val unpairedNearby = state.lanPeers.filter { !it.isPaired }
+                    if (unpairedNearby.isNotEmpty()) {
+                        HorizontalDivider()
+                        Text(
+                            "${strings.nearbyDevicesLabel} (${unpairedNearby.size})",
+                            style = MaterialTheme.typography.titleSmall,
+                        )
+                        unpairedNearby.forEach { peer ->
+                            OutlinedCard(modifier = Modifier.fillMaxWidth(), shape = MaterialTheme.shapes.small) {
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(12.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Icon(Icons.Rounded.Devices, null)
+                                    Spacer(Modifier.width(10.dp))
+                                    Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                        Row(
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                        ) {
+                                            Text(peer.deviceName, style = MaterialTheme.typography.titleSmall)
+                                            if (peer.relayAvailable) {
+                                                Surface(
+                                                    color = MaterialTheme.colorScheme.primaryContainer,
+                                                    shape = RoundedCornerShape(50),
+                                                ) {
+                                                    Row(
+                                                        modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp),
+                                                        verticalAlignment = Alignment.CenterVertically,
+                                                        horizontalArrangement = Arrangement.spacedBy(3.dp),
+                                                    ) {
+                                                        Icon(
+                                                            Icons.Rounded.Bolt,
+                                                            contentDescription = null,
+                                                            modifier = Modifier.size(12.dp),
+                                                            tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                                                        )
+                                                        Text(
+                                                            text = strings.relayBadgeLabel,
+                                                            style = MaterialTheme.typography.labelSmall,
+                                                            color = MaterialTheme.colorScheme.onPrimaryContainer,
+                                                        )
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Text(
+                                            text = "${peer.host}:${peer.port}",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        )
+                                    }
+                                    FilledTonalButton(
+                                        onClick = {
+                                            pairPinInput = ""
+                                            pendingPairPeer = peer
+                                        },
+                                        enabled = !state.isSyncingLan,
+                                    ) {
+                                        Text(strings.pairAction)
+                                    }
                                 }
                             }
                         }
@@ -412,6 +643,9 @@ fun SyncScreen(state: SaltAppState) {
                                     manualHost = parsed.host
                                     manualPort = parsed.port.toString()
                                     manualFp = parsed.fingerprint
+                                    if (parsed.token.isNotBlank()) {
+                                        manualPin = parsed.token
+                                    }
                                     state.notifyMessage(strings.clipboardFilledToast)
                                 } else {
                                     state.notifyMessage(strings.clipboardNoPairingUri)
@@ -447,15 +681,28 @@ fun SyncScreen(state: SaltAppState) {
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth(),
                     )
+                    OutlinedTextField(
+                        value = manualPin,
+                        onValueChange = { manualPin = it },
+                        label = { Text(strings.enterPinLabel) },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
                     FilledTonalButton(
                         onClick = {
                             val p = manualPort.toIntOrNull()
                             if (p != null && manualHost.isNotBlank() && manualFp.isNotBlank()) {
-                                state.syncWithLanPeer(manualHost.trim(), p, manualFp.trim())
+                                if (manualPin.isNotBlank()) {
+                                    state.pairWithLanPeer(manualHost.trim(), p, manualFp.trim(), manualPin.trim())
+                                } else {
+                                    state.syncWithLanPeer(manualHost.trim(), p, manualFp.trim())
+                                }
                             }
                         },
                         enabled = !state.isSyncingLan,
-                    ) { Text(strings.connectAndSync) }
+                    ) {
+                        Text(if (manualPin.isNotBlank()) strings.pairAndSyncAction else strings.connectAndSync)
+                    }
                 }
             }
         }
@@ -493,5 +740,62 @@ fun SyncScreen(state: SaltAppState) {
             },
             onDismiss = { showQrScannerDialog = false },
         )
+    }
+
+    pendingPairPeer?.let { target ->
+        AlertDialog(
+            onDismissRequest = { pendingPairPeer = null },
+            title = { Text(strings.enterPinDialogTitle) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(
+                        text = "${target.deviceName} (${target.host}:${target.port})",
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                    OutlinedTextField(
+                        value = pairPinInput,
+                        onValueChange = { pairPinInput = it },
+                        label = { Text(strings.enterPinLabel) },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        val secret = pairPinInput.trim()
+                        pendingPairPeer = null
+                        if (secret.isNotEmpty()) {
+                            state.pairWithLanPeer(target.host, target.port, target.certFingerprint, secret)
+                        }
+                    },
+                    enabled = pairPinInput.trim().length >= 6 && !state.isSyncingLan,
+                ) { Text(strings.pairAndSyncAction) }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingPairPeer = null }) { Text(strings.cancel) }
+            },
+        )
+    }
+}
+
+@Composable
+private fun SyncPrefSwitchRow(
+    label: String,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit,
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween,
+    ) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.bodyMedium,
+            modifier = Modifier.weight(1f).padding(end = 12.dp),
+        )
+        Switch(checked = checked, onCheckedChange = onCheckedChange)
     }
 }

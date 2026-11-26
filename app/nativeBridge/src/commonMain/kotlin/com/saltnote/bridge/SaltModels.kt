@@ -250,6 +250,9 @@ data class LanNodeInfoDto(
     @SerialName("host_ip") val hostIp: String = "",
     val port: Int,
     val fingerprint: String,
+    @SerialName("pairing_token") val pairingToken: String = "",
+    @SerialName("pairing_pin") val pairingPin: String = "",
+    @SerialName("pairing_expires_at_utc") val pairingExpiresAtUtc: Long = 0L,
 )
 
 @Serializable
@@ -260,6 +263,40 @@ data class LanPeerInfoDto(
     val port: Int,
     @SerialName("cert_fingerprint") val certFingerprint: String,
     @SerialName("relay_available") val relayAvailable: Boolean = false,
+    @SerialName("is_paired") val isPaired: Boolean = false,
+)
+
+@Serializable
+data class PairedPeerDto(
+    @SerialName("device_id") val deviceId: String,
+    @SerialName("device_name") val deviceName: String,
+    @SerialName("cert_fingerprint") val certFingerprint: String,
+    @SerialName("last_host") val lastHost: String = "",
+    @SerialName("last_port") val lastPort: Int = 47821,
+    @SerialName("paired_at_utc") val pairedAtUtc: Long = 0L,
+    @SerialName("last_sync_utc") val lastSyncUtc: Long = 0L,
+    @SerialName("auto_sync") val autoSync: Boolean = true,
+)
+
+@Serializable
+data class LocalSyncPrefsDto(
+    @SerialName("lan_auto_start") val lanAutoStart: Boolean = true,
+    @SerialName("auto_sync_on_capture") val autoSyncOnCapture: Boolean = true,
+    @SerialName("auto_sync_on_edit") val autoSyncOnEdit: Boolean = true,
+    @SerialName("auto_sync_webdav") val autoSyncWebdav: Boolean = true,
+    @SerialName("mirror_webdav_after_lan") val mirrorWebdavAfterLan: Boolean = false,
+)
+
+@Serializable
+data class LanBatchSyncReportDto(
+    @SerialName("attempted_peers") val attemptedPeers: Int = 0,
+    @SerialName("succeeded_peers") val succeededPeers: Int = 0,
+    @SerialName("total_sent_packets") val totalSentPackets: Int = 0,
+    @SerialName("total_received_packets") val totalReceivedPackets: Int = 0,
+    @SerialName("total_sent_assets") val totalSentAssets: Int = 0,
+    @SerialName("total_received_assets") val totalReceivedAssets: Int = 0,
+    @SerialName("synced_device_ids") val syncedDeviceIds: List<String> = emptyList(),
+    val errors: List<String> = emptyList(),
 )
 
 enum class InboxKindDto(val wireName: String) {

@@ -352,6 +352,32 @@ data class SaltStrings(
     val relayBadgeLabel: String get() = inboxStrings.relayBadgeLabel
     val micPermissionPrompt: String get() = inboxStrings.micPermissionPrompt
     val grantMicPermission: String get() = inboxStrings.grantMicPermission
+    val autoSyncSettingsTitle: String get() = inboxStrings.autoSyncSettingsTitle
+    val lanAutoStartLabel: String get() = inboxStrings.lanAutoStartLabel
+    val autoSyncCaptureLabel: String get() = inboxStrings.autoSyncCaptureLabel
+    val autoSyncEditLabel: String get() = inboxStrings.autoSyncEditLabel
+    val autoSyncWebdavLabel: String get() = inboxStrings.autoSyncWebdavLabel
+    val mirrorWebdavAfterLanLabel: String get() = inboxStrings.mirrorWebdavAfterLanLabel
+    val pairingPinLabel: String get() = inboxStrings.pairingPinLabel
+    val refreshPinDesc: String get() = inboxStrings.refreshPinDesc
+    val pairedDevicesLabel: String get() = inboxStrings.pairedDevicesLabel
+    val noPairedDevicesHint: String get() = inboxStrings.noPairedDevicesHint
+    val onlineLabel: String get() = inboxStrings.onlineLabel
+    val offlineLabel: String get() = inboxStrings.offlineLabel
+    val unpairAction: String get() = inboxStrings.unpairAction
+    val pairAction: String get() = inboxStrings.pairAction
+    val enterPinDialogTitle: String get() = inboxStrings.enterPinDialogTitle
+    val enterPinLabel: String get() = inboxStrings.enterPinLabel
+    val pairAndSyncAction: String get() = inboxStrings.pairAndSyncAction
+    val autoSyncStatusIdle: String get() = inboxStrings.autoSyncStatusIdle
+    val autoSyncStatusSyncing: String get() = inboxStrings.autoSyncStatusSyncing
+    val autoSyncStatusSynced: String get() = inboxStrings.autoSyncStatusSynced
+    val autoSyncStatusPending: String get() = inboxStrings.autoSyncStatusPending
+    val autoSyncStatusError: String get() = inboxStrings.autoSyncStatusError
+    val pairSuccessToast: String get() = inboxStrings.pairSuccessToast
+    val pairRemovedToast: String get() = inboxStrings.pairRemovedToast
+    val pairTokenRequiredToast: String get() = inboxStrings.pairTokenRequiredToast
+    val inboxThumbFallbackToast: String get() = inboxStrings.inboxThumbFallbackToast
 }
 
 data class SaltInboxStrings(
@@ -409,6 +435,32 @@ data class SaltInboxStrings(
     val relayBadgeLabel: String,
     val micPermissionPrompt: String,
     val grantMicPermission: String,
+    val autoSyncSettingsTitle: String,
+    val lanAutoStartLabel: String,
+    val autoSyncCaptureLabel: String,
+    val autoSyncEditLabel: String,
+    val autoSyncWebdavLabel: String,
+    val mirrorWebdavAfterLanLabel: String,
+    val pairingPinLabel: String,
+    val refreshPinDesc: String,
+    val pairedDevicesLabel: String,
+    val noPairedDevicesHint: String,
+    val onlineLabel: String,
+    val offlineLabel: String,
+    val unpairAction: String,
+    val pairAction: String,
+    val enterPinDialogTitle: String,
+    val enterPinLabel: String,
+    val pairAndSyncAction: String,
+    val autoSyncStatusIdle: String,
+    val autoSyncStatusSyncing: String,
+    val autoSyncStatusSynced: String,
+    val autoSyncStatusPending: String,
+    val autoSyncStatusError: String,
+    val pairSuccessToast: String,
+    val pairRemovedToast: String,
+    val pairTokenRequiredToast: String,
+    val inboxThumbFallbackToast: String,
 )
 
 private val ZhCnInboxStrings = SaltInboxStrings(
@@ -466,6 +518,32 @@ private val ZhCnInboxStrings = SaltInboxStrings(
     relayBadgeLabel = "可接力算力",
     micPermissionPrompt = "需要麦克风权限以录制语音速记",
     grantMicPermission = "授予麦克风权限",
+    autoSyncSettingsTitle = "自动同步策略",
+    lanAutoStartLabel = "启动时自动开启局域网同步",
+    autoSyncCaptureLabel = "盐池拍照、录音、分享后自动同步",
+    autoSyncEditLabel = "笔记编辑、画布与复习后自动同步",
+    autoSyncWebdavLabel = "无局域网设备时自动走 WebDAV 同步",
+    mirrorWebdavAfterLanLabel = "局域网同步后额外镜像备份至 WebDAV",
+    pairingPinLabel = "6 位配对码",
+    refreshPinDesc = "刷新配对码",
+    pairedDevicesLabel = "已配对设备 · 可信 mTLS",
+    noPairedDevicesHint = "暂无已配对设备。扫描二维码或点击下方附近设备输入 6 位配对码，一次配对后自动免密同步。",
+    onlineLabel = "在线",
+    offlineLabel = "离线",
+    unpairAction = "取消配对",
+    pairAction = "配对",
+    enterPinDialogTitle = "输入对端 6 位配对码",
+    enterPinLabel = "6 位配对码或配对令牌",
+    pairAndSyncAction = "配对并同步",
+    autoSyncStatusIdle = "自动同步就绪",
+    autoSyncStatusSyncing = "正在自动同步…",
+    autoSyncStatusSynced = "已自动同步",
+    autoSyncStatusPending = "待联网/设备上线同步",
+    autoSyncStatusError = "同步失败 · 点击重试",
+    pairSuccessToast = "已完成 mTLS 双向配对并同步",
+    pairRemovedToast = "已取消设备配对",
+    pairTokenRequiredToast = "首次连接需要扫码或输入 6 位配对码完成双向配对",
+    inboxThumbFallbackToast = "大原图尚未完成同步，已先插入缩略图并触发后台补齐",
 )
 
 private val ZhTwInboxStrings = SaltInboxStrings(
@@ -523,6 +601,32 @@ private val ZhTwInboxStrings = SaltInboxStrings(
     relayBadgeLabel = "可接力算力",
     micPermissionPrompt = "需要麥克風權限以錄製語音速記",
     grantMicPermission = "授予麥克風權限",
+    autoSyncSettingsTitle = "自動同步策略",
+    lanAutoStartLabel = "啟動時自動開啟區域網路同步",
+    autoSyncCaptureLabel = "鹽池拍照、錄音、分享後自動同步",
+    autoSyncEditLabel = "筆記編輯、畫布與複習後自動同步",
+    autoSyncWebdavLabel = "無區域網路裝置時自動走 WebDAV 同步",
+    mirrorWebdavAfterLanLabel = "區域網路同步後額外鏡像備份至 WebDAV",
+    pairingPinLabel = "6 位配對碼",
+    refreshPinDesc = "重新整理配對碼",
+    pairedDevicesLabel = "已配對裝置 · 可信 mTLS",
+    noPairedDevicesHint = "尚無已配對裝置。掃描 QR Code 或點擊下方附近裝置輸入 6 位配對碼，一次配對後自動免密同步。",
+    onlineLabel = "在線",
+    offlineLabel = "離線",
+    unpairAction = "取消配對",
+    pairAction = "配對",
+    enterPinDialogTitle = "輸入對端 6 位配對碼",
+    enterPinLabel = "6 位配對碼或配對權杖",
+    pairAndSyncAction = "配對並同步",
+    autoSyncStatusIdle = "自動同步就緒",
+    autoSyncStatusSyncing = "正在自動同步…",
+    autoSyncStatusSynced = "已自動同步",
+    autoSyncStatusPending = "待聯網/裝置上線同步",
+    autoSyncStatusError = "同步失敗 · 點擊重試",
+    pairSuccessToast = "已完成 mTLS 雙向配對並同步",
+    pairRemovedToast = "已取消裝置配對",
+    pairTokenRequiredToast = "首次連線需要掃碼或輸入 6 位配對碼完成雙向配對",
+    inboxThumbFallbackToast = "大原圖尚未完成同步，已先插入縮圖並觸發背景補齊",
 )
 
 private val EnInboxStrings = SaltInboxStrings(
@@ -580,6 +684,32 @@ private val EnInboxStrings = SaltInboxStrings(
     relayBadgeLabel = "Relay Ready",
     micPermissionPrompt = "Microphone permission is required for voice memos",
     grantMicPermission = "Grant Mic",
+    autoSyncSettingsTitle = "Auto-Sync Policy",
+    lanAutoStartLabel = "Auto-start LAN sync on launch",
+    autoSyncCaptureLabel = "Auto-sync after Inbox photo, voice & share",
+    autoSyncEditLabel = "Auto-sync after note, ink & review edits",
+    autoSyncWebdavLabel = "Fallback to WebDAV when LAN peers are away",
+    mirrorWebdavAfterLanLabel = "Also mirror to WebDAV after LAN sync",
+    pairingPinLabel = "6-Digit Pairing PIN",
+    refreshPinDesc = "Rotate PIN",
+    pairedDevicesLabel = "Paired Devices · Trusted mTLS",
+    noPairedDevicesHint = "No paired devices yet. Scan a QR code once or tap Pair on a nearby device below to establish mutual trust.",
+    onlineLabel = "Online",
+    offlineLabel = "Offline",
+    unpairAction = "Unpair",
+    pairAction = "Pair",
+    enterPinDialogTitle = "Enter 6-Digit Pairing PIN",
+    enterPinLabel = "6-Digit PIN or Pairing Token",
+    pairAndSyncAction = "Pair & Sync",
+    autoSyncStatusIdle = "Auto-sync ready",
+    autoSyncStatusSyncing = "Auto-syncing…",
+    autoSyncStatusSynced = "Synced",
+    autoSyncStatusPending = "Waiting for network/peer",
+    autoSyncStatusError = "Sync failed · Tap to retry",
+    pairSuccessToast = "Mutually paired & synced via mTLS",
+    pairRemovedToast = "Device unpaired",
+    pairTokenRequiredToast = "First connection requires a QR token or 6-digit PIN",
+    inboxThumbFallbackToast = "Full image still syncing — inserted thumbnail & queued background fetch",
 )
 
 private val JaInboxStrings = EnInboxStrings.copy(
@@ -603,6 +733,32 @@ private val JaInboxStrings = EnInboxStrings.copy(
     microSessionAnotherRound = "もう3分",
     microSessionStopToday = "今日はここまで",
     enterFullPage = "ページを開く",
+    autoSyncSettingsTitle = "自動同期ポリシー",
+    lanAutoStartLabel = "起動時に LAN 同期を自動開始",
+    autoSyncCaptureLabel = "受信箱の写真・音声・共有後に自動同期",
+    autoSyncEditLabel = "ノート編集・手書き・復習後に自動同期",
+    autoSyncWebdavLabel = "LAN 不在時は WebDAV へ自動同期",
+    mirrorWebdavAfterLanLabel = "LAN 同期後に WebDAV へもバックアップ",
+    pairingPinLabel = "6桁ペアリングPIN",
+    refreshPinDesc = "PINを更新",
+    pairedDevicesLabel = "ペアリング済み · 信頼 mTLS",
+    noPairedDevicesHint = "ペアリング済みデバイスはありません。QR スキャンまたは近くのデバイスから 6 桁 PIN で一度ペアリングしてください。",
+    onlineLabel = "オンライン",
+    offlineLabel = "オフライン",
+    unpairAction = "解除",
+    pairAction = "ペアリング",
+    enterPinDialogTitle = "6桁ペアリングPINを入力",
+    enterPinLabel = "6桁 PIN またはトークン",
+    pairAndSyncAction = "ペアリングして同期",
+    autoSyncStatusIdle = "自動同期待機中",
+    autoSyncStatusSyncing = "自動同期中…",
+    autoSyncStatusSynced = "同期済み",
+    autoSyncStatusPending = "ネット/相手端末待ち",
+    autoSyncStatusError = "同期失敗 · タップで再試行",
+    pairSuccessToast = "mTLS 相互ペアリングと同期が完了しました",
+    pairRemovedToast = "ペアリングを解除しました",
+    pairTokenRequiredToast = "初回接続には QR トークンまたは 6 桁 PIN が必要です",
+    inboxThumbFallbackToast = "元画像が未同期のためサムネイルを挿入しバックグラウンド同期を開始しました",
 )
 
 private val KoInboxStrings = EnInboxStrings.copy(
@@ -626,6 +782,32 @@ private val KoInboxStrings = EnInboxStrings.copy(
     microSessionAnotherRound = "3분 더하기",
     microSessionStopToday = "오늘 복습 끝",
     enterFullPage = "전체 페이지 열기",
+    autoSyncSettingsTitle = "자동 동기화 정책",
+    lanAutoStartLabel = "시작 시 LAN 동기화 자동 활성화",
+    autoSyncCaptureLabel = "인박스 사진·음성·공유 후 자동 동기화",
+    autoSyncEditLabel = "노트 편집·필기·복습 후 자동 동기화",
+    autoSyncWebdavLabel = "LAN 기기 미연결 시 WebDAV 자동 동기화",
+    mirrorWebdavAfterLanLabel = "LAN 동기화 후 WebDAV에도 미러 백업",
+    pairingPinLabel = "6자리 페어링 PIN",
+    refreshPinDesc = "PIN 새로고침",
+    pairedDevicesLabel = "페어링된 기기 · 신뢰 mTLS",
+    noPairedDevicesHint = "페어링된 기기가 없습니다. QR 코드를 스캔하거나 주변 기기에서 6자리 PIN을 입력해 한 번만 신뢰를 등록하세요.",
+    onlineLabel = "온라인",
+    offlineLabel = "오프라인",
+    unpairAction = "연결 해제",
+    pairAction = "페어링",
+    enterPinDialogTitle = "6자리 페어링 PIN 입력",
+    enterPinLabel = "6자리 PIN 또는 페어링 토큰",
+    pairAndSyncAction = "페어링 및 동기화",
+    autoSyncStatusIdle = "자동 동기화 대기",
+    autoSyncStatusSyncing = "자동 동기화 중…",
+    autoSyncStatusSynced = "동기화됨",
+    autoSyncStatusPending = "네트워크/기기 대기 중",
+    autoSyncStatusError = "동기화 실패 · 눌러서 재시도",
+    pairSuccessToast = "mTLS 상호 페어링 및 동기화 완료",
+    pairRemovedToast = "기기 페어링이 해제되었습니다",
+    pairTokenRequiredToast = "최초 연결에는 QR 토큰 또는 6자리 PIN이 필요합니다",
+    inboxThumbFallbackToast = "원본 이미지가 아직 동기화되지 않아 썸네일을 먼저 삽입하고 백그라운드 동기화를 시작했습니다",
 )
 
 private val ZhCnStrings = SaltStrings(

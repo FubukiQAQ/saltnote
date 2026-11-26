@@ -18,9 +18,11 @@ import com.saltnote.bridge.InboxItemViewDto
 import com.saltnote.bridge.InboxKindDto
 import com.saltnote.bridge.LanNodeInfoDto
 import com.saltnote.bridge.LanPeerInfoDto
+import com.saltnote.bridge.LocalSyncPrefsDto
 import com.saltnote.bridge.MicroSessionPlanDto
 import com.saltnote.bridge.PageSnapshotDto
 import com.saltnote.bridge.PageSummaryDto
+import com.saltnote.bridge.PairedPeerDto
 import com.saltnote.bridge.RenderStrokeDto
 import com.saltnote.bridge.ReviewCardViewDto
 import com.saltnote.bridge.RouterConfigDto
@@ -38,9 +40,10 @@ import com.saltnote.ui.i18n.resolveAiOutputLanguageCode
 import com.saltnote.ui.i18n.resolveAppLanguage
 import com.saltnote.ui.i18n.stringsFor
 import com.saltnote.ui.platform.PlatformAudioPlaybackHandle
+import com.saltnote.ui.platform.PlatformNetworkState
 import com.saltnote.ui.platform.RecordedAudioClip
-import com.saltnote.ui.platform.isNetworkMetered
-import com.saltnote.ui.platform.observeNetworkMetered
+import com.saltnote.ui.platform.currentNetworkState
+import com.saltnote.ui.platform.observeNetworkState
 import com.saltnote.ui.platform.playVaultAudio
 import com.saltnote.ui.platform.readVaultAssetBytes
 import com.saltnote.ui.platform.saveLastVaultDirectory
@@ -74,6 +77,27 @@ enum class EditorViewMode(val label: String) {
     Canvas("画布模式"),
     Document("文档模式"),
 }
+
+enum class AutoSyncStateKind {
+    Idle,
+    Syncing,
+    Synced,
+    PendingOffline,
+    Error,
+}
+
+data class AutoSyncStatus(
+    val kind: AutoSyncStateKind = AutoSyncStateKind.Idle,
+    val lastSyncedUtcMs: Long = 0L,
+    val detail: String = "",
+)
+
+private data class Quad<A, B, C, D>(
+    val first: A,
+    val second: B,
+    val third: C,
+    val fourth: D,
+)
 
 data class ActiveCrystalBubble(
     val presetId: String,
@@ -179,36 +203,63 @@ class SaltAppState(
     var playingAudioInboxId by mutableStateOf<String?>(null)
     private var activeAudioHandle: PlatformAudioPlaybackHandle? = null
 
-    // Settings / BYOK / Sync / Metered Guard
+    // Settings / BYOK / Sync / Metered Guard / Auto-Sync
     var routerConfig by mutableStateOf<RouterConfigDto?>(null)
     var routerSecretEpoch by mutableStateOf(0)
     var testingProviderId by mutableStateOf<String?>(null)
     val connectivityResults = mutableStateOf<Map<String, ConnectivityTestResultDto>>(emptyMap())
     var webDavConfig by mutableStateOf(WebDavConfigDto())
-    var isMeteredNetwork by mutableStateOf(isNetworkMetered())
+    var syncPrefs by mutableStateOf(LocalSyncPrefsDto())
+    var networkState by mutableStateOf(currentNetworkState())
+    var isMeteredNetwork by mutableStateOf(networkState.isMetered)
     var isSyncingWebDav by mutableStateOf(false)
     var isSyncingLan by mutableStateOf(false)
     var lastSyncReport by mutableStateOf<SyncReportDto?>(null)
     var lanNodeInfo by mutableStateOf<LanNodeInfoDto?>(null)
     val lanPeers = mutableStateListOf<LanPeerInfoDto>()
+    val pairedPeers = mutableStateListOf<PairedPeerDto>()
+    var autoSyncStatus by mutableStateOf(AutoSyncStatus())
 
     private var bodySaveJob: Job? = null
     private var pendingBodyDirty: Boolean = false
     private var periodicFlushJob: Job? = null
     private var lanObserverJob: Job? = null
+    private var autoSyncJob: Job? = null
+    private var isAutoSyncExecuting: Boolean = false
+    private var localDirtyEpoch: Long = 0L
+    private var lastSyncedEpoch: Long = 0L
     private var networkObserverDispose: (() -> Unit)? = null
     private var lastObservedSyncRevision: Long = 0L
+    private var lastObservedInboxRevision: Long = 0L
+    private var knownOnlinePairedIds: Set<String> = emptySet()
 
     init {
         bootstrapVault(checkOnboarding = true)
         startPeriodicDeltaFlusher()
-        networkObserverDispose = observeNetworkMetered { metered ->
+        networkObserverDispose = observeNetworkState { newState ->
             scope.launch {
-                val wasMetered = isMeteredNetwork
-                isMeteredNetwork = metered
-                if (wasMetered && !metered) {
-                    if (webDavConfig.enabled && (lastSyncReport?.deferredAssets ?: 0) > 0) {
-                        triggerWebDavSync()
+                val prev = networkState
+                networkState = newState
+                isMeteredNetwork = newState.isMetered
+
+                val becameOnline = !prev.isOnline && newState.isOnline
+                val becameUnmetered = prev.isMetered && !newState.isMetered
+                val becameWifi = !prev.isWifiOrEthernet && newState.isWifiOrEthernet
+
+                if (newState.isWifiOrEthernet) {
+                    if (lanNodeInfo != null) {
+                        val refreshed = withContext(Dispatchers.IO) { client.refreshLanNetwork() }
+                        if (refreshed != null) {
+                            lanNodeInfo = refreshed
+                        }
+                    } else if (syncPrefs.lanAutoStart) {
+                        toggleLanP2p(true, silent = true)
+                    }
+                }
+
+                if (becameOnline || becameUnmetered || becameWifi) {
+                    if (localDirtyEpoch > lastSyncedEpoch || (lastSyncReport?.deferredAssets ?: 0) > 0) {
+                        scheduleAutoSync(isCapture = true, forceNow = true)
                     }
                     retryPendingInboxEnrichments()
                 }
@@ -233,6 +284,151 @@ class SaltAppState(
     fun onExternalVaultMutated() {
         refreshInboxOnly()
         refreshCardsOnly()
+        scheduleAutoSync(isCapture = true)
+    }
+
+    fun onAppResumed() {
+        refreshInboxOnly()
+        refreshPairedPeersOnly()
+        if (localDirtyEpoch > lastSyncedEpoch) {
+            scheduleAutoSync(isCapture = true, forceNow = true)
+        }
+    }
+
+    fun triggerManualAutoSync() {
+        scheduleAutoSync(isCapture = true, forceNow = true)
+    }
+
+    private fun scheduleAutoSync(isCapture: Boolean, forceNow: Boolean = false) {
+        if (!forceNow) {
+            if (isCapture && !syncPrefs.autoSyncOnCapture) return
+            if (!isCapture && !syncPrefs.autoSyncOnEdit) return
+        }
+        localDirtyEpoch++
+        if (autoSyncJob?.isActive == true) {
+            if (isAutoSyncExecuting) {
+                // Active pass will see localDirtyEpoch > targetEpoch and coalesce automatically
+                return
+            }
+            if (forceNow || isCapture) {
+                autoSyncJob?.cancel()
+            } else {
+                return
+            }
+        }
+        val initialDelayMs = when {
+            forceNow -> 0L
+            isCapture -> 400L
+            else -> 4_000L
+        }
+        autoSyncJob = scope.launch {
+            if (initialDelayMs > 0L) {
+                delay(initialDelayMs)
+            }
+            runAutoSyncLoop()
+        }
+    }
+
+    private suspend fun runAutoSyncLoop() {
+        while (scope.isActive && lastSyncedEpoch < localDirtyEpoch) {
+            val targetEpoch = localDirtyEpoch
+            val hasPaired = pairedPeers.any { it.autoSync }
+            val canWebDav = webDavConfig.enabled && syncPrefs.autoSyncWebdav
+            if (!hasPaired && !canWebDav) {
+                lastSyncedEpoch = targetEpoch
+                autoSyncStatus = AutoSyncStatus(AutoSyncStateKind.Idle)
+                break
+            }
+
+            flushPendingBodyImmediately()
+            withContext(Dispatchers.IO) {
+                runCatching { client.flushDeltas() }
+            }
+
+            val net = networkState
+            if (!net.isOnline) {
+                autoSyncStatus = AutoSyncStatus(AutoSyncStateKind.PendingOffline)
+                break
+            }
+            if (!net.isWifiOrEthernet && !canWebDav) {
+                autoSyncStatus = AutoSyncStatus(AutoSyncStateKind.PendingOffline)
+                break
+            }
+
+            isAutoSyncExecuting = true
+            autoSyncStatus = AutoSyncStatus(AutoSyncStateKind.Syncing)
+            var lanSucceeded = false
+            var webDavSucceeded = false
+            try {
+                if (net.isWifiOrEthernet && hasPaired) {
+                    if (lanNodeInfo == null && syncPrefs.lanAutoStart) {
+                        setLanMulticastLock(true)
+                        val started = withContext(Dispatchers.IO) {
+                            runCatching { client.startLanP2p(enableMdns = true) }.getOrNull()
+                        }
+                        if (started != null) {
+                            lanNodeInfo = started
+                            startLanObserver()
+                        } else {
+                            setLanMulticastLock(false)
+                        }
+                    }
+                    val lanReport = withContext(Dispatchers.IO) {
+                        runCatching { client.syncAllPairedLanPeers() }.getOrNull()
+                    }
+                    if (lanReport != null && lanReport.succeededPeers > 0) {
+                        lanSucceeded = true
+                        if (lanReport.totalReceivedPackets > 0 || lanReport.totalReceivedAssets > 0) {
+                            syncUiVersion++
+                            lastObservedSyncRevision = withContext(Dispatchers.IO) {
+                                runCatching { client.getSyncRevision() }.getOrDefault(lastObservedSyncRevision)
+                            }
+                            lastObservedInboxRevision = withContext(Dispatchers.IO) {
+                                runCatching { client.getInboxSyncRevision() }.getOrDefault(lastObservedInboxRevision)
+                            }
+                            refreshAll()
+                            activePage?.meta?.pageId?.let { reloadCurrentPageInPlace(it) }
+                        }
+                    }
+                }
+
+                val shouldRunWebDav = canWebDav && (!lanSucceeded || net.isMetered || syncPrefs.mirrorWebdavAfterLan)
+                if (shouldRunWebDav) {
+                    val davReport = withContext(Dispatchers.IO) {
+                        runCatching { client.syncWebDavNow(isMetered = net.isMetered) }.getOrNull()
+                    }
+                    if (davReport != null) {
+                        lastSyncReport = davReport
+                        webDavSucceeded = davReport.errors.isEmpty()
+                        if (davReport.downloadedDeltas > 0 || davReport.downloadedAssets > 0) {
+                            syncUiVersion++
+                            refreshAll()
+                            activePage?.meta?.pageId?.let { reloadCurrentPageInPlace(it) }
+                        }
+                    }
+                }
+            } finally {
+                isAutoSyncExecuting = false
+            }
+
+            if (lanSucceeded || webDavSucceeded) {
+                lastSyncedEpoch = targetEpoch
+                refreshPairedPeersOnly()
+                autoSyncStatus = AutoSyncStatus(
+                    kind = AutoSyncStateKind.Synced,
+                    lastSyncedUtcMs = System.currentTimeMillis(),
+                )
+            } else {
+                autoSyncStatus = AutoSyncStatus(
+                    kind = if (net.isWifiOrEthernet && hasPaired && !canWebDav) {
+                        AutoSyncStateKind.PendingOffline
+                    } else {
+                        AutoSyncStateKind.Error
+                    },
+                )
+                break
+            }
+        }
     }
 
     private fun startPeriodicDeltaFlusher() {
@@ -251,22 +447,49 @@ class SaltAppState(
         lanObserverJob?.cancel()
         lanObserverJob = scope.launch {
             while (isActive && lanNodeInfo != null) {
-                val (peers, rev) = withContext(Dispatchers.IO) {
+                val (peers, paired, rev, inboxRev) = withContext(Dispatchers.IO) {
                     val p = runCatching { client.listLanPeers() }.getOrDefault(emptyList())
+                    val pr = runCatching { client.listPairedPeers() }.getOrDefault(pairedPeers.toList())
                     val r = runCatching { client.getSyncRevision() }.getOrDefault(lastObservedSyncRevision)
-                    p to r
+                    val ir = runCatching { client.getInboxSyncRevision() }.getOrDefault(lastObservedInboxRevision)
+                    listOf(p, pr, r, ir)
+                }.let {
+                    @Suppress("UNCHECKED_CAST")
+                    Quad(
+                        it[0] as List<LanPeerInfoDto>,
+                        it[1] as List<PairedPeerDto>,
+                        it[2] as Long,
+                        it[3] as Long,
+                    )
                 }
+
                 lanPeers.clear()
                 lanPeers.addAll(peers)
+                pairedPeers.clear()
+                pairedPeers.addAll(paired)
+
+                val currentOnlinePaired = peers.filter { it.isPaired }.map { it.deviceId }.toSet()
+                val newlyOnlinePaired = currentOnlinePaired - knownOnlinePairedIds
+                knownOnlinePairedIds = currentOnlinePaired
+                if (newlyOnlinePaired.isNotEmpty() && syncPrefs.autoSyncOnCapture) {
+                    scheduleAutoSync(isCapture = true, forceNow = true)
+                }
 
                 if (rev > lastObservedSyncRevision) {
+                    val revDelta = rev - lastObservedSyncRevision
+                    val inboxDelta = (inboxRev - lastObservedInboxRevision).coerceAtLeast(0L)
                     lastObservedSyncRevision = rev
+                    lastObservedInboxRevision = inboxRev
                     syncUiVersion = rev
-                    refreshAll()
-                    activePage?.meta?.pageId?.let { reloadCurrentPageInPlace(it) }
-                    showToast(strings.lanIncomingSyncToast)
+                    if (inboxDelta > 0L && inboxDelta == revDelta) {
+                        refreshInboxOnly()
+                    } else {
+                        refreshAll()
+                        activePage?.meta?.pageId?.let { reloadCurrentPageInPlace(it) }
+                        showToast(strings.lanIncomingSyncToast)
+                    }
                 }
-                if (peers.any { it.relayAvailable } &&
+                if (peers.any { it.relayAvailable && it.isPaired } &&
                     inboxItems.any { it.transcriptStatus == "waiting_for_lan_relay" }
                 ) {
                     retryPendingInboxEnrichments()
@@ -287,9 +510,20 @@ class SaltAppState(
                     false
                 }
             }
-            lastObservedSyncRevision = withContext(Dispatchers.IO) {
-                runCatching { client.getSyncRevision() }.getOrDefault(0L)
+            val (rev, inboxRev, prefs, paired) = withContext(Dispatchers.IO) {
+                Quad(
+                    runCatching { client.getSyncRevision() }.getOrDefault(0L),
+                    runCatching { client.getInboxSyncRevision() }.getOrDefault(0L),
+                    runCatching { client.getSyncPrefs() }.getOrDefault(LocalSyncPrefsDto()),
+                    runCatching { client.listPairedPeers() }.getOrDefault(emptyList()),
+                )
             }
+            lastObservedSyncRevision = rev
+            lastObservedInboxRevision = inboxRev
+            syncPrefs = prefs
+            pairedPeers.clear()
+            pairedPeers.addAll(paired)
+
             if (checkOnboarding && isFirstLaunch) {
                 showOnboarding = true
             }
@@ -298,18 +532,32 @@ class SaltAppState(
             if (firstId != null) {
                 openPage(firstId)
             }
+            if (prefs.lanAutoStart && networkState.isWifiOrEthernet && lanNodeInfo == null) {
+                toggleLanP2p(true, silent = true)
+            }
         }
     }
 
     fun switchVaultDirectory(newVaultPath: String) {
         scope.launch {
             flushPendingBodyImmediately()
+            lanObserverJob?.cancel()
+            autoSyncJob?.cancel()
             runCatching {
                 withContext(Dispatchers.IO) {
+                    client.stopLanP2p()
                     client.flushDeltas()
                     openSaltNoteClient(newVaultPath, deviceName, client.secretVault)
                 }
             }.onSuccess { newClient ->
+                setLanMulticastLock(false)
+                lanNodeInfo = null
+                lanPeers.clear()
+                pairedPeers.clear()
+                knownOnlinePairedIds = emptySet()
+                localDirtyEpoch = 0L
+                lastSyncedEpoch = 0L
+                autoSyncStatus = AutoSyncStatus()
                 saveLastVaultDirectory(newVaultPath)
                 stopInboxAudioPlayback()
                 client = newClient
@@ -337,7 +585,13 @@ class SaltAppState(
                 val rcfg = runCatching { client.getRouterConfig() }.getOrNull()
                 val dav = runCatching { client.getWebDavConfig() }.getOrDefault(WebDavConfigDto())
                 val inbox = runCatching { client.listInboxItems(showArchivedInbox, 80) }.getOrDefault(emptyList())
-                Triple(Triple(dev, list, presets), Triple(due, all, rcfg), Triple(dav, inbox, Unit))
+                val prefs = runCatching { client.getSyncPrefs() }.getOrDefault(LocalSyncPrefsDto())
+                val paired = runCatching { client.listPairedPeers() }.getOrDefault(emptyList())
+                Triple(
+                    Triple(dev, list, presets),
+                    Triple(due, all, rcfg),
+                    Quad(dav, inbox, prefs, paired),
+                )
             }.let { (first, second, third) ->
                 deviceState = first.first
                 pages.clear()
@@ -357,6 +611,9 @@ class SaltAppState(
                 webDavConfig = third.first
                 inboxItems.clear()
                 inboxItems.addAll(third.second)
+                syncPrefs = third.third
+                pairedPeers.clear()
+                pairedPeers.addAll(third.fourth)
             }
         }
     }
@@ -439,6 +696,7 @@ class SaltAppState(
             refreshAll()
             openPage(created.pageId)
             editorMode = if (mode == "journal") EditorViewMode.Canvas else EditorViewMode.Document
+            scheduleAutoSync(isCapture = false)
         }
     }
 
@@ -451,6 +709,7 @@ class SaltAppState(
             }
             activePage = page.copy(meta = page.meta.copy(tags = cleaned))
             refreshPageListOnly()
+            scheduleAutoSync(isCapture = false)
         }
     }
 
@@ -486,6 +745,7 @@ class SaltAppState(
                 }
                 refreshCardsOnly()
                 showToast(strings.noteDeletedToast)
+                scheduleAutoSync(isCapture = false)
             }.onFailure { err ->
                 showToast("${strings.deleteFailedPrefix}${err.message}")
             }
@@ -511,6 +771,7 @@ class SaltAppState(
             }
             activePage = activePage?.copy(meta = activePage!!.meta.copy(title = newTitle))
             refreshPageListOnly()
+            scheduleAutoSync(isCapture = false)
         }
     }
 
@@ -524,6 +785,7 @@ class SaltAppState(
             activePage = page.copy(meta = page.meta.copy(isPrivate = next))
             refreshPageListOnly()
             showToast(if (next) strings.privateSetToast else strings.privateUnsetToast)
+            scheduleAutoSync(isCapture = false)
         }
     }
 
@@ -539,6 +801,7 @@ class SaltAppState(
                 runCatching { client.updatePageBody(pid, newMarkdown) }
             }
             refreshPageListOnly()
+            scheduleAutoSync(isCapture = false)
         }
     }
 
@@ -667,6 +930,7 @@ class SaltAppState(
                 }
                 if (refreshed != null) activePage = refreshed
                 refreshPageListOnly()
+                scheduleAutoSync(isCapture = false)
             } else if (canvasId == activeCanvasId) {
                 canvasStrokes.removeAll { it.strokeId == tempId }
             }
@@ -691,6 +955,7 @@ class SaltAppState(
                 }
                 if (refreshed != null) activePage = refreshed
                 refreshPageListOnly()
+                scheduleAutoSync(isCapture = false)
             }
         }
     }
@@ -737,6 +1002,7 @@ class SaltAppState(
                 selectedImageId = inserted.imageId
                 selectedTool = "select"
                 showToast(strings.imageInsertedToast)
+                scheduleAutoSync(isCapture = false)
             }.onFailure { err ->
                 showToast("${strings.imageInsertFailedPrefix}${err.message}")
             }
@@ -803,6 +1069,7 @@ class SaltAppState(
                     )
                 }
                 refreshPageListOnly()
+                scheduleAutoSync(isCapture = false)
             }.onFailure { err ->
                 showToast("${strings.updateFailedPrefix}${err.message}")
                 reloadCurrentPageInPlace(pid)
@@ -1060,6 +1327,7 @@ class SaltAppState(
                 activeCrystal = cur.copy(fused = true, isCollapsed = true)
                 activePage = withContext(Dispatchers.IO) { client.getPageSnapshot(halo.pageId) }
                 showToast(strings.fusedToast)
+                scheduleAutoSync(isCapture = false)
             }
         }
     }
@@ -1085,6 +1353,7 @@ class SaltAppState(
             activeCrystal = cur.copy(cardsImported = true)
             refreshCardsOnly()
             showToast("${strings.addedCardsToastPrefix}${cur.cardDrafts.size}${strings.addedCardsToastSuffix}")
+            scheduleAutoSync(isCapture = false)
         }
     }
 
@@ -1101,6 +1370,7 @@ class SaltAppState(
             }
             refreshCardsOnly()
             showToast(strings.cardAddedToast)
+            scheduleAutoSync(isCapture = false)
         }
     }
 
@@ -1117,6 +1387,7 @@ class SaltAppState(
                     reloadCurrentPageInPlace(pageId)
                 }
                 showToast(strings.cardUpdatedToast)
+                scheduleAutoSync(isCapture = false)
             }.onFailure { err ->
                 showToast("${strings.updateFailedPrefix}${err.message}")
             }
@@ -1136,6 +1407,7 @@ class SaltAppState(
                     reloadCurrentPageInPlace(pageId)
                 }
                 showToast(strings.cardDeletedToast)
+                scheduleAutoSync(isCapture = false)
             }.onFailure { err ->
                 showToast("${strings.deleteFailedPrefix}${err.message}")
             }
@@ -1155,6 +1427,7 @@ class SaltAppState(
             currentCardRevealed = false
             cardShownAtMs = System.currentTimeMillis()
             refreshCardsOnly()
+            scheduleAutoSync(isCapture = false)
         }
     }
 
@@ -1335,7 +1608,7 @@ class SaltAppState(
         }
     }
 
-    fun toggleLanP2p(enable: Boolean) {
+    fun toggleLanP2p(enable: Boolean, silent: Boolean = false) {
         scope.launch {
             if (enable) {
                 setLanMulticastLock(true)
@@ -1346,12 +1619,20 @@ class SaltAppState(
                     lastObservedSyncRevision = withContext(Dispatchers.IO) {
                         runCatching { client.getSyncRevision() }.getOrDefault(lastObservedSyncRevision)
                     }
+                    lastObservedInboxRevision = withContext(Dispatchers.IO) {
+                        runCatching { client.getInboxSyncRevision() }.getOrDefault(lastObservedInboxRevision)
+                    }
                     refreshLanPeers()
+                    refreshPairedPeersOnly()
                     startLanObserver()
-                    showToast(strings.lanSyncStartedToast)
+                    if (!silent) {
+                        showToast(strings.lanSyncStartedToast)
+                    }
                 }.onFailure { err ->
                     setLanMulticastLock(false)
-                    showToast("${strings.syncFailedPrefix}${err.message}")
+                    if (!silent) {
+                        showToast("${strings.syncFailedPrefix}${err.message}")
+                    }
                 }
             } else {
                 lanObserverJob?.cancel()
@@ -1359,18 +1640,121 @@ class SaltAppState(
                 setLanMulticastLock(false)
                 lanNodeInfo = null
                 lanPeers.clear()
-                showToast(strings.lanSyncStoppedToast)
+                knownOnlinePairedIds = emptySet()
+                if (!silent) {
+                    showToast(strings.lanSyncStoppedToast)
+                }
             }
         }
     }
 
     fun refreshLanPeers() {
         scope.launch {
-            val peers = withContext(Dispatchers.IO) {
-                runCatching { client.listLanPeers() }.getOrDefault(emptyList())
+            val (peers, paired) = withContext(Dispatchers.IO) {
+                val p = runCatching { client.listLanPeers() }.getOrDefault(emptyList())
+                val pr = runCatching { client.listPairedPeers() }.getOrDefault(pairedPeers.toList())
+                p to pr
             }
             lanPeers.clear()
             lanPeers.addAll(peers)
+            pairedPeers.clear()
+            pairedPeers.addAll(paired)
+        }
+    }
+
+    fun refreshPairedPeersOnly() {
+        scope.launch {
+            val paired = withContext(Dispatchers.IO) {
+                runCatching { client.listPairedPeers() }.getOrDefault(pairedPeers.toList())
+            }
+            pairedPeers.clear()
+            pairedPeers.addAll(paired)
+        }
+    }
+
+    fun saveSyncPrefs(prefs: LocalSyncPrefsDto) {
+        syncPrefs = prefs
+        scope.launch {
+            runCatching {
+                withContext(Dispatchers.IO) { client.saveSyncPrefs(prefs) }
+            }.onSuccess {
+                if (prefs.lanAutoStart && networkState.isWifiOrEthernet && lanNodeInfo == null) {
+                    toggleLanP2p(true, silent = true)
+                }
+            }.onFailure { err ->
+                showToast("${strings.saveFailedPrefix}${err.message}")
+            }
+        }
+    }
+
+    fun rotateLanPairingInfo() {
+        scope.launch {
+            val updated = withContext(Dispatchers.IO) {
+                runCatching { client.rotateLanPairingInfo() }.getOrNull()
+            }
+            if (updated != null) {
+                lanNodeInfo = updated
+            }
+        }
+    }
+
+    fun removePairedPeer(deviceId: String) {
+        scope.launch {
+            runCatching {
+                withContext(Dispatchers.IO) { client.removePairedPeer(deviceId) }
+            }.onSuccess {
+                refreshPairedPeersOnly()
+                refreshLanPeers()
+                showToast(strings.pairRemovedToast)
+            }
+        }
+    }
+
+    fun setPairedPeerAutoSync(deviceId: String, enabled: Boolean) {
+        scope.launch {
+            runCatching {
+                withContext(Dispatchers.IO) { client.setPairedPeerAutoSync(deviceId, enabled) }
+            }.onSuccess {
+                refreshPairedPeersOnly()
+            }
+        }
+    }
+
+    fun pairWithLanPeer(host: String, port: Int, fingerprint: String, pairingSecret: String) {
+        if (isSyncingLan) return
+        isSyncingLan = true
+        scope.launch {
+            flushPendingBodyImmediately()
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    client.flushDeltas()
+                    client.pairWithLanPeer(host, port, fingerprint, pairingSecret)
+                }
+            }.onSuccess { res ->
+                lastObservedSyncRevision = withContext(Dispatchers.IO) {
+                    runCatching { client.getSyncRevision() }.getOrDefault(lastObservedSyncRevision)
+                }
+                lastObservedInboxRevision = withContext(Dispatchers.IO) {
+                    runCatching { client.getInboxSyncRevision() }.getOrDefault(lastObservedInboxRevision)
+                }
+                syncUiVersion++
+                refreshAll()
+                refreshLanPeers()
+                activePage?.meta?.pageId?.let { reloadCurrentPageInPlace(it) }
+                autoSyncStatus = AutoSyncStatus(
+                    kind = AutoSyncStateKind.Synced,
+                    lastSyncedUtcMs = System.currentTimeMillis(),
+                )
+                val suffix = if (res.sentPackets + res.sentAssets + res.receivedPackets + res.receivedAssets > 0) {
+                    " (↑${res.sentPackets + res.sentAssets} · ↓${res.receivedPackets + res.receivedAssets})"
+                } else {
+                    ""
+                }
+                showToast("${strings.pairSuccessToast}$suffix")
+            }.onFailure { err ->
+                showToast("${strings.syncFailedPrefix}${err.message}")
+            }
+            isSyncingLan = false
         }
     }
 
@@ -1380,8 +1764,19 @@ class SaltAppState(
             showToast(strings.invalidPairingToast)
             return false
         }
-        syncWithLanPeer(parsed.host, parsed.port, parsed.fingerprint)
-        return true
+        if (parsed.token.isNotBlank()) {
+            pairWithLanPeer(parsed.host, parsed.port, parsed.fingerprint, parsed.token)
+            return true
+        }
+        val alreadyPaired = pairedPeers.any {
+            it.certFingerprint.equals(parsed.fingerprint, ignoreCase = true)
+        }
+        if (alreadyPaired) {
+            syncWithLanPeer(parsed.host, parsed.port, parsed.fingerprint)
+            return true
+        }
+        showToast(strings.pairTokenRequiredToast)
+        return false
     }
 
     fun syncWithLanPeer(host: String, port: Int, fingerprint: String) {
@@ -1398,9 +1793,16 @@ class SaltAppState(
                 lastObservedSyncRevision = withContext(Dispatchers.IO) {
                     runCatching { client.getSyncRevision() }.getOrDefault(lastObservedSyncRevision)
                 }
+                lastObservedInboxRevision = withContext(Dispatchers.IO) {
+                    runCatching { client.getInboxSyncRevision() }.getOrDefault(lastObservedInboxRevision)
+                }
                 syncUiVersion++
                 refreshAll()
                 activePage?.meta?.pageId?.let { reloadCurrentPageInPlace(it) }
+                autoSyncStatus = AutoSyncStatus(
+                    kind = AutoSyncStateKind.Synced,
+                    lastSyncedUtcMs = System.currentTimeMillis(),
+                )
                 val msg = if (res.sentPackets == 0 && res.receivedPackets == 0 && res.sentAssets == 0 && res.receivedAssets == 0) {
                     strings.lanUpToDateToast
                 } else {
@@ -1499,6 +1901,7 @@ class SaltAppState(
             }.onSuccess {
                 refreshInboxOnly()
                 showToast(strings.inboxCapturedToast)
+                scheduleAutoSync(isCapture = true)
             }.onFailure { err ->
                 showToast("${strings.saveFailedPrefix}${err.message}")
             }
@@ -1529,6 +1932,7 @@ class SaltAppState(
             }.onSuccess {
                 refreshInboxOnly()
                 showToast(strings.inboxCapturedToast)
+                scheduleAutoSync(isCapture = true)
             }.onFailure { err ->
                 showToast("${strings.saveFailedPrefix}${err.message}")
             }
@@ -1554,6 +1958,7 @@ class SaltAppState(
             }.onSuccess { newId ->
                 refreshInboxOnly()
                 showToast(strings.inboxCapturedToast)
+                scheduleAutoSync(isCapture = true)
                 enrichInboxItem(newId)
             }.onFailure { err ->
                 showToast("${strings.saveFailedPrefix}${err.message}")
@@ -1571,6 +1976,7 @@ class SaltAppState(
                 }
             }.onSuccess {
                 refreshInboxOnly()
+                scheduleAutoSync(isCapture = true)
             }.onFailure {
                 refreshInboxOnly()
             }
@@ -1594,6 +2000,7 @@ class SaltAppState(
                 }
             }.onSuccess {
                 refreshInboxOnly()
+                scheduleAutoSync(isCapture = true)
             }
         }
     }
@@ -1607,6 +2014,7 @@ class SaltAppState(
                 withContext(Dispatchers.IO) { client.deleteInboxItem(inboxId) }
             }.onSuccess {
                 refreshInboxOnly()
+                scheduleAutoSync(isCapture = true)
             }
         }
     }
@@ -1656,14 +2064,28 @@ class SaltAppState(
         val pid = page.meta.pageId
         scope.launch {
             flushPendingBodyImmediately()
+            var usedThumbFallback = false
             runCatching {
                 if (editorMode == EditorViewMode.Canvas &&
                     item.kind == InboxKindDto.PhotoNote &&
-                    !item.primaryAssetPath.isNullOrBlank()
+                    (!item.primaryAssetPath.isNullOrBlank() || !item.thumbAssetPath.isNullOrBlank())
                 ) {
-                    val rawBytes = withContext(Dispatchers.IO) {
-                        readVaultAssetBytes(client.vaultPath, item.primaryAssetPath!!)
-                    } ?: error("Image asset missing locally")
+                    val primaryBytes = item.primaryAssetPath?.takeIf { it.isNotBlank() }?.let { rel ->
+                        withContext(Dispatchers.IO) { readVaultAssetBytes(client.vaultPath, rel) }
+                    }
+                    val thumbBytes = if (primaryBytes == null) {
+                        item.thumbAssetPath?.takeIf { it.isNotBlank() }?.let { rel ->
+                            withContext(Dispatchers.IO) { readVaultAssetBytes(client.vaultPath, rel) }
+                        }
+                    } else {
+                        null
+                    }
+                    val rawBytes = primaryBytes ?: thumbBytes
+                    if (rawBytes == null) {
+                        scheduleAutoSync(isCapture = true, forceNow = true)
+                        error(strings.inboxThumbFallbackToast)
+                    }
+                    usedThumbFallback = (primaryBytes == null)
                     val inserted = withContext(Dispatchers.IO) {
                         val node = client.insertCanvasImage(
                             pageId = pid,
@@ -1696,7 +2118,8 @@ class SaltAppState(
             }.onSuccess {
                 refreshInboxOnly()
                 refreshPageListOnly()
-                showToast(strings.inboxConsumedToast)
+                showToast(if (usedThumbFallback) strings.inboxThumbFallbackToast else strings.inboxConsumedToast)
+                scheduleAutoSync(isCapture = true)
             }.onFailure { err ->
                 showToast("${strings.saveFailedPrefix}${err.message}")
             }
@@ -1812,6 +2235,7 @@ class SaltAppState(
                 isMicroSessionFinished = true
             }
             refreshCardsOnly()
+            scheduleAutoSync(isCapture = false)
         }
     }
 
@@ -1823,7 +2247,13 @@ class SaltAppState(
 
     fun dispose() {
         stopInboxAudioPlayback()
+        bodySaveJob?.cancel()
+        periodicFlushJob?.cancel()
+        lanObserverJob?.cancel()
+        autoSyncJob?.cancel()
         networkObserverDispose?.invoke()
         networkObserverDispose = null
+        setLanMulticastLock(false)
+        runCatching { client.stopLanP2p() }
     }
 }

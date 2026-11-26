@@ -6,11 +6,18 @@ import com.saltnote.bridge.AndroidSecretVault
 import com.saltnote.bridge.SaltNoteClient
 import com.saltnote.bridge.openSaltNoteClient
 import com.saltnote.ui.platform.AndroidPlatformContext
+import com.saltnote.ui.platform.currentNetworkState
 import com.saltnote.ui.platform.defaultDeviceName
 import com.saltnote.ui.platform.defaultVaultDirectory
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Process-wide singleton holder for [SaltNoteClient] so [MainActivity], [ShareIngestActivity],
@@ -28,6 +35,38 @@ object SaltClientRegistry {
 
     private val _ingestTick = MutableStateFlow(0L)
     val ingestTick: StateFlow<Long> = _ingestTick.asStateFlow()
+
+    val isMainActivityActive = AtomicBoolean(false)
+    private val backgroundScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    fun triggerBestEffortBackgroundSync(context: Context) {
+        val appCtx = context.applicationContext
+        backgroundScope.launch {
+            runCatching {
+                withTimeoutOrNull(8_000L) {
+                    val client = getOrOpen(appCtx)
+                    val prefs = client.getSyncPrefs()
+                    if (!prefs.autoSyncOnCapture) return@withTimeoutOrNull
+                    val net = currentNetworkState()
+                    if (!net.isOnline) return@withTimeoutOrNull
+                    client.flushDeltas()
+
+                    var lanSucceeded = false
+                    if (net.isWifiOrEthernet && client.listPairedPeers().any { it.autoSync }) {
+                        val report = runCatching { client.syncAllPairedLanPeers() }.getOrNull()
+                        lanSucceeded = (report?.succeededPeers ?: 0) > 0
+                    }
+                    val davCfg = client.getWebDavConfig()
+                    if (davCfg.enabled &&
+                        prefs.autoSyncWebdav &&
+                        (!lanSucceeded || net.isMetered || prefs.mirrorWebdavAfterLan)
+                    ) {
+                        runCatching { client.syncWebDavNow(isMetered = net.isMetered) }
+                    }
+                }
+            }
+        }
+    }
 
     @Synchronized
     fun getOrOpen(context: Context): SaltNoteClient {

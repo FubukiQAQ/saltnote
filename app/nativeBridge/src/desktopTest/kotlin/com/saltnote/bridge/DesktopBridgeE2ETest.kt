@@ -191,4 +191,65 @@ class DesktopBridgeE2ETest {
             tempVault.deleteRecursively()
         }
     }
+
+    @Test
+    fun lanPairingAndPairedBatchInboxSyncOverUniFfi() {
+        val phoneDir = Files.createTempDirectory("saltnote_kt_lan_phone_").toFile()
+        val pcDir = Files.createTempDirectory("saltnote_kt_lan_pc_").toFile()
+        try {
+            val phone = openSaltNoteClient(
+                vaultPath = phoneDir.absolutePath,
+                deviceName = "Kotlin-Phone",
+                secretVault = InMemorySecretVault(),
+            )
+            val pc = openSaltNoteClient(
+                vaultPath = pcDir.absolutePath,
+                deviceName = "Kotlin-PC",
+                secretVault = InMemorySecretVault(),
+            )
+
+            val pcInfo = pc.startLanP2p(enableMdns = false)
+            assertTrue(pcInfo.pairingToken.length >= 16)
+            assertEquals(6, pcInfo.pairingPin.length)
+
+            val pairRes = phone.pairWithLanPeer(
+                host = "127.0.0.1",
+                port = pcInfo.port,
+                expectedFingerprint = pcInfo.fingerprint,
+                pairingSecret = pcInfo.pairingToken,
+            )
+            assertEquals(pcInfo.deviceId, pairRes.peerDeviceId)
+            assertEquals(1, phone.listPairedPeers().size)
+            assertEquals(1, pc.listPairedPeers().size)
+
+            val inboxId = phone.captureInboxItem(
+                InboxCaptureInputDto(
+                    kind = InboxKindDto.PhotoNote,
+                    textNote = "黑板推导自动同步测试",
+                    primaryMediaBytes = "FAKE_WEBP_PHOTO".toByteArray(),
+                    primaryMediaExt = "webp",
+                    thumbWebpBytes = "FAKE_THUMB".toByteArray(),
+                    isPrivate = false,
+                ),
+            )
+            assertTrue(inboxId.startsWith("inbx_"))
+
+            val batch = phone.syncAllPairedLanPeers()
+            assertEquals(1, batch.succeededPeers)
+            assertEquals(1, batch.totalSentPackets)
+            assertEquals(2, batch.totalSentAssets)
+            assertEquals(1, pc.listInboxItems(includeArchived = false, limit = 20).size)
+            assertTrue(pc.getInboxSyncRevision() >= 1L)
+
+            val prefs = phone.getSyncPrefs().copy(mirrorWebdavAfterLan = true)
+            phone.saveSyncPrefs(prefs)
+            assertTrue(phone.getSyncPrefs().mirrorWebdavAfterLan)
+
+            phone.stopLanP2p()
+            pc.stopLanP2p()
+        } finally {
+            phoneDir.deleteRecursively()
+            pcDir.deleteRecursively()
+        }
+    }
 }

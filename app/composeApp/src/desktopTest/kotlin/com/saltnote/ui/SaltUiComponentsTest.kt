@@ -121,6 +121,8 @@ class SaltUiComponentsTest {
             port = 47821,
             fingerprint = "0123456789abcdef0123456789abcdef",
             deviceName = "Pixel Tablet",
+            token = "aabbccddeeff00112233445566778899",
+            deviceId = "01JDF8K2M9P3Q7R1S5T8V0W2X4",
         )
         assertTrue(uri.startsWith("saltnote://pair?"))
         val parsed = LanPairingCodec.parse(uri)
@@ -129,6 +131,8 @@ class SaltUiComponentsTest {
         assertEquals(47821, parsed.port)
         assertEquals("0123456789abcdef0123456789abcdef", parsed.fingerprint)
         assertEquals("Pixel Tablet", parsed.deviceName)
+        assertEquals("aabbccddeeff00112233445566778899", parsed.token)
+        assertEquals("01JDF8K2M9P3Q7R1S5T8V0W2X4", parsed.deviceId)
         assertNull(LanPairingCodec.parse("https://example.com"))
 
         // Verify ZXing QR matrix generation with width=0, height=0 produces valid minimal matrix
@@ -206,6 +210,32 @@ class SaltUiComponentsTest {
                 s.relayBadgeLabel,
                 s.micPermissionPrompt,
                 s.grantMicPermission,
+                s.autoSyncSettingsTitle,
+                s.lanAutoStartLabel,
+                s.autoSyncCaptureLabel,
+                s.autoSyncEditLabel,
+                s.autoSyncWebdavLabel,
+                s.mirrorWebdavAfterLanLabel,
+                s.pairingPinLabel,
+                s.refreshPinDesc,
+                s.pairedDevicesLabel,
+                s.noPairedDevicesHint,
+                s.onlineLabel,
+                s.offlineLabel,
+                s.unpairAction,
+                s.pairAction,
+                s.enterPinDialogTitle,
+                s.enterPinLabel,
+                s.pairAndSyncAction,
+                s.autoSyncStatusIdle,
+                s.autoSyncStatusSyncing,
+                s.autoSyncStatusSynced,
+                s.autoSyncStatusPending,
+                s.autoSyncStatusError,
+                s.pairSuccessToast,
+                s.pairRemovedToast,
+                s.pairTokenRequiredToast,
+                s.inboxThumbFallbackToast,
             )
             assertTrue(
                 required.all { it.isNotBlank() },

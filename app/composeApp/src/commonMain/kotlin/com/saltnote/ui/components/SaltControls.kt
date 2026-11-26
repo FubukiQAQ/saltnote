@@ -1,15 +1,31 @@
 package com.saltnote.ui.components
 
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.AssistChipDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
+import com.saltnote.ui.i18n.LocalSaltStrings
+import com.saltnote.ui.state.AutoSyncStateKind
+import com.saltnote.ui.state.AutoSyncStatus
 
 /**
  * Material 3 FilterChip hardened against Compose Multiplatform / Skia hover-shadow artifacts:
@@ -104,4 +120,59 @@ fun SaltAssistChip(
             borderWidth = 1.dp,
         ),
     )
+}
+
+/**
+ * Calm, unobtrusive status pill displaying background Salt Inbox / Vault auto-sync state.
+ * Tapping triggers an immediate best-effort sync pass.
+ */
+@Composable
+fun AutoSyncStatusPill(
+    status: AutoSyncStatus,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val strings = LocalSaltStrings.current
+    val (label, dotColor) = when (status.kind) {
+        AutoSyncStateKind.Syncing -> strings.autoSyncStatusSyncing to MaterialTheme.colorScheme.primary
+        AutoSyncStateKind.Synced -> strings.autoSyncStatusSynced to Color(0xFF2E7D32)
+        AutoSyncStateKind.PendingOffline -> strings.autoSyncStatusPending to Color(0xFFED6C02)
+        AutoSyncStateKind.Error -> strings.autoSyncStatusError to MaterialTheme.colorScheme.error
+        AutoSyncStateKind.Idle -> strings.autoSyncStatusIdle to MaterialTheme.colorScheme.outline
+    }
+    Surface(
+        onClick = onClick,
+        modifier = modifier,
+        shape = RoundedCornerShape(50),
+        color = MaterialTheme.colorScheme.surfaceContainerLowest,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+        shadowElevation = 0.dp,
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            if (status.kind == AutoSyncStateKind.Syncing) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(11.dp),
+                    strokeWidth = 1.8.dp,
+                    color = dotColor,
+                )
+            } else {
+                Box(
+                    modifier = Modifier
+                        .size(7.dp)
+                        .clip(CircleShape)
+                        .background(dotColor),
+                )
+            }
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+            )
+        }
+    }
 }

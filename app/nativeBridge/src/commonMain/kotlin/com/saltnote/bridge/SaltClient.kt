@@ -26,6 +26,7 @@ interface SaltNoteClient {
     val secretVault: SecretVault
 
     fun getSyncRevision(): Long
+    fun getInboxSyncRevision(): Long
     fun getDeviceState(): DeviceStateDto
     fun listPages(): List<PageSummaryDto>
     fun ensureWelcomePage(): PageMetaDto
@@ -182,6 +183,22 @@ interface SaltNoteClient {
     fun stopLanP2p()
     fun listLanPeers(): List<LanPeerInfoDto>
     fun syncWithLanPeer(host: String, port: Int, expectedFingerprint: String): P2pSyncResultDto
+
+    fun getSyncPrefs(): LocalSyncPrefsDto
+    fun saveSyncPrefs(prefs: LocalSyncPrefsDto)
+    fun listPairedPeers(): List<PairedPeerDto>
+    fun removePairedPeer(deviceId: String)
+    fun setPairedPeerAutoSync(deviceId: String, enabled: Boolean)
+    fun rotateLanPairingInfo(): LanNodeInfoDto
+    fun refreshLanNetwork(): LanNodeInfoDto?
+    fun pairWithLanPeer(
+        host: String,
+        port: Int,
+        expectedFingerprint: String,
+        pairingSecret: String,
+    ): P2pSyncResultDto
+
+    fun syncAllPairedLanPeers(): LanBatchSyncReportDto
 
     // Salt Inbox & Micro-Session FSRS (v0.2-alpha)
     fun captureInboxItem(input: InboxCaptureInputDto): String

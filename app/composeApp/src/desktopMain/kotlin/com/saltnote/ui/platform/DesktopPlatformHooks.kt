@@ -236,6 +236,14 @@ actual fun requestMicrophonePermission(onResult: (Boolean) -> Unit) {
     onResult(true)
 }
 
+actual fun currentNetworkState(): PlatformNetworkState =
+    PlatformNetworkState(isOnline = true, isMetered = false, isWifiOrEthernet = true)
+
+actual fun observeNetworkState(onChange: (PlatformNetworkState) -> Unit): () -> Unit {
+    onChange(currentNetworkState())
+    return {}
+}
+
 actual fun isNetworkMetered(): Boolean = false
 
 actual fun observeNetworkMetered(onChange: (Boolean) -> Unit): () -> Unit {

@@ -46,6 +46,8 @@ private class NativeSaltNoteClient(
 
     override fun getSyncRevision(): Long = engine.getSyncRevision().toLong()
 
+    override fun getInboxSyncRevision(): Long = engine.getInboxSyncRevision().toLong()
+
     override fun getDeviceState(): DeviceStateDto =
         saltJson.decodeFromString(engine.getDeviceStateJson())
 
@@ -337,6 +339,43 @@ private class NativeSaltNoteClient(
     ): P2pSyncResultDto = saltJson.decodeFromString(
         engine.syncWithLanPeerJson(host, port.toUShort(), expectedFingerprint),
     )
+
+    override fun getSyncPrefs(): LocalSyncPrefsDto =
+        saltJson.decodeFromString(engine.getSyncPrefsJson())
+
+    override fun saveSyncPrefs(prefs: LocalSyncPrefsDto) {
+        engine.saveSyncPrefsJson(saltJson.encodeToString(prefs))
+    }
+
+    override fun listPairedPeers(): List<PairedPeerDto> =
+        saltJson.decodeFromString(engine.listPairedPeersJson())
+
+    override fun removePairedPeer(deviceId: String) {
+        engine.removePairedPeer(deviceId)
+    }
+
+    override fun setPairedPeerAutoSync(deviceId: String, enabled: Boolean) {
+        engine.setPairedPeerAutoSync(deviceId, enabled)
+    }
+
+    override fun rotateLanPairingInfo(): LanNodeInfoDto =
+        saltJson.decodeFromString(engine.rotateLanPairingInfoJson())
+
+    override fun refreshLanNetwork(): LanNodeInfoDto? = runCatching {
+        saltJson.decodeFromString<LanNodeInfoDto>(engine.refreshLanNetworkJson())
+    }.getOrNull()
+
+    override fun pairWithLanPeer(
+        host: String,
+        port: Int,
+        expectedFingerprint: String,
+        pairingSecret: String,
+    ): P2pSyncResultDto = saltJson.decodeFromString(
+        engine.pairWithLanPeerJson(host, port.toUShort(), expectedFingerprint, pairingSecret),
+    )
+
+    override fun syncAllPairedLanPeers(): LanBatchSyncReportDto =
+        saltJson.decodeFromString(engine.syncAllPairedLanPeersJson())
 
     override fun captureInboxItem(input: InboxCaptureInputDto): String =
         inboxService.captureItem(

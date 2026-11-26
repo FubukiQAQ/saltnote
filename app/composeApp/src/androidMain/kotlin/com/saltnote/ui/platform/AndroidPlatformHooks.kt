@@ -443,35 +443,72 @@ actual fun requestMicrophonePermission(onResult: (Boolean) -> Unit) {
     }
 }
 
-actual fun isNetworkMetered(): Boolean {
-    if (!AndroidPlatformContext.isInitialized()) return false
+actual fun currentNetworkState(): PlatformNetworkState {
+    if (!AndroidPlatformContext.isInitialized()) {
+        return PlatformNetworkState(isOnline = false, isMetered = false, isWifiOrEthernet = false)
+    }
     val cm = AndroidPlatformContext.appContext.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
-        ?: return false
-    val active = cm.activeNetwork ?: return false
-    val caps = cm.getNetworkCapabilities(active) ?: return cm.isActiveNetworkMetered
+        ?: return PlatformNetworkState(isOnline = false, isMetered = false, isWifiOrEthernet = false)
+    val active = cm.activeNetwork
+        ?: return PlatformNetworkState(isOnline = false, isMetered = false, isWifiOrEthernet = false)
+    val caps = cm.getNetworkCapabilities(active)
+        ?: return PlatformNetworkState(
+            isOnline = true,
+            isMetered = cm.isActiveNetworkMetered,
+            isWifiOrEthernet = !cm.isActiveNetworkMetered,
+        )
+    val isWifiOrEth = caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
+        caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)
+    val isOnline = isWifiOrEth || caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
     val unmetered = caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED) ||
         caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_TEMPORARILY_NOT_METERED)
-    return !unmetered || cm.isActiveNetworkMetered
+    val isMetered = if (isWifiOrEth) false else (!unmetered || cm.isActiveNetworkMetered)
+    return PlatformNetworkState(
+        isOnline = isOnline,
+        isMetered = isMetered,
+        isWifiOrEthernet = isWifiOrEth,
+    )
 }
 
-actual fun observeNetworkMetered(onChange: (Boolean) -> Unit): () -> Unit {
+actual fun observeNetworkState(onChange: (PlatformNetworkState) -> Unit): () -> Unit {
     if (!AndroidPlatformContext.isInitialized()) {
-        onChange(false)
+        onChange(PlatformNetworkState(isOnline = false, isMetered = false, isWifiOrEthernet = false))
         return {}
     }
     val cm = AndroidPlatformContext.appContext.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
     if (cm == null) {
-        onChange(false)
+        onChange(PlatformNetworkState(isOnline = false, isMetered = false, isWifiOrEthernet = false))
         return {}
     }
-    onChange(isNetworkMetered())
+    onChange(currentNetworkState())
     val cb = object : ConnectivityManager.NetworkCallback() {
-        override fun onAvailable(network: Network) = onChange(isNetworkMetered())
-        override fun onLost(network: Network) = onChange(isNetworkMetered())
+        override fun onAvailable(network: Network) = onChange(currentNetworkState())
+        override fun onLost(network: Network) {
+            val state = if (cm.activeNetwork == network) {
+                PlatformNetworkState(isOnline = false, isMetered = false, isWifiOrEthernet = false)
+            } else {
+                currentNetworkState()
+            }
+            onChange(state)
+        }
         override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
+            val isWifiOrEth = networkCapabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
+                networkCapabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)
+            val isOnline = isWifiOrEth ||
+                networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
             val unmetered = networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED) ||
                 networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_TEMPORARILY_NOT_METERED)
-            onChange(!unmetered || cm.isActiveNetworkMetered)
+            val isMetered = if (isWifiOrEth) false else (!unmetered || cm.isActiveNetworkMetered)
+            onChange(
+                PlatformNetworkState(
+                    isOnline = isOnline,
+                    isMetered = isMetered,
+                    isWifiOrEthernet = isWifiOrEth,
+                ),
+            )
+        }
+        override fun onLinkPropertiesChanged(network: Network, linkProperties: android.net.LinkProperties) {
+            onChange(currentNetworkState())
         }
     }
     return runCatching<() -> Unit> {
@@ -482,6 +519,11 @@ actual fun observeNetworkMetered(onChange: (Boolean) -> Unit): () -> Unit {
         {}
     }
 }
+
+actual fun isNetworkMetered(): Boolean = currentNetworkState().isMetered
+
+actual fun observeNetworkMetered(onChange: (Boolean) -> Unit): () -> Unit =
+    observeNetworkState { onChange(it.isMetered) }
 
 actual fun startVoiceRecording(onError: (String) -> Unit): PlatformVoiceRecorderSession? {
     if (!AndroidPlatformContext.isInitialized()) return null

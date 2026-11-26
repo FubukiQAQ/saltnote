@@ -122,7 +122,14 @@ class MainActivity : ComponentActivity() {
         intent.removeExtra(SaltClientRegistry.EXTRA_LAUNCH_ACTION)
     }
 
+    override fun onResume() {
+        super.onResume()
+        SaltClientRegistry.isMainActivityActive.set(true)
+        appState?.onAppResumed()
+    }
+
     override fun onPause() {
+        SaltClientRegistry.isMainActivityActive.set(false)
         super.onPause()
         runCatching { appState?.client?.flushDeltas() }
         lifecycleScope.launch(Dispatchers.IO) {
@@ -132,7 +139,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        SaltClientRegistry.isMainActivityActive.set(false)
         appState?.dispose()
-        runCatching { appState?.client?.stopLanP2p() }
     }
 }

@@ -34,6 +34,14 @@ expect fun supportsLiveCameraQrScan(): Boolean
 expect fun supportsInboxCameraCapture(): Boolean
 expect fun hasMicrophonePermission(): Boolean
 expect fun requestMicrophonePermission(onResult: (Boolean) -> Unit)
+data class PlatformNetworkState(
+    val isOnline: Boolean,
+    val isMetered: Boolean,
+    val isWifiOrEthernet: Boolean,
+)
+
+expect fun currentNetworkState(): PlatformNetworkState
+expect fun observeNetworkState(onChange: (PlatformNetworkState) -> Unit): () -> Unit
 expect fun isNetworkMetered(): Boolean
 expect fun observeNetworkMetered(onChange: (Boolean) -> Unit): () -> Unit
 

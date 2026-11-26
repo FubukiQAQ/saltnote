@@ -11,13 +11,14 @@ use salt_router::{
     SecretResolver, StreamSink,
 };
 use salt_sync::{
-    BackoffSchedule, LanP2pNode, RelayEnrichRequest, SaltRelayHandler, WebDavSyncClient,
+    BackoffSchedule, LanP2pNode, RelayEnrichRequest, RemoteSyncScope, SaltRelayHandler,
+    WebDavSyncClient,
 };
 use salt_types::{
     content_addressed_asset_rel_path, decode_raw_points_le, is_local_or_rfc1918_endpoint,
     new_ulid, now_utc_ms, redact_sensitive_text, AiProviderKind, BrushKind, CanvasImageNode,
-    CanvasSnapshot, FlashCard, HaloAnnotation, InboxItem, PageMode, ProviderConfig, RectF,
-    ReviewLog, ReviewRating, RouterConfig, SaltError, SaltResult, StrokeTransform,
+    CanvasSnapshot, FlashCard, HaloAnnotation, InboxItem, LocalSyncPrefs, PageMode, ProviderConfig,
+    RectF, ReviewLog, ReviewRating, RouterConfig, SaltError, SaltResult, StrokeTransform,
     SyncNetworkPolicy, TranscriptStatus, VisionPolicy, WebDavConfig,
 };
 use serde::Serialize;
@@ -152,6 +153,9 @@ struct LanNodeInfoJson {
     host_ip: String,
     port: u16,
     fingerprint: String,
+    pairing_token: String,
+    pairing_pin: String,
+    pairing_expires_at_utc: i64,
 }
 
 #[derive(Serialize)]
@@ -477,6 +481,10 @@ impl SaltEngine {
 
     pub fn get_sync_revision(&self) -> u64 {
         self.vault.sync_revision()
+    }
+
+    pub fn get_inbox_sync_revision(&self) -> u64 {
+        self.vault.inbox_sync_revision()
     }
 
     pub fn get_device_state_json(&self) -> String {
@@ -1183,6 +1191,9 @@ impl SaltEngine {
                 detail: e.to_string(),
             })?;
         self.vault.save_router_config(&cfg)?;
+        if let Some(node) = self.p2p_node.lock().as_ref() {
+            node.set_relay_available(cfg.salt_relay_enabled);
+        }
         Ok(())
     }
 
@@ -1331,17 +1342,44 @@ impl SaltEngine {
         Ok(serde_json::to_string(&report).unwrap_or_else(|_| "{}".into()))
     }
 
+    pub fn get_sync_prefs_json(&self) -> Result<String, FfiError> {
+        let prefs = self.vault.load_sync_prefs();
+        Ok(serde_json::to_string(&prefs).unwrap_or_else(|_| "{}".into()))
+    }
+
+    pub fn save_sync_prefs_json(&self, prefs_json: String) -> Result<(), FfiError> {
+        let prefs: LocalSyncPrefs =
+            serde_json::from_str(&prefs_json).map_err(|e| FfiError::InvalidInput {
+                detail: e.to_string(),
+            })?;
+        self.vault.save_sync_prefs(&prefs)?;
+        Ok(())
+    }
+
+    pub fn list_paired_peers_json(&self) -> Result<String, FfiError> {
+        let peers = self.vault.load_paired_peers();
+        Ok(serde_json::to_string(&peers).unwrap_or_else(|_| "[]".into()))
+    }
+
+    pub fn remove_paired_peer(&self, device_id: String) -> Result<(), FfiError> {
+        self.vault.remove_paired_peer(&device_id)?;
+        Ok(())
+    }
+
+    pub fn set_paired_peer_auto_sync(
+        &self,
+        device_id: String,
+        enabled: bool,
+    ) -> Result<(), FfiError> {
+        self.vault.set_paired_peer_auto_sync(&device_id, enabled)?;
+        Ok(())
+    }
+
     pub fn start_lan_p2p(&self, enable_mdns: bool) -> Result<String, FfiError> {
         let _guard = GLOBAL_RUNTIME.enter();
         let mut slot = self.p2p_node.lock();
         if let Some(existing) = slot.as_ref() {
-            let info = LanNodeInfoJson {
-                device_id: self.vault.device_state().device_id,
-                host_ip: existing.local_ip().to_string(),
-                port: existing.local_port(),
-                fingerprint: existing.cert_fingerprint().to_string(),
-            };
-            return Ok(serde_json::to_string(&info).unwrap_or_else(|_| "{}".into()));
+            return Ok(self.build_lan_node_info_json(existing));
         }
         let hook = self.make_remote_sync_hook();
         let relay = self.make_salt_relay_handler();
@@ -1351,20 +1389,33 @@ impl SaltEngine {
             Some(hook),
             Some(relay),
         )?);
-        let info = LanNodeInfoJson {
-            device_id: self.vault.device_state().device_id,
-            host_ip: node.local_ip().to_string(),
-            port: node.local_port(),
-            fingerprint: node.cert_fingerprint().to_string(),
-        };
+        let json = self.build_lan_node_info_json(&node);
         *slot = Some(node);
-        Ok(serde_json::to_string(&info).unwrap_or_else(|_| "{}".into()))
+        Ok(json)
     }
 
     pub fn stop_lan_p2p(&self) {
         if let Some(node) = self.p2p_node.lock().take() {
             node.shutdown();
         }
+    }
+
+    pub fn rotate_lan_pairing_info_json(&self) -> Result<String, FfiError> {
+        let slot = self.p2p_node.lock();
+        let node = slot.as_ref().ok_or_else(|| FfiError::InvalidInput {
+            detail: "LAN P2P is not running".into(),
+        })?;
+        let _ = node.rotate_pairing_info();
+        Ok(self.build_lan_node_info_json(node))
+    }
+
+    pub fn refresh_lan_network_json(&self) -> Result<String, FfiError> {
+        let slot = self.p2p_node.lock();
+        let node = slot.as_ref().ok_or_else(|| FfiError::InvalidInput {
+            detail: "LAN P2P is not running".into(),
+        })?;
+        let _ = node.refresh_local_ip();
+        Ok(self.build_lan_node_info_json(node))
     }
 
     pub fn list_lan_peers_json(&self) -> String {
@@ -1375,6 +1426,36 @@ impl SaltEngine {
             }
             None => "[]".into(),
         }
+    }
+
+    pub fn pair_with_lan_peer_json(
+        &self,
+        host: String,
+        port: u16,
+        expected_fingerprint: String,
+        pairing_secret: String,
+    ) -> Result<String, FfiError> {
+        let addr: SocketAddr =
+            format!("{host}:{port}")
+                .parse()
+                .map_err(|e: std::net::AddrParseError| FfiError::InvalidInput {
+                    detail: e.to_string(),
+                })?;
+
+        let node = self.ensure_lan_p2p_node(true)?;
+        GLOBAL_RUNTIME.block_on(node.pair_with_peer(
+            addr,
+            &expected_fingerprint,
+            &pairing_secret,
+            &self.vault,
+        ))?;
+        let res =
+            GLOBAL_RUNTIME.block_on(node.sync_with_peer(addr, &expected_fingerprint, &self.vault))?;
+        if res.received_packets > 0 {
+            self.intel.rebuild_from_vault(&self.vault)?;
+            self.spatial_cache.write().clear();
+        }
+        Ok(serde_json::to_string(&res).unwrap_or_else(|_| "{}".into()))
     }
 
     pub fn sync_with_lan_peer_json(
@@ -1390,25 +1471,24 @@ impl SaltEngine {
                     detail: e.to_string(),
                 })?;
 
-        let node = {
-            let _guard = GLOBAL_RUNTIME.enter();
-            let mut slot = self.p2p_node.lock();
-            if slot.is_none() {
-                let hook = self.make_remote_sync_hook();
-                let relay = self.make_salt_relay_handler();
-                *slot = Some(Arc::new(LanP2pNode::start_with_relay(
-                    Arc::clone(&self.vault),
-                    false,
-                    Some(hook),
-                    Some(relay),
-                )?));
-            }
-            Arc::clone(slot.as_ref().unwrap())
-        };
-        let res = GLOBAL_RUNTIME.block_on(node.sync_with_peer(addr, &expected_fingerprint, &self.vault))?;
-        self.intel.rebuild_from_vault(&self.vault)?;
-        self.spatial_cache.write().clear();
+        let node = self.ensure_lan_p2p_node(false)?;
+        let res =
+            GLOBAL_RUNTIME.block_on(node.sync_with_peer(addr, &expected_fingerprint, &self.vault))?;
+        if res.received_packets > 0 {
+            self.intel.rebuild_from_vault(&self.vault)?;
+            self.spatial_cache.write().clear();
+        }
         Ok(serde_json::to_string(&res).unwrap_or_else(|_| "{}".into()))
+    }
+
+    pub fn sync_all_paired_lan_peers_json(&self) -> Result<String, FfiError> {
+        let node = self.ensure_lan_p2p_node(false)?;
+        let report = GLOBAL_RUNTIME.block_on(node.sync_all_paired_peers(&self.vault, 3_000));
+        if report.total_received_packets > 0 {
+            self.intel.rebuild_from_vault(&self.vault)?;
+            self.spatial_cache.write().clear();
+        }
+        Ok(serde_json::to_string(&report).unwrap_or_else(|_| "{}".into()))
     }
 
     pub fn redact_log_text(&self, raw: String) -> String {
@@ -1417,13 +1497,50 @@ impl SaltEngine {
 }
 
 impl SaltEngine {
-    fn make_remote_sync_hook(&self) -> salt_sync::p2p::OnRemoteSyncHook {
+    fn ensure_lan_p2p_node(&self, enable_discovery: bool) -> Result<Arc<LanP2pNode>, FfiError> {
+        let _guard = GLOBAL_RUNTIME.enter();
+        let mut slot = self.p2p_node.lock();
+        if let Some(existing) = slot.as_ref() {
+            return Ok(Arc::clone(existing));
+        }
+        let hook = self.make_remote_sync_hook();
+        let relay = self.make_salt_relay_handler();
+        let node = Arc::new(LanP2pNode::start_with_relay(
+            Arc::clone(&self.vault),
+            enable_discovery,
+            Some(hook),
+            Some(relay),
+        )?);
+        *slot = Some(Arc::clone(&node));
+        Ok(node)
+    }
+
+    fn build_lan_node_info_json(&self, node: &LanP2pNode) -> String {
+        let p = node.pairing_info();
+        let info = LanNodeInfoJson {
+            device_id: self.vault.device_state().device_id,
+            host_ip: node.local_ip(),
+            port: node.local_port(),
+            fingerprint: node.cert_fingerprint().to_string(),
+            pairing_token: p.token,
+            pairing_pin: p.pin,
+            pairing_expires_at_utc: p.expires_at_utc,
+        };
+        serde_json::to_string(&info).unwrap_or_else(|_| "{}".into())
+    }
+
+    fn make_remote_sync_hook(&self) -> salt_sync::OnRemoteSyncHook {
         let vault = Arc::clone(&self.vault);
         let intel = Arc::clone(&self.intel);
         let spatial = Arc::clone(&self.spatial_cache);
-        Arc::new(move || {
-            let _ = intel.rebuild_from_vault(&vault);
-            spatial.write().clear();
+        Arc::new(move |scope: RemoteSyncScope| {
+            if scope.pages_changed {
+                let _ = intel.rebuild_from_vault(&vault);
+                spatial.write().clear();
+            }
+            if scope.inbox_changed {
+                vault.bump_inbox_sync_revision();
+            }
             vault.bump_sync_revision();
         })
     }
@@ -1759,7 +1876,7 @@ async fn enrich_inbox_item_impl(
             if let Some(relay_peer) = node
                 .discovered_peers()
                 .into_iter()
-                .find(|p| p.relay_available)
+                .find(|p| p.relay_available && p.is_paired)
             {
                 if let Ok(addr) = format!("{}:{}", relay_peer.host, relay_peer.port).parse::<SocketAddr>() {
                     let _ = vault.update_inbox_enrichment(
@@ -2058,5 +2175,59 @@ mod tests {
         assert_eq!(plan.cards[0].source_page_title, "Linear Algebra");
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn ffi_lan_pairing_and_batch_inbox_sync_roundtrip() {
+        let base = std::env::temp_dir().join(format!("saltnote_ffi_lan_{}", new_ulid()));
+        let phone = SaltEngine::open(
+            base.join("phone").to_string_lossy().to_string(),
+            "FFI-Phone".into(),
+            Box::new(TestSecrets),
+        )
+        .unwrap();
+        let pc = SaltEngine::open(
+            base.join("pc").to_string_lossy().to_string(),
+            "FFI-PC".into(),
+            Box::new(TestSecrets),
+        )
+        .unwrap();
+
+        let pc_info_json = pc.start_lan_p2p(false).unwrap();
+        let pc_info: serde_json::Value = serde_json::from_str(&pc_info_json).unwrap();
+        let pc_port = pc_info["port"].as_u64().unwrap() as u16;
+        let pc_fp = pc_info["fingerprint"].as_str().unwrap().to_string();
+        let pc_token = pc_info["pairing_token"].as_str().unwrap().to_string();
+
+        phone
+            .pair_with_lan_peer_json("127.0.0.1".into(), pc_port, pc_fp, pc_token)
+            .unwrap();
+        assert!(phone.list_paired_peers_json().unwrap().contains("FFI-PC"));
+        assert!(pc.list_paired_peers_json().unwrap().contains("FFI-Phone"));
+
+        let inbox_id = phone
+            .inbox()
+            .capture_item(InboxCaptureInput {
+                kind: InboxKind::QuickText,
+                text_note: Some("Auto sync via paired batch".into()),
+                primary_media_bytes: None,
+                primary_media_ext: None,
+                thumb_webp_bytes: None,
+                audio_duration_ms: 0,
+                is_private: false,
+            })
+            .unwrap();
+        assert!(inbox_id.starts_with("inbx_"));
+
+        let batch_json = phone.sync_all_paired_lan_peers_json().unwrap();
+        let batch: salt_types::LanBatchSyncReport = serde_json::from_str(&batch_json).unwrap();
+        assert_eq!(batch.succeeded_peers, 1);
+        assert_eq!(batch.total_sent_packets, 1);
+        assert!(pc.get_inbox_sync_revision() >= 1);
+        assert_eq!(pc.inbox().list_items(false, 10).unwrap().len(), 1);
+
+        phone.stop_lan_p2p();
+        pc.stop_lan_p2p();
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

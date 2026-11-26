@@ -70,6 +70,7 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import com.saltnote.bridge.InboxItemViewDto
 import com.saltnote.bridge.InboxKindDto
+import com.saltnote.ui.components.AutoSyncStatusPill
 import com.saltnote.ui.components.SaltAssistChip
 import com.saltnote.ui.components.SaltFilterChip
 import com.saltnote.ui.i18n.LocalSaltStrings
@@ -224,10 +225,19 @@ fun FragmentHubScreen(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween,
             ) {
-                Text(
-                    text = "${strings.inboxTitle} (${state.inboxItems.size})",
-                    style = MaterialTheme.typography.titleMedium,
-                )
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Text(
+                        text = "${strings.inboxTitle} (${state.inboxItems.size})",
+                        style = MaterialTheme.typography.titleMedium,
+                    )
+                    AutoSyncStatusPill(
+                        status = state.autoSyncStatus,
+                        onClick = { state.triggerManualAutoSync() },
+                    )
+                }
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(6.dp),

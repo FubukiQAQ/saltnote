@@ -886,6 +886,10 @@ impl SyncNetworkPolicy {
     }
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LanPeerInfo {
     pub device_id: String,
@@ -895,6 +899,74 @@ pub struct LanPeerInfo {
     pub cert_fingerprint: String,
     #[serde(default)]
     pub relay_available: bool,
+    #[serde(default)]
+    pub is_paired: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairedPeer {
+    pub device_id: String,
+    pub device_name: String,
+    pub cert_fingerprint: String,
+    pub last_host: String,
+    pub last_port: u16,
+    pub paired_at_utc: i64,
+    #[serde(default)]
+    pub last_sync_utc: i64,
+    #[serde(default = "default_true")]
+    pub auto_sync: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalSyncPrefs {
+    #[serde(default = "default_true")]
+    pub lan_auto_start: bool,
+    #[serde(default = "default_true")]
+    pub auto_sync_on_capture: bool,
+    #[serde(default = "default_true")]
+    pub auto_sync_on_edit: bool,
+    #[serde(default = "default_true")]
+    pub auto_sync_webdav: bool,
+    #[serde(default)]
+    pub mirror_webdav_after_lan: bool,
+}
+
+impl Default for LocalSyncPrefs {
+    fn default() -> Self {
+        Self {
+            lan_auto_start: true,
+            auto_sync_on_capture: true,
+            auto_sync_on_edit: true,
+            auto_sync_webdav: true,
+            mirror_webdav_after_lan: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LanBatchSyncReport {
+    pub attempted_peers: u32,
+    pub succeeded_peers: u32,
+    pub total_sent_packets: u32,
+    pub total_received_packets: u32,
+    pub total_sent_assets: u32,
+    pub total_received_assets: u32,
+    pub synced_device_ids: Vec<String>,
+    pub errors: Vec<String>,
+}
+
+/// Generates a 128-bit hex pairing token for `saltnote://pair` QR URIs.
+pub fn new_pairing_token_hex() -> String {
+    let seed = format!("{}:{}", new_ulid(), new_ulid());
+    sha256_hex(seed.as_bytes())[..32].to_string()
+}
+
+/// Generates a 6-digit pairing PIN derived from two CSPRNG-backed ULIDs.
+pub fn new_pairing_pin_6() -> String {
+    let seed = format!("{}:{}", new_ulid(), new_ulid());
+    let digest = Sha256::digest(seed.as_bytes());
+    let val = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]);
+    format!("{:06}", val % 1_000_000)
 }
 
 // ============================================================================
@@ -1180,5 +1252,23 @@ mod tests {
         assert!(!redacted.contains("AIzaSyTestKey999"));
         assert!(redacted.contains("Authorization: [REDACTED]"));
         assert!(redacted.contains("x-api-key: [REDACTED]"));
+    }
+
+    #[test]
+    fn pairing_secrets_and_sync_prefs_defaults() {
+        let token = new_pairing_token_hex();
+        assert_eq!(token.len(), 32);
+        assert!(token.chars().all(|c| c.is_ascii_hexdigit()));
+
+        let pin = new_pairing_pin_6();
+        assert_eq!(pin.len(), 6);
+        assert!(pin.chars().all(|c| c.is_ascii_digit()));
+
+        let prefs: LocalSyncPrefs = serde_json::from_str("{}").unwrap();
+        assert!(prefs.lan_auto_start);
+        assert!(prefs.auto_sync_on_capture);
+        assert!(prefs.auto_sync_on_edit);
+        assert!(prefs.auto_sync_webdav);
+        assert!(!prefs.mirror_webdav_after_lan);
     }
 }

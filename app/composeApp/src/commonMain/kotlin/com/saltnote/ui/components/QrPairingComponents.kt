@@ -29,20 +29,37 @@ data class ParsedLanPairing(
     val port: Int,
     val fingerprint: String,
     val deviceName: String = "",
+    val token: String = "",
+    val deviceId: String = "",
 )
 
 /**
- * Encodes & parses `saltnote://pair?host=...&port=...&fp=...&name=...` URIs used for
+ * Encodes & parses `saltnote://pair?host=...&port=...&fp=...&name=...&token=...&id=...` URIs used for
  * QR code scanning and one-click clipboard pairing across Desktop and Android.
  */
 object LanPairingCodec {
     private const val PREFIX = "saltnote://pair?"
 
-    fun encode(host: String, port: Int, fingerprint: String, deviceName: String): String {
+    fun encode(
+        host: String,
+        port: Int,
+        fingerprint: String,
+        deviceName: String,
+        token: String = "",
+        deviceId: String = "",
+    ): String {
         val encHost = URLEncoder.encode(host.trim(), StandardCharsets.UTF_8.name())
         val encFp = URLEncoder.encode(fingerprint.trim(), StandardCharsets.UTF_8.name())
         val encName = URLEncoder.encode(deviceName.trim(), StandardCharsets.UTF_8.name())
-        return "${PREFIX}host=$encHost&port=$port&fp=$encFp&name=$encName"
+        val extras = buildString {
+            if (token.isNotBlank()) {
+                append("&token=").append(URLEncoder.encode(token.trim(), StandardCharsets.UTF_8.name()))
+            }
+            if (deviceId.isNotBlank()) {
+                append("&id=").append(URLEncoder.encode(deviceId.trim(), StandardCharsets.UTF_8.name()))
+            }
+        }
+        return "${PREFIX}host=$encHost&port=$port&fp=$encFp&name=$encName$extras"
     }
 
     fun parse(raw: String): ParsedLanPairing? {
@@ -72,6 +89,8 @@ object LanPairingCodec {
             port = port,
             fingerprint = fp,
             deviceName = params["name"].orEmpty(),
+            token = params["token"].orEmpty(),
+            deviceId = params["id"].orEmpty(),
         )
     }
 }
