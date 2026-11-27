@@ -26,6 +26,8 @@ expect fun exportMarkdownBackupWithPicker(
     onResult: (String) -> Unit,
 )
 expect fun formatUtcTimestamp(utcMs: Long): String
+
+expect fun currentHourOfDay(): Int
 expect fun setLanMulticastLock(enabled: Boolean)
 
 expect fun copyTextToClipboard(text: String)

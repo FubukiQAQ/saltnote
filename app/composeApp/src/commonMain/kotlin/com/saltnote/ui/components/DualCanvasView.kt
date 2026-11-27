@@ -11,14 +11,17 @@ import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -32,16 +35,29 @@ import androidx.compose.material.icons.rounded.CenterFocusStrong
 import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.Create
 import androidx.compose.material.icons.rounded.Delete
+import androidx.compose.material.icons.rounded.DeleteOutline
 import androidx.compose.material.icons.rounded.DoNotTouch
+import androidx.compose.material.icons.rounded.Edit
+import androidx.compose.material.icons.rounded.Fullscreen
+import androidx.compose.material.icons.rounded.FullscreenExit
 import androidx.compose.material.icons.rounded.Image
+import androidx.compose.material.icons.rounded.KeyboardArrowDown
 import androidx.compose.material.icons.rounded.OpenWith
 import androidx.compose.material.icons.rounded.Remove
+import androidx.compose.material.icons.rounded.Tune
+import androidx.compose.material.icons.rounded.UnfoldLess
+import androidx.compose.material.icons.rounded.UnfoldMore
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ElevatedCard
 import androidx.compose.material3.FilledIconToggleButton
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.VerticalDivider
@@ -66,10 +82,13 @@ import androidx.compose.ui.graphics.drawscope.withTransform
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import com.saltnote.bridge.CanvasImageNodeDto
+import com.saltnote.bridge.CanvasSnapshotDto
 import com.saltnote.bridge.HaloAnnotationDto
 import com.saltnote.bridge.RenderStrokeDto
 import com.saltnote.bridge.StrokeSample
@@ -119,7 +138,6 @@ fun DualCanvasView(
     panY: Float,
     zoom: Float,
     onSelectTool: (String) -> Unit,
-    onSelectColor: (Color) -> Unit,
     onStrokeWidthChange: (Float) -> Unit,
     onToggleStylusOnly: () -> Unit,
     onPanZoom: (Float, Float, Float, Float, Float) -> Unit,
@@ -129,7 +147,22 @@ fun DualCanvasView(
     onInsertImageBytes: (ByteArray) -> Unit,
     onOpenHalo: (HaloAnnotationDto) -> Unit,
     modifier: Modifier = Modifier,
+    penPalette: List<Color> = DefaultInkPalette,
+    selectedColorSlotIndex: Int = 0,
+    recentCustomColors: List<Color> = emptyList(),
+    onSelectColorSlot: (Int) -> Unit = {},
+    onUpdateColorSlot: (Int, Color) -> Unit = { _, _ -> },
+    onResetPaletteDefaults: () -> Unit = {},
     activeCanvasId: String = "main",
+    canvases: List<CanvasSnapshotDto> = emptyList(),
+    onSwitchCanvas: (String) -> Unit = {},
+    onCreateCanvas: () -> Unit = {},
+    onRenameCanvas: (String, String) -> Unit = { _, _ -> },
+    onDeleteCanvas: (String) -> Unit = {},
+    isDockCollapsed: Boolean = false,
+    onToggleDockCollapsed: () -> Unit = {},
+    isFocusMode: Boolean = false,
+    onToggleFocusMode: () -> Unit = {},
     activeHaloId: String? = null,
     selectedImageId: String? = null,
     onSelectImage: (String?) -> Unit = {},
@@ -141,12 +174,26 @@ fun DualCanvasView(
     var viewportSize by remember { mutableStateOf(IntSize.Zero) }
     var activeGestureImageId by remember { mutableStateOf<String?>(null) }
     var previewImageRect by remember { mutableStateOf<ImageWorldRect?>(null) }
+    var showCustomColorDialog by remember { mutableStateOf(false) }
+    var showBrushSettings by remember { mutableStateOf(false) }
+    var renamingCanvas by remember { mutableStateOf<CanvasSnapshotDto?>(null) }
+    var deletingCanvas by remember { mutableStateOf<CanvasSnapshotDto?>(null) }
+
+    val effectivePalette = remember(penPalette) {
+        penPalette.ifEmpty { DefaultInkPalette }
+    }
+    val standaloneCanvases = remember(canvases, activeCanvasId) {
+        canvases.filter { !it.isInline && !it.deleted }
+            .ifEmpty { listOf(CanvasSnapshotDto(canvasId = activeCanvasId, title = "")) }
+    }
+    fun canvasDisplayTitle(c: CanvasSnapshotDto): String =
+        c.title.ifBlank { if (c.canvasId == "main") strings.defaultMainCanvasTitle else c.canvasId }
 
     val activeToolColor = when (selectedTool) {
         "halo_amber" -> SaltHaloAmber
         "halo_glacier" -> SaltHaloGlacier
         "halo_mineral" -> SaltHaloMineral
-        "highlighter" -> if (inkColor == DefaultInkPalette[0]) SaltHaloAmber else inkColor
+        "highlighter" -> if (inkColor == effectivePalette.firstOrNull()) SaltHaloAmber else inkColor
         else -> inkColor
     }
 
@@ -159,7 +206,7 @@ fun DualCanvasView(
         }
     }
     val visibleHalos = remember(halos, activeCanvasId) {
-        halos.filter { it.canvasId == null || it.canvasId == activeCanvasId }
+        halos.filter { it.canvasId == activeCanvasId || (it.canvasId == null && activeCanvasId == "main") }
     }
     val activeHalo = remember(visibleHalos, activeHaloId) {
         if (activeHaloId == null) null else visibleHalos.firstOrNull { it.haloId == activeHaloId }
@@ -264,159 +311,302 @@ fun DualCanvasView(
             )
         }
 
-        // Layer 4: Material Design 3 Floating Tool Dock
-        ElevatedCard(
-            modifier = Modifier
-                .align(Alignment.TopCenter)
-                .padding(top = 12.dp, start = 12.dp, end = 12.dp),
-            shape = RoundedCornerShape(28.dp),
-        ) {
-            Row(
+        // Layer 4: Collapsible Floating Tool Dock
+        if (isDockCollapsed) {
+            ElevatedCard(
                 modifier = Modifier
-                    .horizontalScroll(rememberScrollState())
-                    .padding(horizontal = 10.dp, vertical = 6.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                    .align(Alignment.TopCenter)
+                    .padding(top = 12.dp),
+                shape = RoundedCornerShape(24.dp),
             ) {
-                ToolToggleIcon(
-                    selected = selectedTool == "pen",
-                    onClick = { onSelectTool("pen") },
-                    icon = Icons.Rounded.Create,
-                    description = strings.toolPen,
-                )
-                ToolToggleIcon(
-                    selected = selectedTool == "highlighter",
-                    onClick = { onSelectTool("highlighter") },
-                    icon = Icons.Rounded.BorderColor,
-                    description = strings.toolHighlighter,
-                )
-                ToolToggleIcon(
-                    selected = selectedTool == "eraser",
-                    onClick = { onSelectTool("eraser") },
-                    icon = Icons.Rounded.AutoFixOff,
-                    description = strings.toolEraser,
-                )
-                ToolToggleIcon(
-                    selected = selectedTool == "select",
-                    onClick = { onSelectTool(if (selectedTool == "select") "pen" else "select") },
-                    icon = Icons.Rounded.AspectRatio,
-                    description = strings.toolSelectImage,
-                )
-                ToolToggleIcon(
-                    selected = selectedTool == "pan",
-                    onClick = { onSelectTool("pan") },
-                    icon = Icons.Rounded.OpenWith,
-                    description = strings.toolPan,
-                )
-
-                // Stylus-only palm rejection toggle
-                Surface(
-                    onClick = onToggleStylusOnly,
-                    shape = RoundedCornerShape(18.dp),
-                    color = if (stylusOnlyMode) {
-                        MaterialTheme.colorScheme.primaryContainer
-                    } else {
-                        MaterialTheme.colorScheme.surfaceContainerLowest
-                    },
-                    shadowElevation = 0.dp,
-                    border = BorderStroke(
-                        width = 1.dp,
-                        color = if (stylusOnlyMode) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant,
-                    ),
+                Row(
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(4.dp),
+                    val toolIcon = when (selectedTool) {
+                        "highlighter" -> Icons.Rounded.BorderColor
+                        "eraser" -> Icons.Rounded.AutoFixOff
+                        "select" -> Icons.Rounded.AspectRatio
+                        "pan" -> Icons.Rounded.OpenWith
+                        else -> Icons.Rounded.Create
+                    }
+                    Icon(
+                        imageVector = toolIcon,
+                        contentDescription = null,
+                        tint = activeToolColor,
+                        modifier = Modifier.size(18.dp),
+                    )
+                    Box(
+                        modifier = Modifier
+                            .size(18.dp)
+                            .clip(CircleShape)
+                            .background(activeToolColor)
+                            .border(1.dp, MaterialTheme.colorScheme.outlineVariant, CircleShape)
+                            .clickable { showCustomColorDialog = true },
+                    )
+                    IconButton(
+                        onClick = onToggleDockCollapsed,
+                        modifier = Modifier.size(28.dp),
                     ) {
                         Icon(
-                            imageVector = Icons.Rounded.DoNotTouch,
-                            contentDescription = strings.palmRejection,
-                            tint = if (stylusOnlyMode) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.size(16.dp),
+                            Icons.Rounded.UnfoldMore,
+                            contentDescription = strings.expandToolbarDesc,
+                            modifier = Modifier.size(18.dp),
                         )
-                        Text(
-                            text = strings.palmRejection,
-                            style = MaterialTheme.typography.labelMedium,
-                            color = if (stylusOnlyMode) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurface,
+                    }
+                    IconButton(
+                        onClick = onToggleFocusMode,
+                        modifier = Modifier.size(28.dp),
+                    ) {
+                        Icon(
+                            imageVector = if (isFocusMode) Icons.Rounded.FullscreenExit else Icons.Rounded.Fullscreen,
+                            contentDescription = if (isFocusMode) strings.exitFocusMode else strings.focusMode,
+                            modifier = Modifier.size(18.dp),
                         )
                     }
                 }
-
-                VerticalDivider(modifier = Modifier.height(24.dp).padding(horizontal = 4.dp))
-
-                // 3-Color Salt Halo Command Pens
-                HaloPenButton(
-                    label = strings.haloAmberShort,
-                    color = SaltHaloAmber,
-                    selected = selectedTool == "halo_amber",
-                    onClick = { onSelectTool("halo_amber") },
-                )
-                HaloPenButton(
-                    label = strings.haloGlacierShort,
-                    color = SaltHaloGlacier,
-                    selected = selectedTool == "halo_glacier",
-                    onClick = { onSelectTool("halo_glacier") },
-                )
-                HaloPenButton(
-                    label = strings.haloMineralShort,
-                    color = SaltHaloMineral,
-                    selected = selectedTool == "halo_mineral",
-                    onClick = { onSelectTool("halo_mineral") },
-                )
-
-                VerticalDivider(modifier = Modifier.height(24.dp).padding(horizontal = 4.dp))
-
-                // Ink Color Swatches
-                DefaultInkPalette.forEach { swatch ->
-                    val chosen = inkColor == swatch && !selectedTool.startsWith("halo_")
-                    Box(
-                        modifier = Modifier
-                            .size(24.dp)
-                            .clip(CircleShape)
-                            .background(swatch)
-                            .border(
-                                width = if (chosen) 2.5.dp else 1.dp,
-                                color = if (chosen) MaterialTheme.colorScheme.primary else Color.Transparent,
-                                shape = CircleShape,
-                            )
-                            .clickable {
-                                onSelectColor(swatch)
-                                if (selectedTool.startsWith("halo_") || selectedTool == "eraser" || selectedTool == "pan" || selectedTool == "select") {
-                                    onSelectTool("pen")
-                                }
-                            },
+            }
+        } else {
+            ElevatedCard(
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .padding(top = 12.dp, start = 12.dp, end = 12.dp),
+                shape = RoundedCornerShape(28.dp),
+            ) {
+                Row(
+                    modifier = Modifier
+                        .horizontalScroll(rememberScrollState())
+                        .padding(horizontal = 10.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    ToolToggleIcon(
+                        selected = selectedTool == "pen",
+                        onClick = { onSelectTool("pen") },
+                        icon = Icons.Rounded.Create,
+                        description = strings.toolPen,
                     )
-                }
+                    ToolToggleIcon(
+                        selected = selectedTool == "highlighter",
+                        onClick = { onSelectTool("highlighter") },
+                        icon = Icons.Rounded.BorderColor,
+                        description = strings.toolHighlighter,
+                    )
+                    ToolToggleIcon(
+                        selected = selectedTool == "eraser",
+                        onClick = { onSelectTool("eraser") },
+                        icon = Icons.Rounded.AutoFixOff,
+                        description = strings.toolEraser,
+                    )
+                    ToolToggleIcon(
+                        selected = selectedTool == "select",
+                        onClick = { onSelectTool(if (selectedTool == "select") "pen" else "select") },
+                        icon = Icons.Rounded.AspectRatio,
+                        description = strings.toolSelectImage,
+                    )
+                    ToolToggleIcon(
+                        selected = selectedTool == "pan",
+                        onClick = { onSelectTool("pan") },
+                        icon = Icons.Rounded.OpenWith,
+                        description = strings.toolPan,
+                    )
 
-                Spacer(Modifier.width(4.dp))
+                    VerticalDivider(modifier = Modifier.height(24.dp).padding(horizontal = 4.dp))
 
-                IconButton(
-                    onClick = { onStrokeWidthChange((strokeWidth - 1f).coerceAtLeast(1.5f)) },
-                    modifier = Modifier.size(30.dp),
-                ) {
-                    Icon(Icons.Rounded.Remove, strings.thinnerDesc, modifier = Modifier.size(16.dp))
-                }
-                Text(
-                    text = "${strokeWidth.roundToInt()}px",
-                    style = MaterialTheme.typography.labelSmall,
-                )
-                IconButton(
-                    onClick = { onStrokeWidthChange((strokeWidth + 1f).coerceAtMost(14f)) },
-                    modifier = Modifier.size(30.dp),
-                ) {
-                    Icon(Icons.Rounded.Add, strings.thickerDesc, modifier = Modifier.size(16.dp))
-                }
+                    // 3-Color Salt Halo Command Pens
+                    HaloPenButton(
+                        label = strings.haloAmberShort,
+                        color = SaltHaloAmber,
+                        selected = selectedTool == "halo_amber",
+                        onClick = { onSelectTool("halo_amber") },
+                    )
+                    HaloPenButton(
+                        label = strings.haloGlacierShort,
+                        color = SaltHaloGlacier,
+                        selected = selectedTool == "halo_glacier",
+                        onClick = { onSelectTool("halo_glacier") },
+                    )
+                    HaloPenButton(
+                        label = strings.haloMineralShort,
+                        color = SaltHaloMineral,
+                        selected = selectedTool == "halo_mineral",
+                        onClick = { onSelectTool("halo_mineral") },
+                    )
 
-                VerticalDivider(modifier = Modifier.height(24.dp).padding(horizontal = 4.dp))
+                    VerticalDivider(modifier = Modifier.height(24.dp).padding(horizontal = 4.dp))
 
-                IconButton(
-                    onClick = {
-                        pickLocalImageBytes()?.let { onInsertImageBytes(it) }
-                    },
-                    modifier = Modifier.size(34.dp),
-                ) {
-                    Icon(Icons.Rounded.Image, strings.insertImageDesc)
+                    // Custom-editable 5-slot Pen Color Swatches (tap active slot -> custom picker)
+                    effectivePalette.forEachIndexed { idx, swatch ->
+                        val chosen = idx == selectedColorSlotIndex && !selectedTool.startsWith("halo_")
+                        Box(
+                            modifier = Modifier
+                                .size(25.dp)
+                                .clip(CircleShape)
+                                .background(swatch)
+                                .border(
+                                    width = if (chosen) 2.5.dp else 1.dp,
+                                    color = if (chosen) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f),
+                                    shape = CircleShape,
+                                )
+                                .clickable {
+                                    if (chosen) {
+                                        showCustomColorDialog = true
+                                    } else {
+                                        onSelectColorSlot(idx)
+                                    }
+                                },
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            if (chosen) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(6.dp)
+                                        .clip(CircleShape)
+                                        .background(Color.White.copy(alpha = 0.9f)),
+                                )
+                            }
+                        }
+                    }
+
+                    Spacer(Modifier.width(4.dp))
+
+                    // Brush width + Palm Rejection compact popover button
+                    Box {
+                        Surface(
+                            onClick = { showBrushSettings = true },
+                            shape = RoundedCornerShape(16.dp),
+                            color = if (stylusOnlyMode) {
+                                MaterialTheme.colorScheme.primaryContainer
+                            } else {
+                                MaterialTheme.colorScheme.surfaceContainerLowest
+                            },
+                            border = BorderStroke(
+                                1.dp,
+                                if (stylusOnlyMode) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant,
+                            ),
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 9.dp, vertical = 5.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(5.dp),
+                            ) {
+                                Icon(
+                                    imageVector = if (stylusOnlyMode) Icons.Rounded.DoNotTouch else Icons.Rounded.Tune,
+                                    contentDescription = strings.brushSettingsDesc,
+                                    tint = if (stylusOnlyMode) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.size(15.dp),
+                                )
+                                Text(
+                                    text = "${strokeWidth.roundToInt()}px",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = if (stylusOnlyMode) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurface,
+                                )
+                            }
+                        }
+
+                        DropdownMenu(
+                            expanded = showBrushSettings,
+                            onDismissRequest = { showBrushSettings = false },
+                        ) {
+                            Column(
+                                modifier = Modifier
+                                    .widthIn(min = 230.dp, max = 270.dp)
+                                    .padding(horizontal = 14.dp, vertical = 10.dp),
+                                verticalArrangement = Arrangement.spacedBy(8.dp),
+                            ) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Text(strings.brushSettingsDesc, style = MaterialTheme.typography.labelLarge)
+                                    Text("${strokeWidth.roundToInt()}px", style = MaterialTheme.typography.labelMedium)
+                                }
+                                Slider(
+                                    value = strokeWidth,
+                                    onValueChange = onStrokeWidthChange,
+                                    valueRange = 1.5f..14f,
+                                )
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                ) {
+                                    listOf(2f, 3.5f, 6f, 10f).forEach { preset ->
+                                        val activePreset = abs(strokeWidth - preset) < 0.7f
+                                        Surface(
+                                            onClick = { onStrokeWidthChange(preset) },
+                                            shape = RoundedCornerShape(10.dp),
+                                            color = if (activePreset) {
+                                                MaterialTheme.colorScheme.primaryContainer
+                                            } else {
+                                                MaterialTheme.colorScheme.surfaceContainerLow
+                                            },
+                                        ) {
+                                            Text(
+                                                text = "${preset.toInt()}px",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                                            )
+                                        }
+                                    }
+                                }
+                                HorizontalDivider()
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clickable { onToggleStylusOnly() },
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                ) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                    ) {
+                                        Icon(Icons.Rounded.DoNotTouch, null, modifier = Modifier.size(16.dp))
+                                        Text(strings.palmRejection, style = MaterialTheme.typography.bodySmall)
+                                    }
+                                    Switch(
+                                        checked = stylusOnlyMode,
+                                        onCheckedChange = { onToggleStylusOnly() },
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    VerticalDivider(modifier = Modifier.height(24.dp).padding(horizontal = 4.dp))
+
+                    IconButton(
+                        onClick = {
+                            pickLocalImageBytes()?.let { onInsertImageBytes(it) }
+                        },
+                        modifier = Modifier.size(32.dp),
+                    ) {
+                        Icon(Icons.Rounded.Image, strings.insertImageDesc, modifier = Modifier.size(19.dp))
+                    }
+
+                    IconButton(
+                        onClick = onToggleFocusMode,
+                        modifier = Modifier.size(32.dp),
+                    ) {
+                        Icon(
+                            imageVector = if (isFocusMode) Icons.Rounded.FullscreenExit else Icons.Rounded.Fullscreen,
+                            contentDescription = if (isFocusMode) strings.exitFocusMode else strings.focusMode,
+                            modifier = Modifier.size(19.dp),
+                        )
+                    }
+
+                    IconButton(
+                        onClick = onToggleDockCollapsed,
+                        modifier = Modifier.size(30.dp),
+                    ) {
+                        Icon(
+                            Icons.Rounded.UnfoldLess,
+                            contentDescription = strings.collapseToolbarDesc,
+                            modifier = Modifier.size(18.dp),
+                        )
+                    }
                 }
             }
         }
@@ -458,65 +648,208 @@ fun DualCanvasView(
             }
         }
 
-        if (selectedTool.startsWith("halo_")) {
-            val hint = when (selectedTool) {
-                "halo_amber" -> strings.haloAmberHint
-                "halo_glacier" -> strings.haloGlacierHint
-                else -> strings.haloMineralHint
-            }
-            Surface(
-                modifier = Modifier
-                    .align(Alignment.BottomStart)
-                    .padding(14.dp),
-                shape = RoundedCornerShape(16.dp),
-                color = activeToolColor.copy(alpha = 0.2f),
-                border = BorderStroke(1.dp, activeToolColor),
-            ) {
-                Text(
-                    text = hint,
-                    style = MaterialTheme.typography.labelMedium,
-                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
-                )
-            }
-        } else if (selectedTool == "select") {
-            Surface(
-                modifier = Modifier
-                    .align(Alignment.BottomStart)
-                    .padding(14.dp),
-                shape = RoundedCornerShape(16.dp),
-                color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.94f),
-                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
-            ) {
-                Row(
-                    modifier = Modifier.padding(start = 12.dp, end = 6.dp, top = 4.dp, bottom = 4.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+        // Layer 6: Bottom-Start Tool Hints + Multi-Canvas Switcher Floating Pill
+        Column(
+            modifier = Modifier
+                .align(Alignment.BottomStart)
+                .padding(14.dp)
+                .widthIn(max = 520.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+            horizontalAlignment = Alignment.Start,
+        ) {
+            if (selectedTool.startsWith("halo_")) {
+                val hint = when (selectedTool) {
+                    "halo_amber" -> strings.haloAmberHint
+                    "halo_glacier" -> strings.haloGlacierHint
+                    else -> strings.haloMineralHint
+                }
+                Surface(
+                    shape = RoundedCornerShape(16.dp),
+                    color = activeToolColor.copy(alpha = 0.2f),
+                    border = BorderStroke(1.dp, activeToolColor),
                 ) {
                     Text(
-                        text = strings.imageEditHint,
+                        text = hint,
                         style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.onSecondaryContainer,
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
                     )
-                    TextButton(
-                        onClick = {
-                            onSelectImage(null)
-                            onSelectTool("pen")
-                        },
+                }
+            } else if (selectedTool == "select") {
+                Surface(
+                    shape = RoundedCornerShape(16.dp),
+                    color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.94f),
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                ) {
+                    Row(
+                        modifier = Modifier.padding(start = 12.dp, end = 6.dp, top = 4.dp, bottom = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
-                        Icon(Icons.Rounded.Check, null, modifier = Modifier.size(16.dp))
-                        Spacer(Modifier.width(4.dp))
-                        Text(strings.done)
+                        Text(
+                            text = strings.imageEditHint,
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSecondaryContainer,
+                        )
+                        TextButton(
+                            onClick = {
+                                onSelectImage(null)
+                                onSelectTool("pen")
+                            },
+                        ) {
+                            Icon(Icons.Rounded.Check, null, modifier = Modifier.size(16.dp))
+                            Spacer(Modifier.width(4.dp))
+                            Text(strings.done)
+                        }
+                    }
+                }
+            }
+
+            Surface(
+                shape = RoundedCornerShape(20.dp),
+                color = MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.94f),
+                tonalElevation = 2.dp,
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.7f)),
+            ) {
+                Row(
+                    modifier = Modifier
+                        .horizontalScroll(rememberScrollState())
+                        .padding(horizontal = 8.dp, vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    standaloneCanvases.forEach { canvas ->
+                        val isSelected = canvas.canvasId == activeCanvasId
+                        var menuOpen by remember(canvas.canvasId) { mutableStateOf(false) }
+                        Box {
+                            Surface(
+                                onClick = {
+                                    if (isSelected) {
+                                        menuOpen = true
+                                    } else {
+                                        onSwitchCanvas(canvas.canvasId)
+                                    }
+                                },
+                                shape = RoundedCornerShape(14.dp),
+                                color = if (isSelected) {
+                                    MaterialTheme.colorScheme.primaryContainer
+                                } else {
+                                    Color.Transparent
+                                },
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 9.dp, vertical = 4.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(3.dp),
+                                ) {
+                                    Text(
+                                        text = canvasDisplayTitle(canvas),
+                                        style = MaterialTheme.typography.labelMedium,
+                                        fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Normal,
+                                        color = if (isSelected) {
+                                            MaterialTheme.colorScheme.onPrimaryContainer
+                                        } else {
+                                            MaterialTheme.colorScheme.onSurface
+                                        },
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.widthIn(max = 120.dp),
+                                    )
+                                    if (isSelected) {
+                                        Icon(
+                                            Icons.Rounded.KeyboardArrowDown,
+                                            contentDescription = null,
+                                            tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                                            modifier = Modifier.size(14.dp),
+                                        )
+                                    }
+                                }
+                            }
+                            DropdownMenu(
+                                expanded = menuOpen,
+                                onDismissRequest = { menuOpen = false },
+                            ) {
+                                DropdownMenuItem(
+                                    text = { Text(strings.renameCanvas) },
+                                    leadingIcon = { Icon(Icons.Rounded.Edit, null, modifier = Modifier.size(16.dp)) },
+                                    onClick = {
+                                        menuOpen = false
+                                        renamingCanvas = canvas
+                                    },
+                                )
+                                DropdownMenuItem(
+                                    text = { Text(strings.deleteCanvas) },
+                                    leadingIcon = { Icon(Icons.Rounded.DeleteOutline, null, modifier = Modifier.size(16.dp)) },
+                                    enabled = standaloneCanvases.size > 1,
+                                    onClick = {
+                                        menuOpen = false
+                                        deletingCanvas = canvas
+                                    },
+                                )
+                            }
+                        }
+                    }
+
+                    IconButton(
+                        onClick = onCreateCanvas,
+                        modifier = Modifier.size(26.dp),
+                    ) {
+                        Icon(
+                            Icons.Rounded.Add,
+                            contentDescription = strings.newCanvas,
+                            modifier = Modifier.size(17.dp),
+                        )
                     }
                 }
             }
         }
+    }
+
+    if (showCustomColorDialog) {
+        val currentSlotColor = effectivePalette.getOrElse(selectedColorSlotIndex) { inkColor }
+        CustomPenColorDialog(
+            initialColor = currentSlotColor,
+            recentColors = recentCustomColors,
+            onApply = { chosenColor ->
+                onUpdateColorSlot(selectedColorSlotIndex, chosenColor)
+                showCustomColorDialog = false
+            },
+            onResetDefaults = {
+                onResetPaletteDefaults()
+                showCustomColorDialog = false
+            },
+            onDismiss = { showCustomColorDialog = false },
+        )
+    }
+
+    renamingCanvas?.let { target ->
+        SaltRenameItemDialog(
+            title = strings.renameCanvas,
+            initialName = canvasDisplayTitle(target),
+            onConfirm = { newTitle ->
+                onRenameCanvas(target.canvasId, newTitle)
+                renamingCanvas = null
+            },
+            onDismiss = { renamingCanvas = null },
+        )
+    }
+
+    deletingCanvas?.let { target ->
+        SaltConfirmDeleteDialog(
+            title = strings.deleteCanvas,
+            message = strings.deleteCanvasConfirm,
+            onConfirm = {
+                onDeleteCanvas(target.canvasId)
+                deletingCanvas = null
+            },
+            onDismiss = { deletingCanvas = null },
+        )
     }
 }
 
 /**
  * Compact (<600dp) phone HD read-only canvas preview rendered purely via Compose [Canvas]
  * without a `SurfaceView` overlay, eliminating Android surface Z-order glitches while
- * supporting pinch-zoom, panning, and clickable Salt Halo crystal pins.
+ * supporting pinch-zoom, panning, canvas switching, and clickable Salt Halo crystal pins.
  */
 @Composable
 fun CompactCanvasPreview(
@@ -532,6 +865,8 @@ fun CompactCanvasPreview(
     onOpenHalo: (HaloAnnotationDto) -> Unit,
     modifier: Modifier = Modifier,
     activeCanvasId: String = "main",
+    canvases: List<CanvasSnapshotDto> = emptyList(),
+    onSwitchCanvas: (String) -> Unit = {},
     activeHaloId: String? = null,
 ) {
     val strings = LocalSaltStrings.current
@@ -544,10 +879,13 @@ fun CompactCanvasPreview(
         }
     }
     val visibleHalos = remember(halos, activeCanvasId) {
-        halos.filter { it.canvasId == null || it.canvasId == activeCanvasId }
+        halos.filter { it.canvasId == activeCanvasId || (it.canvasId == null && activeCanvasId == "main") }
     }
     val activeHalo = remember(visibleHalos, activeHaloId) {
         if (activeHaloId == null) null else visibleHalos.firstOrNull { it.haloId == activeHaloId }
+    }
+    val standaloneCanvases = remember(canvases) {
+        canvases.filter { !it.isInline && !it.deleted }
     }
 
     val dotColor = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.55f)
@@ -614,6 +952,46 @@ fun CompactCanvasPreview(
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
             )
+        }
+
+        if (standaloneCanvases.size > 1) {
+            Surface(
+                modifier = Modifier
+                    .align(Alignment.BottomStart)
+                    .padding(12.dp)
+                    .widthIn(max = 220.dp),
+                shape = RoundedCornerShape(18.dp),
+                color = MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.94f),
+                tonalElevation = 2.dp,
+            ) {
+                Row(
+                    modifier = Modifier
+                        .horizontalScroll(rememberScrollState())
+                        .padding(horizontal = 6.dp, vertical = 4.dp),
+                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    standaloneCanvases.forEach { c ->
+                        val isSelected = c.canvasId == activeCanvasId
+                        val title = c.title.ifBlank {
+                            if (c.canvasId == "main") strings.defaultMainCanvasTitle else c.canvasId
+                        }
+                        Surface(
+                            onClick = { onSwitchCanvas(c.canvasId) },
+                            shape = RoundedCornerShape(12.dp),
+                            color = if (isSelected) MaterialTheme.colorScheme.primaryContainer else Color.Transparent,
+                        ) {
+                            Text(
+                                text = title,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = if (isSelected) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurface,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                            )
+                        }
+                    }
+                }
+            }
         }
 
         Surface(

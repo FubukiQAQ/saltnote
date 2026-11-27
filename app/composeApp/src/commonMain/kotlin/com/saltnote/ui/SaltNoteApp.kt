@@ -1,5 +1,6 @@
 package com.saltnote.ui
 
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -21,6 +22,7 @@ import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.CloudSync
 import androidx.compose.material.icons.rounded.Description
 import androidx.compose.material.icons.rounded.EditNote
+import androidx.compose.material.icons.rounded.Home
 import androidx.compose.material.icons.rounded.Inbox
 import androidx.compose.material.icons.rounded.Mic
 import androidx.compose.material.icons.rounded.Settings
@@ -57,17 +59,23 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import com.saltnote.ui.components.LocalInboxFallbackResolver
+import com.saltnote.ui.components.LocalOnOpenImageLightbox
+import com.saltnote.ui.components.LocalSyncVersion
+import com.saltnote.ui.components.LocalVaultPath
 import com.saltnote.ui.i18n.LocalSaltStrings
 import com.saltnote.ui.i18n.SaltStrings
 import com.saltnote.ui.platform.PlatformInboxCameraCaptureDialog
 import com.saltnote.ui.platform.pickVaultDirectory
 import com.saltnote.ui.screens.FragmentHubScreen
 import com.saltnote.ui.screens.FsrsReviewScreen
+import com.saltnote.ui.screens.InboxImageLightboxDialog
 import com.saltnote.ui.screens.NotesWorkspaceScreen
 import com.saltnote.ui.screens.QuickTextCaptureDialog
 import com.saltnote.ui.screens.QuickVoiceCaptureDialog
 import com.saltnote.ui.screens.SettingsScreen
 import com.saltnote.ui.screens.SyncScreen
+import com.saltnote.ui.screens.WelcomeHomeScreen
 import com.saltnote.ui.state.LaunchRoute
 import com.saltnote.ui.state.NavTab
 import com.saltnote.ui.state.SaltAppState
@@ -77,7 +85,13 @@ import com.saltnote.ui.theme.SaltNoteTheme
 @Composable
 fun SaltNoteApp(state: SaltAppState) {
     val strings = state.strings
-    CompositionLocalProvider(LocalSaltStrings provides strings) {
+    CompositionLocalProvider(
+        LocalSaltStrings provides strings,
+        LocalVaultPath provides state.client.vaultPath,
+        LocalSyncVersion provides state.syncUiVersion,
+        LocalInboxFallbackResolver provides { rel -> state.findInboxThumbFallback(rel) },
+        LocalOnOpenImageLightbox provides { rel, cap -> state.lightboxImageRequest = rel to cap },
+    ) {
         SaltNoteTheme(darkTheme = state.darkTheme) {
             val snackbarHostState = remember { SnackbarHostState() }
 
@@ -97,10 +111,12 @@ fun SaltNoteApp(state: SaltAppState) {
 
                 LaunchedEffect(isCompact) {
                     if (!state.initialTabResolved) {
-                        state.selectedTab = if (isCompact) NavTab.Hub else NavTab.Notes
+                        state.selectedTab = NavTab.Home
                         state.initialTabResolved = true
                     } else if (isWideScreen && state.selectedTab == NavTab.Hub) {
-                        state.selectedTab = NavTab.Notes
+                        state.selectedTab = NavTab.Home
+                    } else if (isCompact && (state.selectedTab == NavTab.Sync || state.selectedTab == NavTab.Settings)) {
+                        state.selectedTab = NavTab.Home
                     }
                 }
 
@@ -113,11 +129,12 @@ fun SaltNoteApp(state: SaltAppState) {
                 Scaffold(
                     snackbarHost = { SnackbarHost(snackbarHostState) },
                     topBar = {
-                        if (isCompact) {
+                        if (isCompact && !state.isImmersiveEditorMode) {
                             TopAppBar(
                                 title = {
                                     Text(
                                         text = when (state.selectedTab) {
+                                            NavTab.Home -> "SaltNote"
                                             NavTab.Hub -> strings.hubTitle
                                             NavTab.Review -> strings.reviewTitle
                                             NavTab.Notes -> strings.navNotes
@@ -160,8 +177,8 @@ fun SaltNoteApp(state: SaltAppState) {
                         }
                     },
                     bottomBar = {
-                        if (isCompact) {
-                            val compactTabs = listOf(NavTab.Hub, NavTab.Review, NavTab.Notes)
+                        if (isCompact && !state.isImmersiveEditorMode) {
+                            val compactTabs = listOf(NavTab.Home, NavTab.Hub, NavTab.Review, NavTab.Notes)
                             NavigationBar {
                                 compactTabs.forEach { tab ->
                                     val label = navTabLabel(tab, strings)
@@ -189,8 +206,8 @@ fun SaltNoteApp(state: SaltAppState) {
                             .fillMaxSize()
                             .padding(innerPadding),
                     ) {
-                        if (isWideScreen) {
-                            val wideTabs = listOf(NavTab.Notes, NavTab.Review, NavTab.Sync, NavTab.Settings)
+                        if (isWideScreen && !state.isImmersiveEditorMode) {
+                            val wideTabs = listOf(NavTab.Home, NavTab.Notes, NavTab.Review, NavTab.Sync, NavTab.Settings)
                             NavigationRail(
                                 containerColor = MaterialTheme.colorScheme.surfaceContainer,
                                 header = {
@@ -201,7 +218,9 @@ fun SaltNoteApp(state: SaltAppState) {
                                         Surface(
                                             shape = MaterialTheme.shapes.medium,
                                             color = MaterialTheme.colorScheme.primaryContainer,
-                                            modifier = Modifier.size(44.dp),
+                                            modifier = Modifier
+                                                .size(44.dp)
+                                                .clickable { state.selectedTab = NavTab.Home },
                                         ) {
                                             Box(contentAlignment = Alignment.Center) {
                                                 Icon(
@@ -240,20 +259,26 @@ fun SaltNoteApp(state: SaltAppState) {
                         Box(modifier = Modifier.weight(1f).fillMaxHeight()) {
                             if (isCompact) {
                                 when (state.selectedTab) {
+                                    NavTab.Home -> WelcomeHomeScreen(state = state, isWideScreen = false)
                                     NavTab.Hub, NavTab.Sync, NavTab.Settings -> FragmentHubScreen(state = state)
                                     NavTab.Review -> FsrsReviewScreen(state = state, isCompact = true)
                                     NavTab.Notes -> NotesWorkspaceScreen(state = state, isWideScreen = false)
                                 }
                             } else {
                                 when (state.selectedTab) {
-                                    NavTab.Hub, NavTab.Notes -> NotesWorkspaceScreen(state = state, isWideScreen = true)
+                                    NavTab.Home, NavTab.Hub -> WelcomeHomeScreen(state = state, isWideScreen = true)
+                                    NavTab.Notes -> NotesWorkspaceScreen(state = state, isWideScreen = true)
                                     NavTab.Review -> FsrsReviewScreen(state = state, isCompact = false)
                                     NavTab.Sync -> SyncScreen(state = state)
                                     NavTab.Settings -> SettingsScreen(state = state)
                                 }
                             }
 
-                            if (isCompact && state.selectedTab != NavTab.Review) {
+                            if (isCompact &&
+                                !state.isImmersiveEditorMode &&
+                                state.selectedTab != NavTab.Review &&
+                                state.selectedTab != NavTab.Home
+                            ) {
                                 FloatingCaptureCapsule(
                                     onPhoto = { state.showCameraCaptureModal = true },
                                     onVoice = { state.showVoiceCaptureModal = true },
@@ -330,6 +355,15 @@ fun SaltNoteApp(state: SaltAppState) {
                                 onMessage = { msg -> state.notifyMessage(msg) },
                             )
                         },
+                    )
+                }
+
+                state.lightboxImageRequest?.let { req ->
+                    InboxImageLightboxDialog(
+                        vaultPath = state.client.vaultPath,
+                        relPath = req.first,
+                        caption = req.second,
+                        onDismiss = { state.lightboxImageRequest = null },
                     )
                 }
             }
@@ -413,6 +447,7 @@ private fun CompactModalSheetDialog(
 }
 
 private fun navTabLabel(tab: NavTab, strings: SaltStrings): String = when (tab) {
+    NavTab.Home -> strings.navHome
     NavTab.Hub -> strings.navInbox
     NavTab.Notes -> strings.navNotes
     NavTab.Review -> strings.navReview
@@ -429,8 +464,9 @@ private fun NavTabIcon(
     description: String,
 ) {
     val icon: ImageVector = when (tab) {
+        NavTab.Home -> Icons.Rounded.Home
         NavTab.Hub -> Icons.Rounded.Inbox
-        NavTab.Notes -> Icons.Rounded.Description
+        NavTab.Notes -> Icons.Rounded.EditNote
         NavTab.Review -> Icons.Rounded.Style
         NavTab.Sync -> Icons.Rounded.CloudSync
         NavTab.Settings -> Icons.Rounded.Settings

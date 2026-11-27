@@ -100,6 +100,54 @@ private class NativeSaltNoteClient(
         engine.deletePage(pageId)
     }
 
+    override fun createPageCanvas(pageId: String, title: String?): CanvasSnapshotDto =
+        saltJson.decodeFromString(engine.createPageCanvas(pageId, title))
+
+    override fun renamePageCanvas(pageId: String, canvasId: String, title: String) {
+        engine.renamePageCanvas(pageId, canvasId, title)
+    }
+
+    override fun deletePageCanvas(pageId: String, canvasId: String) {
+        engine.deletePageCanvas(pageId, canvasId)
+    }
+
+    override fun createPageDocument(
+        pageId: String,
+        title: String?,
+        initialMarkdown: String,
+    ): PageDocumentSnapshotDto =
+        saltJson.decodeFromString(engine.createPageDocument(pageId, title, initialMarkdown))
+
+    override fun updatePageDocumentBody(pageId: String, docId: String, markdown: String) {
+        engine.updatePageDocumentBody(pageId, docId, markdown)
+    }
+
+    override fun renamePageDocument(pageId: String, docId: String, title: String) {
+        engine.renamePageDocument(pageId, docId, title)
+    }
+
+    override fun deletePageDocument(pageId: String, docId: String) {
+        engine.deletePageDocument(pageId, docId)
+    }
+
+    override fun getUiPrefs(): LocalUiPrefsDto =
+        saltJson.decodeFromString(engine.getUiPrefsJson())
+
+    override fun saveUiPrefs(prefs: LocalUiPrefsDto) {
+        engine.saveUiPrefsJson(saltJson.encodeToString(prefs))
+    }
+
+    override fun recordPageVisit(
+        pageId: String,
+        mode: String?,
+        canvasId: String?,
+        docId: String?,
+    ): LocalUiPrefsDto =
+        saltJson.decodeFromString(engine.recordPageVisitJson(pageId, mode, canvasId, docId))
+
+    override fun recordCardVisit(cardId: String, pageId: String): LocalUiPrefsDto =
+        saltJson.decodeFromString(engine.recordCardVisitJson(cardId, pageId))
+
     override fun flushDeltas(): Int = engine.flushDeltas().toInt()
 
     override fun exportMarkdownBackup(targetDir: String): Int =
@@ -226,6 +274,29 @@ private class NativeSaltNoteClient(
         return NativeCancelHandle(handle)
     }
 
+    override fun triggerTextHaloInDoc(
+        pageId: String,
+        docId: String,
+        presetId: String,
+        anchorOffset: Int,
+        selectedText: String,
+        providerId: String?,
+        outputLanguageHint: String?,
+        listener: HaloStreamListener,
+    ): CancelHandle {
+        val handle = engine.triggerTextHaloInDoc(
+            pageId = pageId,
+            docId = docId,
+            presetId = presetId,
+            anchorOffset = anchorOffset.coerceAtLeast(0).toUInt(),
+            selectedText = selectedText,
+            providerId = providerId,
+            outputLanguageHint = outputLanguageHint,
+            callback = wrapCallback(listener),
+        )
+        return NativeCancelHandle(handle)
+    }
+
     override fun triggerInboxHalo(
         inboxId: String,
         pageId: String,
@@ -250,6 +321,9 @@ private class NativeSaltNoteClient(
 
     override fun fuseHaloIntoBody(pageId: String, haloId: String): String =
         engine.fuseHaloIntoBody(pageId, haloId)
+
+    override fun fuseHaloIntoDocument(pageId: String, haloId: String, docId: String?): String =
+        engine.fuseHaloIntoDocument(pageId, haloId, docId)
 
     override fun toggleHaloCollapsed(pageId: String, haloId: String, collapsed: Boolean) {
         engine.toggleHaloCollapsed(pageId, haloId, collapsed)

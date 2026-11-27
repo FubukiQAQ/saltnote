@@ -6,7 +6,9 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.graphics.Color
 import com.saltnote.bridge.CancelHandle
+import com.saltnote.bridge.CanvasSnapshotDto
 import com.saltnote.bridge.ConnectivityTestResultDto
+import com.saltnote.bridge.DEFAULT_PEN_PALETTE_ARGB
 import com.saltnote.bridge.DeviceStateDto
 import com.saltnote.bridge.FlashcardDraftDto
 import com.saltnote.bridge.FsrsCardStateDto
@@ -19,6 +21,7 @@ import com.saltnote.bridge.InboxKindDto
 import com.saltnote.bridge.LanNodeInfoDto
 import com.saltnote.bridge.LanPeerInfoDto
 import com.saltnote.bridge.LocalSyncPrefsDto
+import com.saltnote.bridge.LocalUiPrefsDto
 import com.saltnote.bridge.MicroSessionPlanDto
 import com.saltnote.bridge.PageSnapshotDto
 import com.saltnote.bridge.PageSummaryDto
@@ -32,6 +35,7 @@ import com.saltnote.bridge.StrokeSample
 import com.saltnote.bridge.SyncReportDto
 import com.saltnote.bridge.WebDavConfigDto
 import com.saltnote.bridge.openSaltNoteClient
+import kotlin.math.roundToInt
 import com.saltnote.ui.components.LanPairingCodec
 import com.saltnote.ui.components.StrokeGeometry
 import com.saltnote.ui.i18n.AppLanguage
@@ -59,6 +63,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 enum class NavTab(val label: String) {
+    Home("首页"),
     Hub("盐池"),
     Notes("笔记"),
     Review("复习"),
@@ -76,6 +81,22 @@ enum class LaunchRoute {
 enum class EditorViewMode(val label: String) {
     Canvas("画布模式"),
     Document("文档模式"),
+}
+
+enum class DocumentLayoutMode {
+    EditOnly,
+    Split,
+    PreviewOnly,
+}
+
+fun argbLongToColor(argb: Long): Color = Color(argb and 0xFFFFFFFFL)
+
+fun colorToArgbLong(color: Color): Long {
+    val a = ((color.alpha * 255f).roundToInt() and 0xFF).toLong()
+    val r = ((color.red * 255f).roundToInt() and 0xFF).toLong()
+    val g = ((color.green * 255f).roundToInt() and 0xFF).toLong()
+    val b = ((color.blue * 255f).roundToInt() and 0xFF).toLong()
+    return (a shl 24) or (r shl 16) or (g shl 8) or b
 }
 
 enum class AutoSyncStateKind {
@@ -125,18 +146,30 @@ class SaltAppState(
 
     var darkTheme by mutableStateOf(false)
     var showOnboarding by mutableStateOf(false)
-    var selectedTab by mutableStateOf(NavTab.Notes)
+    var selectedTab by mutableStateOf(NavTab.Home)
     var initialTabResolved by mutableStateOf(false)
     var editorMode by mutableStateOf(EditorViewMode.Canvas)
 
-    // v0.2-alpha Adaptive Modals, Salt Tray & Widget/Tile Launch Triggers
-    var showSaltTray by mutableStateOf(true)
+    // v0.2-alpha & v0.3-alpha Adaptive Modals, Workspace Layout & Immersive Modes
+    var showSaltTray by mutableStateOf(false)
+    var showVaultSidebar by mutableStateOf(true)
+    var sidebarAutoResolved by mutableStateOf(false)
+    var isDocumentLargeScreenMode by mutableStateOf(false)
+    var isCanvasFocusMode by mutableStateOf(false)
+    val isImmersiveEditorMode: Boolean
+        get() = selectedTab == NavTab.Notes && (
+            (editorMode == EditorViewMode.Document && isDocumentLargeScreenMode) ||
+                (editorMode == EditorViewMode.Canvas && isCanvasFocusMode)
+            )
+    var isCanvasDockCollapsed by mutableStateOf(false)
+    var documentLayoutMode by mutableStateOf(DocumentLayoutMode.Split)
     var showCameraCaptureModal by mutableStateOf(false)
     var showVoiceCaptureModal by mutableStateOf(false)
     var showQuickTextCaptureModal by mutableStateOf(false)
     var showCompactSyncModal by mutableStateOf(false)
     var showCompactSettingsModal by mutableStateOf(false)
     var pendingLaunchRoute by mutableStateOf(LaunchRoute.None)
+    var lightboxImageRequest by mutableStateOf<Pair<String, String?>?>(null)
 
     var snackbarMessage by mutableStateOf<String?>(null)
     var deviceState by mutableStateOf(DeviceStateDto())
@@ -164,10 +197,17 @@ class SaltAppState(
     val searchHits = mutableStateListOf<SearchHitDto>()
     private var optimisticStrokeSeq: Long = 0L
 
-    // Canvas State
+    // Canvas & Multi-Document State
     var activeCanvasId by mutableStateOf("main")
+    var activeDocId by mutableStateOf("main")
     var selectedTool by mutableStateOf("pen")
     var selectedImageId by mutableStateOf<String?>(null)
+    var uiPrefs by mutableStateOf(LocalUiPrefsDto())
+    val penPalette = mutableStateListOf<Color>(
+        *DEFAULT_PEN_PALETTE_ARGB.map(::argbLongToColor).toTypedArray(),
+    )
+    var selectedColorSlotIndex by mutableStateOf(0)
+    val recentCustomColors = mutableStateListOf<Color>()
     var inkColor by mutableStateOf(Color(0xFF191C1E))
     var strokeWidth by mutableStateOf(3.2f)
     var stylusOnlyMode by mutableStateOf(false)
@@ -176,6 +216,8 @@ class SaltAppState(
     var zoom by mutableStateOf(1f)
     val canvasStrokes = mutableStateListOf<RenderStrokeDto>()
     var syncUiVersion by mutableStateOf(0L)
+    private val canvasViewports = mutableMapOf<Pair<String, String>, Triple<Float, Float, Float>>()
+    private val inboxThumbFallbackByPrimary = mutableMapOf<String, String>()
 
     // Salt Halo State
     val haloPresets = mutableStateListOf<HaloPresetDto>()
@@ -222,6 +264,8 @@ class SaltAppState(
 
     private var bodySaveJob: Job? = null
     private var pendingBodyDirty: Boolean = false
+    private var pendingBodyPageId: String? = null
+    private var pendingBodyDocId: String? = null
     private var periodicFlushJob: Job? = null
     private var lanObserverJob: Job? = null
     private var autoSyncJob: Job? = null
@@ -510,32 +554,120 @@ class SaltAppState(
                     false
                 }
             }
-            val (rev, inboxRev, prefs, paired) = withContext(Dispatchers.IO) {
-                Quad(
+            val (rev, inboxRev, prefs, paired, loadedUiPrefs) = withContext(Dispatchers.IO) {
+                listOf(
                     runCatching { client.getSyncRevision() }.getOrDefault(0L),
                     runCatching { client.getInboxSyncRevision() }.getOrDefault(0L),
                     runCatching { client.getSyncPrefs() }.getOrDefault(LocalSyncPrefsDto()),
                     runCatching { client.listPairedPeers() }.getOrDefault(emptyList()),
+                    runCatching { client.getUiPrefs() }.getOrDefault(LocalUiPrefsDto()),
                 )
             }
-            lastObservedSyncRevision = rev
-            lastObservedInboxRevision = inboxRev
-            syncPrefs = prefs
-            pairedPeers.clear()
-            pairedPeers.addAll(paired)
+            @Suppress("UNCHECKED_CAST")
+            run {
+                lastObservedSyncRevision = rev as Long
+                lastObservedInboxRevision = inboxRev as Long
+                syncPrefs = prefs as LocalSyncPrefsDto
+                pairedPeers.clear()
+                pairedPeers.addAll(paired as List<PairedPeerDto>)
+                applyUiPrefs(loadedUiPrefs as LocalUiPrefsDto)
+            }
 
             if (checkOnboarding && isFirstLaunch) {
                 showOnboarding = true
             }
-            refreshAll()
-            val firstId = pages.firstOrNull()?.meta?.pageId
-            if (firstId != null) {
-                openPage(firstId)
+            refreshAllSyncSnapshot()
+            val preferredId = uiPrefs.recentPages
+                .firstOrNull { rp -> pages.any { it.meta.pageId == rp.pageId } }
+                ?.pageId
+                ?: pages.firstOrNull()?.meta?.pageId
+            if (preferredId != null) {
+                openPage(
+                    pageId = preferredId,
+                    switchToNotesTab = false,
+                    recordVisit = false,
+                )
             }
-            if (prefs.lanAutoStart && networkState.isWifiOrEthernet && lanNodeInfo == null) {
+            if ((prefs as LocalSyncPrefsDto).lanAutoStart && networkState.isWifiOrEthernet && lanNodeInfo == null) {
                 toggleLanP2p(true, silent = true)
             }
         }
+    }
+
+    private fun applyUiPrefs(prefs: LocalUiPrefsDto) {
+        uiPrefs = prefs
+        val defaults = DEFAULT_PEN_PALETTE_ARGB.map(::argbLongToColor)
+        val mergedPalette = (0 until 5).map { idx ->
+            prefs.penPaletteArgb.getOrNull(idx)?.let(::argbLongToColor) ?: defaults[idx]
+        }
+        penPalette.clear()
+        penPalette.addAll(mergedPalette)
+        recentCustomColors.clear()
+        recentCustomColors.addAll(prefs.recentCustomColorsArgb.map(::argbLongToColor))
+        if (selectedColorSlotIndex !in 0..4) {
+            selectedColorSlotIndex = 0
+        }
+        inkColor = penPalette[selectedColorSlotIndex]
+    }
+
+    private suspend fun refreshAllSyncSnapshot() {
+        val (first, second, third, allInbox) = withContext(Dispatchers.IO) {
+            val dev = runCatching { client.getDeviceState() }.getOrDefault(DeviceStateDto())
+            val list = runCatching { client.listPages() }.getOrDefault(emptyList())
+            val presets = runCatching { client.getHaloPresets() }.getOrDefault(emptyList())
+            val due = runCatching { client.listDueCards() }.getOrDefault(emptyList())
+            val all = runCatching { client.listAllCards() }.getOrDefault(emptyList())
+            val rcfg = runCatching { client.getRouterConfig() }.getOrNull()
+            val dav = runCatching { client.getWebDavConfig() }.getOrDefault(WebDavConfigDto())
+            val inbox = runCatching { client.listInboxItems(showArchivedInbox, 80) }.getOrDefault(emptyList())
+            val prefs = runCatching { client.getSyncPrefs() }.getOrDefault(LocalSyncPrefsDto())
+            val paired = runCatching { client.listPairedPeers() }.getOrDefault(emptyList())
+            val fullInbox = runCatching { client.listInboxItems(true, 200) }.getOrDefault(inbox)
+            Quad(
+                Triple(dev, list, presets),
+                Triple(due, all, rcfg),
+                Quad(dav, inbox, prefs, paired),
+                fullInbox,
+            )
+        }
+        deviceState = first.first
+        pages.clear()
+        pages.addAll(first.second)
+        haloPresets.clear()
+        haloPresets.addAll(first.third)
+        dueCards.clear()
+        dueCards.addAll(second.first)
+        allCards.clear()
+        allCards.addAll(second.second)
+        val rcfg = second.third
+        routerConfig = rcfg
+        if (rcfg != null) {
+            uiLanguage = rcfg.uiLanguage.ifBlank { "system" }
+            aiOutputLanguage = rcfg.aiOutputLanguage.ifBlank { "follow_ui" }
+        }
+        webDavConfig = third.first
+        inboxItems.clear()
+        inboxItems.addAll(third.second)
+        syncPrefs = third.third
+        pairedPeers.clear()
+        pairedPeers.addAll(third.fourth)
+        updateInboxThumbFallbackMap(allInbox)
+    }
+
+    private fun updateInboxThumbFallbackMap(items: List<InboxItemViewDto>) {
+        inboxThumbFallbackByPrimary.clear()
+        items.forEach { item ->
+            val primary = item.primaryAssetPath?.trim()?.removePrefix("./")?.trimStart('/')
+            val thumb = item.thumbAssetPath?.trim()?.removePrefix("./")?.trimStart('/')
+            if (!primary.isNullOrBlank() && !thumb.isNullOrBlank()) {
+                inboxThumbFallbackByPrimary[primary] = thumb
+            }
+        }
+    }
+
+    fun findInboxThumbFallback(primaryRelPath: String): String? {
+        val norm = primaryRelPath.trim().replace('\\', '/').removePrefix("./").trimStart('/')
+        return inboxThumbFallbackByPrimary[norm]
     }
 
     fun switchVaultDirectory(newVaultPath: String) {
@@ -562,10 +694,16 @@ class SaltAppState(
                 stopInboxAudioPlayback()
                 client = newClient
                 activePage = null
+                activeCanvasId = "main"
+                activeDocId = "main"
+                canvasViewports.clear()
+                inboxThumbFallbackByPrimary.clear()
                 selectedImageId = null
                 activeCrystal = null
                 microSessionPlan = null
                 activeSlicePreviewCard = null
+                isDocumentLargeScreenMode = false
+                isCanvasFocusMode = false
                 bootstrapVault(checkOnboarding = false)
                 showToast(strings.vaultSwitchedToast)
             }.onFailure { err ->
@@ -576,56 +714,27 @@ class SaltAppState(
 
     fun refreshAll() {
         scope.launch {
-            withContext(Dispatchers.IO) {
-                val dev = runCatching { client.getDeviceState() }.getOrDefault(DeviceStateDto())
-                val list = runCatching { client.listPages() }.getOrDefault(emptyList())
-                val presets = runCatching { client.getHaloPresets() }.getOrDefault(emptyList())
-                val due = runCatching { client.listDueCards() }.getOrDefault(emptyList())
-                val all = runCatching { client.listAllCards() }.getOrDefault(emptyList())
-                val rcfg = runCatching { client.getRouterConfig() }.getOrNull()
-                val dav = runCatching { client.getWebDavConfig() }.getOrDefault(WebDavConfigDto())
-                val inbox = runCatching { client.listInboxItems(showArchivedInbox, 80) }.getOrDefault(emptyList())
-                val prefs = runCatching { client.getSyncPrefs() }.getOrDefault(LocalSyncPrefsDto())
-                val paired = runCatching { client.listPairedPeers() }.getOrDefault(emptyList())
-                Triple(
-                    Triple(dev, list, presets),
-                    Triple(due, all, rcfg),
-                    Quad(dav, inbox, prefs, paired),
-                )
-            }.let { (first, second, third) ->
-                deviceState = first.first
-                pages.clear()
-                pages.addAll(first.second)
-                haloPresets.clear()
-                haloPresets.addAll(first.third)
-                dueCards.clear()
-                dueCards.addAll(second.first)
-                allCards.clear()
-                allCards.addAll(second.second)
-                val rcfg = second.third
-                routerConfig = rcfg
-                if (rcfg != null) {
-                    uiLanguage = rcfg.uiLanguage.ifBlank { "system" }
-                    aiOutputLanguage = rcfg.aiOutputLanguage.ifBlank { "follow_ui" }
-                }
-                webDavConfig = third.first
-                inboxItems.clear()
-                inboxItems.addAll(third.second)
-                syncPrefs = third.third
-                pairedPeers.clear()
-                pairedPeers.addAll(third.fourth)
+            refreshAllSyncSnapshot()
+            val loadedUiPrefs = withContext(Dispatchers.IO) {
+                runCatching { client.getUiPrefs() }.getOrNull()
+            }
+            if (loadedUiPrefs != null) {
+                applyUiPrefs(loadedUiPrefs)
             }
         }
     }
 
     private suspend fun flushPendingBodyImmediately() {
         bodySaveJob?.cancel()
-        val pid = activePage?.meta?.pageId
+        val pid = pendingBodyPageId ?: activePage?.meta?.pageId
+        val did = pendingBodyDocId ?: activeDocId
         if (pendingBodyDirty && pid != null) {
             pendingBodyDirty = false
+            pendingBodyPageId = null
+            pendingBodyDocId = null
             val snapshotBody = editableBody
             withContext(Dispatchers.IO) {
-                runCatching { client.updatePageBody(pid, snapshotBody) }
+                runCatching { client.updatePageDocumentBody(pid, did, snapshotBody) }
             }
         }
     }
@@ -635,13 +744,33 @@ class SaltAppState(
             runCatching { client.getPageSnapshot(pageId) }.getOrNull()
         } ?: return
         activePage = snap
-        if (!pendingBodyDirty) {
-            editableBody = snap.bodyMarkdown
+        val standalone = snap.canvases.filter { !it.isInline && !it.deleted }
+        if (snap.canvases.none { it.canvasId == activeCanvasId && !it.deleted }) {
+            activeCanvasId = standalone.firstOrNull()?.canvasId ?: "main"
         }
-        reloadCanvasStrokes()
+        val activeDocs = snap.documents.filter { !it.deleted }
+        if (activeDocs.none { it.docId == activeDocId }) {
+            activeDocId = activeDocs.firstOrNull()?.docId ?: "main"
+        }
+        if (!pendingBodyDirty) {
+            editableBody = activeDocs.firstOrNull { it.docId == activeDocId }?.bodyMarkdown
+                ?: snap.bodyMarkdown
+        }
+        reloadCanvasStrokes(activeCanvasId)
     }
 
-    fun openPage(pageId: String, targetHaloId: String? = null) {
+    fun openPage(
+        pageId: String,
+        targetHaloId: String? = null,
+        initialMode: EditorViewMode? = null,
+        targetCanvasId: String? = null,
+        targetDocId: String? = null,
+        switchToNotesTab: Boolean = true,
+        recordVisit: Boolean = true,
+    ) {
+        activePage?.meta?.pageId?.let { curPid ->
+            canvasViewports[curPid to activeCanvasId] = Triple(panX, panY, zoom)
+        }
         scope.launch {
             flushPendingBodyImmediately()
             withContext(Dispatchers.IO) {
@@ -651,19 +780,397 @@ class SaltAppState(
                 runCatching { client.getPageSnapshot(pageId) }.getOrNull()
             } ?: return@launch
 
+            val priorVisit = uiPrefs.recentPages.firstOrNull { it.pageId == pageId }
+            val standaloneCanvases = snap.canvases.filter { !it.isInline && !it.deleted }
+            val nextCanvasId = targetCanvasId?.takeIf { cid ->
+                snap.canvases.any { it.canvasId == cid && !it.deleted }
+            } ?: priorVisit?.lastCanvasId?.takeIf { cid ->
+                standaloneCanvases.any { it.canvasId == cid }
+            } ?: standaloneCanvases.firstOrNull()?.canvasId ?: "main"
+
+            val activeDocs = snap.documents.filter { !it.deleted }
+            val nextDocId = targetDocId?.takeIf { did ->
+                activeDocs.any { it.docId == did }
+            } ?: priorVisit?.lastDocId?.takeIf { did ->
+                activeDocs.any { it.docId == did }
+            } ?: activeDocs.firstOrNull()?.docId ?: "main"
+
+            val resolvedMode = when {
+                initialMode != null -> initialMode
+                targetCanvasId != null -> EditorViewMode.Canvas
+                targetDocId != null -> EditorViewMode.Document
+                priorVisit?.lastMode == "canvas" -> EditorViewMode.Canvas
+                priorVisit?.lastMode == "document" -> EditorViewMode.Document
+                else -> if (snap.meta.mode == "journal") EditorViewMode.Canvas else EditorViewMode.Document
+            }
+
             activePage = snap
-            editableBody = snap.bodyMarkdown
-            activeCanvasId = "main"
+            activeCanvasId = nextCanvasId
+            activeDocId = nextDocId
+            editableBody = activeDocs.firstOrNull { it.docId == nextDocId }?.bodyMarkdown
+                ?: snap.bodyMarkdown
             selectedImageId = null
             if (selectedTool == "select") selectedTool = "pen"
-            editorMode = if (snap.meta.mode == "journal") EditorViewMode.Canvas else EditorViewMode.Document
-            reloadCanvasStrokes()
+            editorMode = resolvedMode
+
+            val (vpX, vpY, vpZ) = canvasViewports[pageId to nextCanvasId] ?: Triple(0f, 0f, 1f)
+            panX = vpX
+            panY = vpY
+            zoom = vpZ
+
+            if (switchToNotesTab) {
+                selectedTab = NavTab.Notes
+            }
+            reloadCanvasStrokes(nextCanvasId)
+
+            if (recordVisit) {
+                recordVisitInBackground(
+                    pageId = pageId,
+                    mode = if (resolvedMode == EditorViewMode.Canvas) "canvas" else "document",
+                    canvasId = nextCanvasId,
+                    docId = nextDocId,
+                )
+            }
 
             if (targetHaloId != null) {
                 val halo = snap.halos.firstOrNull { it.haloId == targetHaloId }
                 if (halo != null) {
+                    if (!halo.canvasId.isNullOrBlank()) {
+                        editorMode = EditorViewMode.Canvas
+                        if (halo.canvasId != activeCanvasId) {
+                            switchCanvas(halo.canvasId!!)
+                        }
+                    } else if (!halo.docId.isNullOrBlank()) {
+                        editorMode = EditorViewMode.Document
+                        if (halo.docId != activeDocId) {
+                            switchDocument(halo.docId!!)
+                        }
+                    }
                     openPersistedHaloBubble(halo)
                 }
+            }
+        }
+    }
+
+    private fun recordVisitInBackground(
+        pageId: String,
+        mode: String?,
+        canvasId: String?,
+        docId: String?,
+    ) {
+        scope.launch {
+            val updated = withContext(Dispatchers.IO) {
+                runCatching { client.recordPageVisit(pageId, mode, canvasId, docId) }.getOrNull()
+            }
+            if (updated != null) {
+                uiPrefs = updated
+            }
+        }
+    }
+
+    fun recordCardVisit(cardId: String, pageId: String) {
+        if (cardId.isBlank() || pageId.isBlank()) return
+        scope.launch {
+            val updated = withContext(Dispatchers.IO) {
+                runCatching { client.recordCardVisit(cardId, pageId) }.getOrNull()
+            }
+            if (updated != null) {
+                uiPrefs = updated
+            }
+        }
+    }
+
+    fun recentPagesForHome(limit: Int = 6): List<PageSummaryDto> {
+        val byId = pages.associateBy { it.meta.pageId }
+        val result = ArrayList<PageSummaryDto>(limit)
+        val seen = HashSet<String>()
+        for (visit in uiPrefs.recentPages) {
+            val summary = byId[visit.pageId] ?: continue
+            if (seen.add(summary.meta.pageId)) {
+                result.add(summary)
+                if (result.size >= limit) return result
+            }
+        }
+        for (summary in pages) {
+            if (seen.add(summary.meta.pageId)) {
+                result.add(summary)
+                if (result.size >= limit) break
+            }
+        }
+        return result
+    }
+
+    fun recentCardsForHome(limit: Int = 5): List<FsrsCardStateDto> {
+        val dueById = dueCards.associateBy { it.cardId }
+        val allById = allCards.associateBy { it.cardId }
+        val result = ArrayList<FsrsCardStateDto>(limit)
+        val seen = HashSet<String>()
+        for (visit in uiPrefs.recentCards) {
+            val card = dueById[visit.cardId] ?: allById[visit.cardId] ?: continue
+            if (seen.add(card.cardId)) {
+                result.add(card)
+                if (result.size >= limit) return result
+            }
+        }
+        for (card in dueCards) {
+            if (seen.add(card.cardId)) {
+                result.add(card)
+                if (result.size >= limit) return result
+            }
+        }
+        for (card in allCards) {
+            if (seen.add(card.cardId)) {
+                result.add(card)
+                if (result.size >= limit) break
+            }
+        }
+        return result
+    }
+
+    fun selectPenColorSlot(index: Int) {
+        if (index !in penPalette.indices) return
+        selectedColorSlotIndex = index
+        inkColor = penPalette[index]
+        if (selectedTool.startsWith("halo_") || selectedTool == "eraser" || selectedTool == "pan" || selectedTool == "select") {
+            selectedTool = "pen"
+        }
+    }
+
+    fun updatePenColorSlot(index: Int, color: Color) {
+        if (index !in 0..4) return
+        val argb = colorToArgbLong(color)
+        val normalizedColor = argbLongToColor(argb)
+        penPalette[index] = normalizedColor
+        selectedColorSlotIndex = index
+        inkColor = normalizedColor
+        if (selectedTool.startsWith("halo_") || selectedTool == "eraser" || selectedTool == "pan" || selectedTool == "select") {
+            selectedTool = "pen"
+        }
+        recentCustomColors.removeAll { colorToArgbLong(it) == argb }
+        recentCustomColors.add(0, normalizedColor)
+        while (recentCustomColors.size > 8) {
+            recentCustomColors.removeAt(recentCustomColors.lastIndex)
+        }
+        persistCurrentPalettePrefs()
+    }
+
+    fun resetPenPaletteDefaults() {
+        val defaults = DEFAULT_PEN_PALETTE_ARGB.map(::argbLongToColor)
+        penPalette.clear()
+        penPalette.addAll(defaults)
+        inkColor = penPalette.getOrElse(selectedColorSlotIndex) { defaults.first() }
+        persistCurrentPalettePrefs()
+    }
+
+    private fun persistCurrentPalettePrefs() {
+        val nextPrefs = uiPrefs.copy(
+            penPaletteArgb = penPalette.take(5).map(::colorToArgbLong),
+            recentCustomColorsArgb = recentCustomColors.take(8).map(::colorToArgbLong),
+        )
+        uiPrefs = nextPrefs
+        scope.launch {
+            withContext(Dispatchers.IO) {
+                runCatching { client.saveUiPrefs(nextPrefs) }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // Multi-Canvas & Multi-Document Management (v0.3-alpha)
+    // ------------------------------------------------------------------------
+
+    fun switchCanvas(canvasId: String) {
+        val page = activePage ?: return
+        val pid = page.meta.pageId
+        if (canvasId == activeCanvasId && editorMode == EditorViewMode.Canvas) return
+        canvasViewports[pid to activeCanvasId] = Triple(panX, panY, zoom)
+        activeCanvasId = canvasId
+        selectedImageId = null
+        if (selectedTool == "select") selectedTool = "pen"
+        editorMode = EditorViewMode.Canvas
+        val (vpX, vpY, vpZ) = canvasViewports[pid to canvasId] ?: Triple(0f, 0f, 1f)
+        panX = vpX
+        panY = vpY
+        zoom = vpZ
+        reloadCanvasStrokes(canvasId)
+        recordVisitInBackground(pid, "canvas", canvasId, activeDocId)
+    }
+
+    fun createCanvas(title: String? = null) {
+        val page = activePage ?: return
+        val pid = page.meta.pageId
+        val standaloneCount = page.canvases.count { !it.isInline && !it.deleted }
+        val resolvedTitle = title?.trim()?.takeIf { it.isNotEmpty() }
+            ?: "${strings.canvasesSection} ${standaloneCount + 1}"
+        scope.launch {
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    client.createPageCanvas(pid, resolvedTitle)
+                }
+            }.onSuccess { created ->
+                canvasViewports[pid to activeCanvasId] = Triple(panX, panY, zoom)
+                activeCanvasId = created.canvasId
+                editorMode = EditorViewMode.Canvas
+                panX = 0f
+                panY = 0f
+                zoom = 1f
+                reloadCurrentPageInPlace(pid)
+                refreshPageListOnly()
+                recordVisitInBackground(pid, "canvas", created.canvasId, activeDocId)
+                scheduleAutoSync(isCapture = false)
+            }.onFailure { err ->
+                showToast("${strings.saveFailedPrefix}${err.message}")
+            }
+        }
+    }
+
+    fun renameCanvas(canvasId: String, newTitle: String) {
+        val pid = activePage?.meta?.pageId ?: return
+        val clean = newTitle.trim()
+        if (clean.isEmpty()) return
+        scope.launch {
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    client.renamePageCanvas(pid, canvasId, clean)
+                }
+            }.onSuccess {
+                reloadCurrentPageInPlace(pid)
+                refreshPageListOnly()
+                scheduleAutoSync(isCapture = false)
+            }.onFailure { err ->
+                showToast("${strings.updateFailedPrefix}${err.message}")
+            }
+        }
+    }
+
+    fun deleteCanvas(canvasId: String) {
+        val page = activePage ?: return
+        val pid = page.meta.pageId
+        val remaining = page.canvases.filter { !it.isInline && !it.deleted && it.canvasId != canvasId }
+        if (remaining.isEmpty()) {
+            showToast(strings.cannotDeleteLastCanvas)
+            return
+        }
+        scope.launch {
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    client.deletePageCanvas(pid, canvasId)
+                }
+            }.onSuccess {
+                canvasViewports.remove(pid to canvasId)
+                if (activeCanvasId == canvasId) {
+                    activeCanvasId = remaining.first().canvasId
+                    val (vpX, vpY, vpZ) = canvasViewports[pid to activeCanvasId] ?: Triple(0f, 0f, 1f)
+                    panX = vpX
+                    panY = vpY
+                    zoom = vpZ
+                }
+                reloadCurrentPageInPlace(pid)
+                refreshPageListOnly()
+                scheduleAutoSync(isCapture = false)
+            }.onFailure { err ->
+                showToast("${strings.deleteFailedPrefix}${err.message}")
+            }
+        }
+    }
+
+    fun switchDocument(docId: String) {
+        val page = activePage ?: return
+        val pid = page.meta.pageId
+        scope.launch {
+            flushPendingBodyImmediately()
+            val refreshed = withContext(Dispatchers.IO) {
+                runCatching { client.getPageSnapshot(pid) }.getOrNull()
+            } ?: page
+            activePage = refreshed
+            val targetDoc = refreshed.documents.firstOrNull { !it.deleted && it.docId == docId }
+                ?: refreshed.documents.firstOrNull { !it.deleted }
+                ?: return@launch
+            activeDocId = targetDoc.docId
+            editableBody = targetDoc.bodyMarkdown
+            editorMode = EditorViewMode.Document
+            recordVisitInBackground(pid, "document", activeCanvasId, targetDoc.docId)
+        }
+    }
+
+    fun createDocument(title: String? = null) {
+        val page = activePage ?: return
+        val pid = page.meta.pageId
+        val docCount = page.documents.count { !it.deleted }
+        val resolvedTitle = title?.trim()?.takeIf { it.isNotEmpty() }
+            ?: "${strings.documentsSection} ${docCount + 1}"
+        scope.launch {
+            flushPendingBodyImmediately()
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    client.createPageDocument(pid, resolvedTitle, "# $resolvedTitle\n\n")
+                }
+            }.onSuccess { created ->
+                activeDocId = created.docId
+                editableBody = created.bodyMarkdown
+                editorMode = EditorViewMode.Document
+                reloadCurrentPageInPlace(pid)
+                refreshPageListOnly()
+                recordVisitInBackground(pid, "document", activeCanvasId, created.docId)
+                scheduleAutoSync(isCapture = false)
+            }.onFailure { err ->
+                showToast("${strings.saveFailedPrefix}${err.message}")
+            }
+        }
+    }
+
+    fun renameDocument(docId: String, newTitle: String) {
+        val pid = activePage?.meta?.pageId ?: return
+        val clean = newTitle.trim()
+        if (clean.isEmpty()) return
+        scope.launch {
+            flushPendingBodyImmediately()
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    client.renamePageDocument(pid, docId, clean)
+                }
+            }.onSuccess {
+                reloadCurrentPageInPlace(pid)
+                refreshPageListOnly()
+                scheduleAutoSync(isCapture = false)
+            }.onFailure { err ->
+                showToast("${strings.updateFailedPrefix}${err.message}")
+            }
+        }
+    }
+
+    fun deleteDocument(docId: String) {
+        val page = activePage ?: return
+        val pid = page.meta.pageId
+        val remaining = page.documents.filter { !it.deleted && it.docId != docId }
+        if (remaining.isEmpty()) {
+            showToast(strings.cannotDeleteLastDoc)
+            return
+        }
+        scope.launch {
+            if (activeDocId == docId) {
+                bodySaveJob?.cancel()
+                pendingBodyDirty = false
+                pendingBodyPageId = null
+                pendingBodyDocId = null
+            } else {
+                flushPendingBodyImmediately()
+            }
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    client.deletePageDocument(pid, docId)
+                }
+            }.onSuccess {
+                if (activeDocId == docId) {
+                    val next = remaining.first()
+                    activeDocId = next.docId
+                    editableBody = next.bodyMarkdown
+                }
+                reloadCurrentPageInPlace(pid)
+                refreshPageListOnly()
+                scheduleAutoSync(isCapture = false)
+            }.onFailure { err ->
+                showToast("${strings.deleteFailedPrefix}${err.message}")
             }
         }
     }
@@ -673,6 +1180,7 @@ class SaltAppState(
         mode: String,
         isPrivate: Boolean,
         customTags: List<String> = emptyList(),
+        switchToNotesTab: Boolean = true,
     ) {
         scope.launch {
             flushPendingBodyImmediately()
@@ -694,8 +1202,12 @@ class SaltAppState(
                 )
             }
             refreshAll()
-            openPage(created.pageId)
-            editorMode = if (mode == "journal") EditorViewMode.Canvas else EditorViewMode.Document
+            val targetMode = if (mode == "journal") EditorViewMode.Canvas else EditorViewMode.Document
+            openPage(
+                pageId = created.pageId,
+                initialMode = targetMode,
+                switchToNotesTab = switchToNotesTab,
+            )
             scheduleAutoSync(isCapture = false)
         }
     }
@@ -718,6 +1230,8 @@ class SaltAppState(
             if (activePage?.meta?.pageId == pageId) {
                 bodySaveJob?.cancel()
                 pendingBodyDirty = false
+                pendingBodyPageId = null
+                pendingBodyDocId = null
                 closeCrystalBubble()
             }
             runCatching {
@@ -791,14 +1305,28 @@ class SaltAppState(
 
     fun onBodyMarkdownEdited(newMarkdown: String) {
         editableBody = newMarkdown
-        pendingBodyDirty = true
         val pid = activePage?.meta?.pageId ?: return
+        val did = activeDocId
+        pendingBodyDirty = true
+        pendingBodyPageId = pid
+        pendingBodyDocId = did
+        // Optimistically update activePage.documents so switching tabs or snapshots stays consistent
+        activePage?.let { cur ->
+            activePage = cur.copy(
+                bodyMarkdown = if (did == "main") newMarkdown else cur.bodyMarkdown,
+                documents = cur.documents.map { d ->
+                    if (d.docId == did) d.copy(bodyMarkdown = newMarkdown) else d
+                },
+            )
+        }
         bodySaveJob?.cancel()
         bodySaveJob = scope.launch {
             delay(800L)
             pendingBodyDirty = false
+            pendingBodyPageId = null
+            pendingBodyDocId = null
             withContext(Dispatchers.IO) {
-                runCatching { client.updatePageBody(pid, newMarkdown) }
+                runCatching { client.updatePageDocumentBody(pid, did, newMarkdown) }
             }
             refreshPageListOnly()
             scheduleAutoSync(isCapture = false)
@@ -1156,6 +1684,7 @@ class SaltAppState(
 
     fun triggerTextHalo(presetId: String, selectedText: String) {
         val pid = activePage?.meta?.pageId ?: return
+        val did = activeDocId
         val excerpt = selectedText.ifBlank { editableBody.takeLast(240) }
         cancelActiveCrystalStream()
         val preset = haloPresets.firstOrNull { it.presetId == presetId }
@@ -1171,8 +1700,9 @@ class SaltAppState(
             flushPendingBodyImmediately()
             runCatching {
                 withContext(Dispatchers.IO) {
-                    client.triggerTextHalo(
+                    client.triggerTextHaloInDoc(
                         pageId = pid,
+                        docId = did,
                         presetId = presetId,
                         anchorOffset = editableBody.length,
                         selectedText = excerpt,
@@ -1317,15 +1847,19 @@ class SaltAppState(
     fun fuseActiveCrystalIntoBody() {
         val cur = activeCrystal ?: return
         val halo = cur.persistedHalo ?: return
+        val targetDocId = halo.docId ?: activeDocId
         scope.launch {
             flushPendingBodyImmediately()
             val updatedBody = withContext(Dispatchers.IO) {
-                runCatching { client.fuseHaloIntoBody(halo.pageId, halo.haloId) }.getOrNull()
+                runCatching { client.fuseHaloIntoDocument(halo.pageId, halo.haloId, targetDocId) }.getOrNull()
             }
             if (updatedBody != null) {
-                editableBody = updatedBody
+                if (activePage?.meta?.pageId == halo.pageId && activeDocId == targetDocId) {
+                    editableBody = updatedBody
+                }
                 activeCrystal = cur.copy(fused = true, isCollapsed = true)
-                activePage = withContext(Dispatchers.IO) { client.getPageSnapshot(halo.pageId) }
+                reloadCurrentPageInPlace(halo.pageId)
+                refreshPageListOnly()
                 showToast(strings.fusedToast)
                 scheduleAutoSync(isCapture = false)
             }
@@ -1414,12 +1948,14 @@ class SaltAppState(
         }
     }
 
-    fun revealCurrentCard() {
+    fun revealCurrentCard(card: FsrsCardStateDto? = null) {
         currentCardRevealed = true
+        card?.let { recordCardVisit(it.cardId, it.pageId) }
     }
 
     fun submitReviewRating(card: FsrsCardStateDto, rating: Int) {
         val elapsedMs = (System.currentTimeMillis() - cardShownAtMs).coerceIn(500L, 600_000L).toInt()
+        recordCardVisit(card.cardId, card.pageId)
         scope.launch {
             withContext(Dispatchers.IO) {
                 runCatching { client.submitCardReview(card.pageId, card.cardId, rating, elapsedMs) }
@@ -1432,6 +1968,7 @@ class SaltAppState(
     }
 
     fun jumpToCardAnchor(card: FsrsCardStateDto) {
+        recordCardVisit(card.cardId, card.pageId)
         selectedTab = NavTab.Notes
         openPage(card.pageId, targetHaloId = card.anchorHaloId)
     }
@@ -1871,11 +2408,18 @@ class SaltAppState(
 
     fun refreshInboxOnly() {
         scope.launch {
-            val list = withContext(Dispatchers.IO) {
-                runCatching { client.listInboxItems(showArchivedInbox, 80) }.getOrDefault(emptyList())
+            val (list, allList) = withContext(Dispatchers.IO) {
+                val filtered = runCatching { client.listInboxItems(showArchivedInbox, 80) }.getOrDefault(emptyList())
+                val all = if (showArchivedInbox) {
+                    filtered
+                } else {
+                    runCatching { client.listInboxItems(true, 200) }.getOrDefault(filtered)
+                }
+                filtered to all
             }
             inboxItems.clear()
             inboxItems.addAll(list)
+            updateInboxThumbFallbackMap(allList)
         }
     }
 
@@ -2101,6 +2645,17 @@ class SaltAppState(
                     selectedImageId = inserted.imageId
                     reloadCurrentPageInPlace(pid)
                 } else {
+                    val hasPrimaryAsset = item.kind == InboxKindDto.PhotoNote &&
+                        !item.primaryAssetPath.isNullOrBlank()
+                    if (hasPrimaryAsset) {
+                        val primaryBytes = withContext(Dispatchers.IO) {
+                            readVaultAssetBytes(client.vaultPath, item.primaryAssetPath!!)
+                        }
+                        if (primaryBytes == null) {
+                            usedThumbFallback = true
+                            scheduleAutoSync(isCapture = true, forceNow = true)
+                        }
+                    }
                     val blockId = "inbx_blk_${System.currentTimeMillis()}"
                     val blockMd = buildInboxMarkdownInsert(item)
                     val updatedMd = if (editableBody.isBlank()) {
@@ -2109,12 +2664,64 @@ class SaltAppState(
                         "${editableBody.trimEnd()}\n\n$blockMd\n"
                     }
                     withContext(Dispatchers.IO) {
-                        client.updatePageBody(pid, updatedMd)
+                        client.updatePageDocumentBody(pid, activeDocId, updatedMd)
                         client.consumeInboxIntoPage(item.inboxId, pid, blockId)
                     }
                     editableBody = updatedMd
                     reloadCurrentPageInPlace(pid)
                 }
+            }.onSuccess {
+                refreshInboxOnly()
+                refreshPageListOnly()
+                showToast(if (usedThumbFallback) strings.inboxThumbFallbackToast else strings.inboxConsumedToast)
+                scheduleAutoSync(isCapture = true)
+            }.onFailure { err ->
+                showToast("${strings.saveFailedPrefix}${err.message}")
+            }
+        }
+    }
+
+    fun consumeInboxIntoRecentOrActivePage(item: InboxItemViewDto) {
+        val targetPid = recentPagesForHome().firstOrNull()?.meta?.pageId
+            ?: activePage?.meta?.pageId
+            ?: pages.firstOrNull()?.meta?.pageId
+        if (targetPid == null) {
+            showToast(strings.recentNotesEmpty)
+            return
+        }
+        if (activePage?.meta?.pageId == targetPid) {
+            consumeInboxIntoActivePage(item)
+            return
+        }
+        scope.launch {
+            flushPendingBodyImmediately()
+            var usedThumbFallback = false
+            runCatching {
+                val snap = withContext(Dispatchers.IO) { client.getPageSnapshot(targetPid) }
+                val targetDoc = snap.documents.firstOrNull()
+                val targetDocId = targetDoc?.docId ?: "main"
+                val baseBody = targetDoc?.bodyMarkdown ?: snap.bodyMarkdown
+                if (item.kind == InboxKindDto.PhotoNote && !item.primaryAssetPath.isNullOrBlank()) {
+                    val primaryBytes = withContext(Dispatchers.IO) {
+                        readVaultAssetBytes(client.vaultPath, item.primaryAssetPath!!)
+                    }
+                    if (primaryBytes == null) {
+                        usedThumbFallback = true
+                        scheduleAutoSync(isCapture = true, forceNow = true)
+                    }
+                }
+                val blockId = "inbx_blk_${System.currentTimeMillis()}"
+                val blockMd = buildInboxMarkdownInsert(item)
+                val updatedMd = if (baseBody.isBlank()) {
+                    blockMd
+                } else {
+                    "${baseBody.trimEnd()}\n\n$blockMd\n"
+                }
+                withContext(Dispatchers.IO) {
+                    client.updatePageDocumentBody(targetPid, targetDocId, updatedMd)
+                    client.consumeInboxIntoPage(item.inboxId, targetPid, blockId)
+                }
+                recordVisitInBackground(targetPid, "document", null, targetDocId)
             }.onSuccess {
                 refreshInboxOnly()
                 refreshPageListOnly()
@@ -2169,7 +2776,15 @@ class SaltAppState(
             InboxKindDto.PhotoNote -> {
                 val imgPath = item.primaryAssetPath ?: item.thumbAssetPath
                 if (!imgPath.isNullOrBlank()) {
-                    append("![${item.textNote ?: "Salt Inbox"}]($imgPath)\n")
+                    val safeAlt = (item.textNote ?: "Salt Inbox")
+                        .replace('\r', ' ')
+                        .replace('\n', ' ')
+                        .replace('[', '(')
+                        .replace(']', ')')
+                        .trim()
+                        .take(80)
+                        .ifBlank { "Salt Inbox" }
+                    append("![$safeAlt]($imgPath)\n")
                 }
                 item.textNote?.takeIf { it.isNotBlank() }?.let { append("> $it\n") }
                 item.transcriptText?.takeIf { it.isNotBlank() }?.let {
@@ -2221,6 +2836,7 @@ class SaltAppState(
     }
 
     fun submitMicroCardRating(card: ReviewCardViewDto, rating: Int) {
+        recordCardVisit(card.cardId, card.pageId)
         val elapsedMs = (System.currentTimeMillis() - cardShownAtMs).coerceIn(500L, 600_000L).toInt()
         scope.launch {
             withContext(Dispatchers.IO) {
@@ -2240,6 +2856,7 @@ class SaltAppState(
     }
 
     fun jumpToCardAnchor(card: ReviewCardViewDto) {
+        recordCardVisit(card.cardId, card.pageId)
         activeSlicePreviewCard = null
         selectedTab = NavTab.Notes
         openPage(card.pageId, targetHaloId = card.anchorHaloId)

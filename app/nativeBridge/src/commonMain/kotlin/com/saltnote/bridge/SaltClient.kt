@@ -49,6 +49,26 @@ interface SaltNoteClient {
 
     fun updatePageBody(pageId: String, markdown: String)
     fun deletePage(pageId: String)
+    fun createPageCanvas(pageId: String, title: String? = null): CanvasSnapshotDto
+    fun renamePageCanvas(pageId: String, canvasId: String, title: String)
+    fun deletePageCanvas(pageId: String, canvasId: String)
+    fun createPageDocument(
+        pageId: String,
+        title: String? = null,
+        initialMarkdown: String = "",
+    ): PageDocumentSnapshotDto
+    fun updatePageDocumentBody(pageId: String, docId: String, markdown: String)
+    fun renamePageDocument(pageId: String, docId: String, title: String)
+    fun deletePageDocument(pageId: String, docId: String)
+    fun getUiPrefs(): LocalUiPrefsDto
+    fun saveUiPrefs(prefs: LocalUiPrefsDto)
+    fun recordPageVisit(
+        pageId: String,
+        mode: String? = null,
+        canvasId: String? = null,
+        docId: String? = null,
+    ): LocalUiPrefsDto
+    fun recordCardVisit(cardId: String, pageId: String): LocalUiPrefsDto
     fun flushDeltas(): Int
     fun exportMarkdownBackup(targetDir: String): Int
 
@@ -129,6 +149,17 @@ interface SaltNoteClient {
         listener: HaloStreamListener,
     ): CancelHandle
 
+    fun triggerTextHaloInDoc(
+        pageId: String,
+        docId: String,
+        presetId: String,
+        anchorOffset: Int,
+        selectedText: String,
+        providerId: String?,
+        outputLanguageHint: String? = null,
+        listener: HaloStreamListener,
+    ): CancelHandle
+
     fun triggerInboxHalo(
         inboxId: String,
         pageId: String,
@@ -141,6 +172,7 @@ interface SaltNoteClient {
     fun updateHaloPin(pageId: String, haloId: String, pinX: Float, pinY: Float): HaloAnnotationDto
 
     fun fuseHaloIntoBody(pageId: String, haloId: String): String
+    fun fuseHaloIntoDocument(pageId: String, haloId: String, docId: String? = null): String
     fun toggleHaloCollapsed(pageId: String, haloId: String, collapsed: Boolean)
     fun deleteHalo(pageId: String, haloId: String)
     fun parseFlashcardDrafts(rawOutput: String): List<FlashcardDraftDto>

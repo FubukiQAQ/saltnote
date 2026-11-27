@@ -86,7 +86,12 @@ impl IntelEngine {
         }
         for summary in vault.list_pages() {
             if let Ok(snap) = vault.get_page_snapshot(&summary.meta.page_id) {
-                self.index_page(&snap.meta, &snap.body_markdown)?;
+                let search_body = if snap.documents.is_empty() {
+                    snap.body_markdown.clone()
+                } else {
+                    salt_crdt::combine_documents_for_search(&snap.documents)
+                };
+                self.index_page(&snap.meta, &search_body)?;
             }
         }
         let (cards, logs) = vault.get_all_cards_and_logs();
@@ -437,8 +442,14 @@ impl IntelEngine {
                     if !halo.context_excerpt.trim().is_empty() {
                         return Some(halo.context_excerpt.clone());
                     }
+                    let target_body = halo
+                        .doc_id
+                        .as_deref()
+                        .and_then(|did| snap.documents.iter().find(|d| d.doc_id == did))
+                        .map(|d| d.body_markdown.as_str())
+                        .unwrap_or(&snap.body_markdown);
                     let ctx = extract_markdown_context(
-                        &snap.body_markdown,
+                        target_body,
                         halo.anchor_text_offset.map(|o| o as usize),
                     );
                     if ctx.trim().is_empty() {
@@ -999,6 +1010,32 @@ mod tests {
             .filter(|c| c.card_id.starts_with("c_deep_"))
             .count();
         assert!(deep_in_plan <= 3, "Deep forgotten cards capped at <=20%");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn fts5_indexes_and_searches_secondary_sub_documents() {
+        let base = std::env::temp_dir().join(format!("saltnote_intel_multidoc_{}", new_ulid()));
+        let vault = VaultStore::open(&base, Some("SubDoc".into())).unwrap();
+        let engine = IntelEngine::open(vault.paths().sqlite_path()).unwrap();
+
+        let page = vault
+            .create_page("复变函数", PageMode::Study, false, vec![], "# 柯西积分定理")
+            .unwrap();
+        let doc2 = vault
+            .create_page_document(&page.page_id, Some("留数定理".into()), "洛朗级数展开与极点留数计算")
+            .unwrap();
+        assert!(doc2.doc_id.starts_with("doc_"));
+
+        engine.rebuild_from_vault(&vault).unwrap();
+        let hits = engine.search("洛朗级数", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].page_id, page.page_id);
+
+        let hits_title = engine.search("留数定理", 10).unwrap();
+        assert_eq!(hits_title.len(), 1);
+        assert_eq!(hits_title[0].page_id, page.page_id);
 
         let _ = std::fs::remove_dir_all(&base);
     }

@@ -132,9 +132,23 @@ actual fun defaultDeviceName(): String {
     return if (host.isNotBlank()) "$host ($os)" else "SaltNote-$os"
 }
 
+private fun resolveSafeVaultFile(vaultPath: String, relPath: String): File? {
+    val cleanRel = relPath
+        .trim()
+        .replace('\\', '/')
+        .removePrefix("./")
+        .trimStart('/')
+    if (cleanRel.isEmpty() || cleanRel.contains("..")) return null
+    return runCatching {
+        val root = File(vaultPath).canonicalFile
+        val target = File(root, cleanRel).canonicalFile
+        if (target.path.startsWith(root.path)) target else null
+    }.getOrNull()
+}
+
 actual fun loadImageBitmapFromVault(vaultPath: String, relPath: String): ImageBitmap? {
-    val file = File(vaultPath, relPath)
-    if (!file.exists()) return null
+    val file = resolveSafeVaultFile(vaultPath, relPath) ?: return null
+    if (!file.isFile) return null
     return runCatching {
         val bytes = file.readBytes()
         SkiaImage.makeFromEncoded(bytes).toComposeImageBitmap()
@@ -142,7 +156,7 @@ actual fun loadImageBitmapFromVault(vaultPath: String, relPath: String): ImageBi
 }
 
 actual fun readVaultAssetBytes(vaultPath: String, relPath: String): ByteArray? {
-    val file = File(vaultPath, relPath)
+    val file = resolveSafeVaultFile(vaultPath, relPath) ?: return null
     if (!file.isFile) return null
     return runCatching { file.readBytes() }.getOrNull()
 }
@@ -207,6 +221,8 @@ actual fun formatUtcTimestamp(utcMs: Long): String {
     if (utcMs <= 0L) return "-"
     return runCatching { utcFmt.format(Instant.ofEpochMilli(utcMs)) }.getOrDefault("-")
 }
+
+actual fun currentHourOfDay(): Int = java.time.LocalTime.now().hour
 
 actual fun setLanMulticastLock(enabled: Boolean) = Unit
 

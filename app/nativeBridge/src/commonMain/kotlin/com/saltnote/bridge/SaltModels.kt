@@ -16,12 +16,74 @@ data class PageMetaDto(
 )
 
 @Serializable
+data class PageCanvasSummaryDto(
+    @SerialName("canvas_id") val canvasId: String,
+    val title: String = "",
+    @SerialName("sort_order") val sortOrder: Long = 0L,
+    @SerialName("stroke_count") val strokeCount: Int = 0,
+    @SerialName("image_count") val imageCount: Int = 0,
+)
+
+@Serializable
+data class PageDocumentSummaryDto(
+    @SerialName("doc_id") val docId: String,
+    val title: String = "",
+    @SerialName("sort_order") val sortOrder: Long = 0L,
+    @SerialName("updated_at_utc") val updatedAtUtc: Long = 0L,
+)
+
+@Serializable
+data class PageDocumentSnapshotDto(
+    @SerialName("doc_id") val docId: String,
+    val title: String = "",
+    @SerialName("body_markdown") val bodyMarkdown: String = "",
+    @SerialName("sort_order") val sortOrder: Long = 0L,
+    @SerialName("created_at_utc") val createdAtUtc: Long = 0L,
+    @SerialName("updated_at_utc") val updatedAtUtc: Long = 0L,
+    val deleted: Boolean = false,
+)
+
+@Serializable
 data class PageSummaryDto(
     val meta: PageMetaDto,
     val snippet: String = "",
     @SerialName("stroke_count") val strokeCount: Int = 0,
     @SerialName("card_count") val cardCount: Int = 0,
     @SerialName("markdown_file") val markdownFile: String = "",
+    val canvases: List<PageCanvasSummaryDto> = emptyList(),
+    val documents: List<PageDocumentSummaryDto> = emptyList(),
+)
+
+val DEFAULT_PEN_PALETTE_ARGB: List<Long> = listOf(
+    0xFF191C1EL,
+    0xFF1A657AL,
+    0xFFC62828L,
+    0xFF2E7D32L,
+    0xFF6A1B9AL,
+)
+
+@Serializable
+data class RecentPageVisitDto(
+    @SerialName("page_id") val pageId: String,
+    @SerialName("visited_at_utc") val visitedAtUtc: Long = 0L,
+    @SerialName("last_mode") val lastMode: String? = null,
+    @SerialName("last_canvas_id") val lastCanvasId: String? = null,
+    @SerialName("last_doc_id") val lastDocId: String? = null,
+)
+
+@Serializable
+data class RecentCardVisitDto(
+    @SerialName("card_id") val cardId: String,
+    @SerialName("page_id") val pageId: String,
+    @SerialName("visited_at_utc") val visitedAtUtc: Long = 0L,
+)
+
+@Serializable
+data class LocalUiPrefsDto(
+    @SerialName("pen_palette_argb") val penPaletteArgb: List<Long> = DEFAULT_PEN_PALETTE_ARGB,
+    @SerialName("recent_custom_colors_argb") val recentCustomColorsArgb: List<Long> = emptyList(),
+    @SerialName("recent_pages") val recentPages: List<RecentPageVisitDto> = emptyList(),
+    @SerialName("recent_cards") val recentCards: List<RecentCardVisitDto> = emptyList(),
 )
 
 @Serializable
@@ -76,6 +138,11 @@ data class CanvasImageNodeDto(
 @Serializable
 data class CanvasSnapshotDto(
     @SerialName("canvas_id") val canvasId: String,
+    val title: String = "",
+    @SerialName("sort_order") val sortOrder: Long = 0L,
+    @SerialName("created_at_utc") val createdAtUtc: Long = 0L,
+    @SerialName("is_inline") val isInline: Boolean = false,
+    val deleted: Boolean = false,
     val strokes: List<DeltaStrokeDto> = emptyList(),
     val transforms: List<StrokeTransformDto> = emptyList(),
     val images: List<CanvasImageNodeDto> = emptyList(),
@@ -123,6 +190,7 @@ data class HaloAnnotationDto(
     @SerialName("halo_id") val haloId: String,
     @SerialName("page_id") val pageId: String,
     @SerialName("canvas_id") val canvasId: String? = null,
+    @SerialName("doc_id") val docId: String? = null,
     @SerialName("preset_id") val presetId: String,
     @SerialName("anchor_bbox") val anchorBbox: RectFDto? = null,
     @SerialName("anchor_text_offset") val anchorTextOffset: Int? = null,
@@ -175,6 +243,7 @@ data class PageSnapshotDto(
     val meta: PageMetaDto,
     @SerialName("body_markdown") val bodyMarkdown: String = "",
     val canvases: List<CanvasSnapshotDto> = emptyList(),
+    val documents: List<PageDocumentSnapshotDto> = emptyList(),
     val halos: List<HaloAnnotationDto> = emptyList(),
     val cards: List<FlashCardDto> = emptyList(),
 )

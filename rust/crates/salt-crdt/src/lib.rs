@@ -2,13 +2,14 @@ use chrono::{TimeZone, Utc};
 use loro::{ExportMode, LoroDoc, LoroList, LoroMap, LoroValue, UpdateOptions, VersionVector};
 use parking_lot::{Mutex, RwLock};
 use salt_types::{
-    content_addressed_asset_rel_path, default_halo_presets, new_ulid, now_utc_ms,
-    parse_flashcard_drafts, sha256_hex, validate_router_config_no_plaintext_keys, CanvasImageNode,
-    CanvasSnapshot, DeltaEntry, DeltaStroke, DeviceManifest, DeviceState, FlashCard,
-    HaloAnnotation, HaloPreset, InboxAiEnrichment, InboxConsumption, InboxItem, InboxKind,
-    InboxPayload, InboxState, LocalSyncPrefs, PageMeta, PageMode, PageSnapshot, PageSummary,
-    PairedPeer, ReviewLog, RouterConfig, SaltError, SaltResult, StrokeTransform, TranscriptStatus,
-    WebDavConfig,
+    content_addressed_asset_rel_path, default_halo_presets, default_pen_palette_argb, new_ulid,
+    now_utc_ms, parse_flashcard_drafts, sha256_hex, validate_router_config_no_plaintext_keys,
+    CanvasImageNode, CanvasSnapshot, DeltaEntry, DeltaStroke, DeviceManifest, DeviceState,
+    FlashCard, HaloAnnotation, HaloPreset, InboxAiEnrichment, InboxConsumption, InboxItem,
+    InboxKind, InboxPayload, InboxState, LocalSyncPrefs, LocalUiPrefs, PageCanvasSummary,
+    PageDocumentSnapshot, PageDocumentSummary, PageMeta, PageMode, PageSnapshot, PageSummary,
+    PairedPeer, RecentCardVisit, RecentPageVisit, ReviewLog, RouterConfig, SaltError, SaltResult,
+    StrokeTransform, TranscriptStatus, WebDavConfig,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -106,6 +107,10 @@ impl VaultPaths {
         self.local_dir().join("sync_prefs.json")
     }
 
+    pub fn ui_prefs_path(&self) -> PathBuf {
+        self.local_dir().join("ui_prefs.json")
+    }
+
     pub fn ensure_structure(&self) -> SaltResult<()> {
         for dir in [
             self.pages_dir(),
@@ -135,6 +140,8 @@ pub struct DeltaPacket {
 
 /// Reserved document ID for Vault-level CRDT root state (e.g. `inbox` LoroMap).
 pub const VAULT_ROOT_DOC_ID: &str = "__vault_root__";
+pub const MAIN_CANVAS_ID: &str = "main";
+pub const MAIN_DOC_ID: &str = "main";
 
 /// Events emitted on every local edit or remote CRDT import to drive `salt-intel` (FTS5 + FSRS).
 #[derive(Debug, Clone)]
@@ -175,6 +182,7 @@ pub struct VaultStore {
     inbox_sync_revision: AtomicU64,
     flush_lock: Mutex<()>,
     paired_peers_lock: Mutex<()>,
+    ui_prefs_lock: Mutex<()>,
 }
 
 impl VaultStore {
@@ -250,6 +258,7 @@ impl VaultStore {
             inbox_sync_revision: AtomicU64::new(0),
             flush_lock: Mutex::new(()),
             paired_peers_lock: Mutex::new(()),
+            ui_prefs_lock: Mutex::new(()),
         };
 
         store.replay_all_deltas_from_disk()?;
@@ -492,6 +501,97 @@ impl VaultStore {
         atomic_write(&self.paths.sync_prefs_path(), json.as_bytes())
     }
 
+    pub fn load_ui_prefs(&self) -> LocalUiPrefs {
+        let _guard = self.ui_prefs_lock.lock();
+        self.load_ui_prefs_unlocked()
+    }
+
+    fn load_ui_prefs_unlocked(&self) -> LocalUiPrefs {
+        let p = self.paths.ui_prefs_path();
+        let parsed = if p.exists() {
+            fs::read_to_string(&p)
+                .ok()
+                .and_then(|raw| serde_json::from_str::<LocalUiPrefs>(&raw).ok())
+                .unwrap_or_default()
+        } else {
+            LocalUiPrefs::default()
+        };
+        normalize_ui_prefs(parsed)
+    }
+
+    pub fn save_ui_prefs(&self, prefs: &LocalUiPrefs) -> SaltResult<()> {
+        let _guard = self.ui_prefs_lock.lock();
+        let clean = normalize_ui_prefs(prefs.clone());
+        let json =
+            serde_json::to_string_pretty(&clean).map_err(|e| SaltError::Io(e.to_string()))?;
+        atomic_write(&self.paths.ui_prefs_path(), json.as_bytes())
+    }
+
+    pub fn record_page_visit(
+        &self,
+        page_id: &str,
+        mode: Option<&str>,
+        canvas_id: Option<&str>,
+        doc_id: Option<&str>,
+    ) -> SaltResult<LocalUiPrefs> {
+        let pid = page_id.trim();
+        if pid.is_empty() {
+            return Ok(self.load_ui_prefs());
+        }
+        let _guard = self.ui_prefs_lock.lock();
+        let mut prefs = self.load_ui_prefs_unlocked();
+        let prev = prefs.recent_pages.iter().find(|v| v.page_id == pid).cloned();
+        prefs.recent_pages.retain(|v| v.page_id != pid);
+        prefs.recent_pages.insert(
+            0,
+            RecentPageVisit {
+                page_id: pid.to_string(),
+                visited_at_utc: now_utc_ms(),
+                last_mode: mode
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| prev.as_ref().and_then(|p| p.last_mode.clone())),
+                last_canvas_id: canvas_id
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| prev.as_ref().and_then(|p| p.last_canvas_id.clone())),
+                last_doc_id: doc_id
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| prev.as_ref().and_then(|p| p.last_doc_id.clone())),
+            },
+        );
+        let clean = normalize_ui_prefs(prefs);
+        let json =
+            serde_json::to_string_pretty(&clean).map_err(|e| SaltError::Io(e.to_string()))?;
+        atomic_write(&self.paths.ui_prefs_path(), json.as_bytes())?;
+        Ok(clean)
+    }
+
+    pub fn record_card_visit(&self, card_id: &str, page_id: &str) -> SaltResult<LocalUiPrefs> {
+        let cid = card_id.trim();
+        let pid = page_id.trim();
+        if cid.is_empty() || pid.is_empty() {
+            return Ok(self.load_ui_prefs());
+        }
+        let _guard = self.ui_prefs_lock.lock();
+        let mut prefs = self.load_ui_prefs_unlocked();
+        prefs.recent_cards.retain(|v| v.card_id != cid);
+        prefs.recent_cards.insert(
+            0,
+            RecentCardVisit {
+                card_id: cid.to_string(),
+                page_id: pid.to_string(),
+                visited_at_utc: now_utc_ms(),
+            },
+        );
+        let clean = normalize_ui_prefs(prefs);
+        let json =
+            serde_json::to_string_pretty(&clean).map_err(|e| SaltError::Io(e.to_string()))?;
+        atomic_write(&self.paths.ui_prefs_path(), json.as_bytes())?;
+        Ok(clean)
+    }
+
     // ------------------------------------------------------------------------
     // Page CRUD & Dual-Mode Mutations
     // ------------------------------------------------------------------------
@@ -595,7 +695,7 @@ SaltNote 是一款**永久免费开源、本地优先（Local-First）、零后�
         is_private: Option<bool>,
         tags: Option<Vec<String>>,
     ) -> SaltResult<PageMeta> {
-        let (meta, body_str, old_file) = {
+        let (meta, projected_body, search_body, old_file) = {
             let mut pages = self.pages.write();
             let entry = pages
                 .get_mut(page_id)
@@ -624,34 +724,274 @@ SaltNote 是一款**永久免费开源、本地优先（Local-First）、零后�
                 .map_err(|e| SaltError::Crdt(e.to_string()))?;
             self.append_wal(page_id, &bytes)?;
             entry.dirty_since_export = true;
-            let body_str = entry.doc.get_text("body").to_string();
-            (meta, body_str, entry.markdown_file.clone())
+            let docs = read_documents_from_doc(&entry.doc, &meta, false);
+            let projected = render_page_documents_markdown(&docs);
+            let combined = combine_documents_for_search(&docs);
+            (meta, projected, combined, entry.markdown_file.clone())
         };
 
-        let new_file = self.project_markdown_file(&meta, &body_str, old_file.as_deref())?;
+        let new_file = self.project_markdown_file(&meta, &projected_body, old_file.as_deref())?;
         if let Some(entry) = self.pages.write().get_mut(page_id) {
             entry.markdown_file = Some(new_file);
         }
         let _ = self.events_tx.send(DocChangeEvent::PageUpdated {
             page_id: page_id.to_string(),
             meta: meta.clone(),
-            body_markdown: body_str,
+            body_markdown: search_body,
         });
         Ok(meta)
     }
 
     pub fn update_page_body(&self, page_id: &str, new_markdown: &str) -> SaltResult<()> {
-        let (meta, body_str, existing_file) = {
+        self.update_page_document_body(page_id, MAIN_DOC_ID, new_markdown)
+    }
+
+    pub fn create_page_canvas(
+        &self,
+        page_id: &str,
+        title: Option<String>,
+    ) -> SaltResult<CanvasSnapshot> {
+        let mut pages = self.pages.write();
+        let entry = pages
+            .get_mut(page_id)
+            .ok_or_else(|| SaltError::PageNotFound(page_id.to_string()))?;
+        let existing = read_canvases_from_doc_all(&entry.doc, true);
+        let active_count = existing
+            .iter()
+            .filter(|c| !c.deleted && !c.is_inline)
+            .count();
+        let next_sort = existing
+            .iter()
+            .filter(|c| !c.is_inline)
+            .map(|c| c.sort_order)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let canvas_id = format!("cvs_{}", new_ulid());
+        let now = now_utc_ms();
+        let resolved_title = title
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| format!("Canvas {}", active_count + 1));
+
+        let pre_vv = entry.doc.oplog_vv();
+        let meta_root = entry.doc.get_map("canvas_meta");
+        let meta_map = meta_root
+            .ensure_mergeable_map(&canvas_id)
+            .map_err(|e| SaltError::Crdt(e.to_string()))?;
+        meta_map
+            .insert("title", resolved_title.as_str())
+            .map_err(|e| SaltError::Crdt(e.to_string()))?;
+        meta_map
+            .insert("sort_order", next_sort)
+            .map_err(|e| SaltError::Crdt(e.to_string()))?;
+        meta_map
+            .insert("created_at_utc", now)
+            .map_err(|e| SaltError::Crdt(e.to_string()))?;
+        meta_map
+            .insert("deleted", false)
+            .map_err(|e| SaltError::Crdt(e.to_string()))?;
+
+        let canvases = entry.doc.get_map("canvas");
+        let _ = canvases
+            .ensure_mergeable_map(&canvas_id)
+            .map_err(|e| SaltError::Crdt(e.to_string()))?;
+
+        touch_updated_at(&entry.doc)?;
+        entry.doc.commit();
+
+        let bytes = entry
+            .doc
+            .export(ExportMode::updates(&pre_vv))
+            .map_err(|e| SaltError::Crdt(e.to_string()))?;
+        self.append_wal(page_id, &bytes)?;
+        entry.dirty_since_export = true;
+
+        Ok(CanvasSnapshot {
+            canvas_id,
+            title: resolved_title,
+            sort_order: next_sort,
+            created_at_utc: now,
+            is_inline: false,
+            deleted: false,
+            strokes: Vec::new(),
+            transforms: Vec::new(),
+            images: Vec::new(),
+        })
+    }
+
+    pub fn rename_page_canvas(
+        &self,
+        page_id: &str,
+        canvas_id: &str,
+        title: String,
+    ) -> SaltResult<()> {
+        let clean_title = title.trim().to_string();
+        if clean_title.is_empty() {
+            return Err(SaltError::InvalidInput("Canvas title cannot be empty".into()));
+        }
+        let mut pages = self.pages.write();
+        let entry = pages
+            .get_mut(page_id)
+            .ok_or_else(|| SaltError::PageNotFound(page_id.to_string()))?;
+        let existing = read_canvases_from_doc_all(&entry.doc, false);
+        let Some(target) = existing.iter().find(|c| c.canvas_id == canvas_id) else {
+            return Err(SaltError::InvalidInput(format!(
+                "Canvas {canvas_id} not found"
+            )));
+        };
+
+        let pre_vv = entry.doc.oplog_vv();
+        let meta_root = entry.doc.get_map("canvas_meta");
+        let meta_map = meta_root
+            .ensure_mergeable_map(canvas_id)
+            .map_err(|e| SaltError::Crdt(e.to_string()))?;
+        let existing_keys: std::collections::HashSet<String> = match meta_map.get_deep_value() {
+            LoroValue::Map(m) => m.keys().cloned().collect(),
+            _ => std::collections::HashSet::new(),
+        };
+        if !existing_keys.contains("sort_order") {
+            meta_map
+                .insert("sort_order", target.sort_order)
+                .map_err(|e| SaltError::Crdt(e.to_string()))?;
+        }
+        if !existing_keys.contains("created_at_utc") {
+            let created = if target.created_at_utc > 0 {
+                target.created_at_utc
+            } else {
+                now_utc_ms()
+            };
+            meta_map
+                .insert("created_at_utc", created)
+                .map_err(|e| SaltError::Crdt(e.to_string()))?;
+        }
+        if !existing_keys.contains("deleted") {
+            meta_map
+                .insert("deleted", false)
+                .map_err(|e| SaltError::Crdt(e.to_string()))?;
+        }
+        meta_map
+            .insert("title", clean_title.as_str())
+            .map_err(|e| SaltError::Crdt(e.to_string()))?;
+
+        touch_updated_at(&entry.doc)?;
+        entry.doc.commit();
+
+        let bytes = entry
+            .doc
+            .export(ExportMode::updates(&pre_vv))
+            .map_err(|e| SaltError::Crdt(e.to_string()))?;
+        self.append_wal(page_id, &bytes)?;
+        entry.dirty_since_export = true;
+        Ok(())
+    }
+
+    pub fn delete_page_canvas(&self, page_id: &str, canvas_id: &str) -> SaltResult<()> {
+        if canvas_id.starts_with("inline-") {
+            return Err(SaltError::InvalidInput(
+                "Inline canvas blocks cannot be deleted via standalone canvas API".into(),
+            ));
+        }
+        let mut pages = self.pages.write();
+        let entry = pages
+            .get_mut(page_id)
+            .ok_or_else(|| SaltError::PageNotFound(page_id.to_string()))?;
+        let active_standalone: Vec<CanvasSnapshot> = read_canvases_from_doc_all(&entry.doc, false)
+            .into_iter()
+            .filter(|c| !c.is_inline)
+            .collect();
+        if active_standalone.len() <= 1 {
+            return Err(SaltError::InvalidInput(
+                "Cannot delete the last canvas of a page".into(),
+            ));
+        }
+        let Some(target) = active_standalone.iter().find(|c| c.canvas_id == canvas_id) else {
+            return Err(SaltError::InvalidInput(format!(
+                "Canvas {canvas_id} not found"
+            )));
+        };
+
+        let pre_vv = entry.doc.oplog_vv();
+        let meta_root = entry.doc.get_map("canvas_meta");
+        let meta_map = meta_root
+            .ensure_mergeable_map(canvas_id)
+            .map_err(|e| SaltError::Crdt(e.to_string()))?;
+        let existing_keys: std::collections::HashSet<String> = match meta_map.get_deep_value() {
+            LoroValue::Map(m) => m.keys().cloned().collect(),
+            _ => std::collections::HashSet::new(),
+        };
+        if !existing_keys.contains("sort_order") {
+            meta_map
+                .insert("sort_order", target.sort_order)
+                .map_err(|e| SaltError::Crdt(e.to_string()))?;
+        }
+        meta_map
+            .insert("deleted", true)
+            .map_err(|e| SaltError::Crdt(e.to_string()))?;
+
+        touch_updated_at(&entry.doc)?;
+        entry.doc.commit();
+
+        let bytes = entry
+            .doc
+            .export(ExportMode::updates(&pre_vv))
+            .map_err(|e| SaltError::Crdt(e.to_string()))?;
+        self.append_wal(page_id, &bytes)?;
+        entry.dirty_since_export = true;
+        Ok(())
+    }
+
+    pub fn create_page_document(
+        &self,
+        page_id: &str,
+        title: Option<String>,
+        initial_markdown: &str,
+    ) -> SaltResult<PageDocumentSnapshot> {
+        let (created_doc, meta, projected_body, search_body, existing_file) = {
             let mut pages = self.pages.write();
             let entry = pages
                 .get_mut(page_id)
                 .ok_or_else(|| SaltError::PageNotFound(page_id.to_string()))?;
-            let pre_vv = entry.doc.oplog_vv();
-            let body = entry.doc.get_text("body");
-            body.update(new_markdown, UpdateOptions::default())
-                .map_err(|e| SaltError::Crdt(e.to_string()))?;
             let mut meta = read_meta_from_doc(&entry.doc, page_id)?;
-            meta.updated_at_utc = now_utc_ms();
+            let existing = read_documents_from_doc(&entry.doc, &meta, true);
+            let active_count = existing.iter().filter(|d| !d.deleted).count();
+            let next_sort = existing.iter().map(|d| d.sort_order).max().unwrap_or(0) + 1;
+            let doc_id = format!("doc_{}", new_ulid());
+            let now = now_utc_ms();
+            let resolved_title = title
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+                .unwrap_or_else(|| format!("Document {}", active_count + 1));
+
+            let pre_vv = entry.doc.oplog_vv();
+            let doc_meta_root = entry.doc.get_map("doc_meta");
+            let d_map = doc_meta_root
+                .ensure_mergeable_map(&doc_id)
+                .map_err(|e| SaltError::Crdt(e.to_string()))?;
+            d_map
+                .insert("title", resolved_title.as_str())
+                .map_err(|e| SaltError::Crdt(e.to_string()))?;
+            d_map
+                .insert("sort_order", next_sort)
+                .map_err(|e| SaltError::Crdt(e.to_string()))?;
+            d_map
+                .insert("created_at_utc", now)
+                .map_err(|e| SaltError::Crdt(e.to_string()))?;
+            d_map
+                .insert("updated_at_utc", now)
+                .map_err(|e| SaltError::Crdt(e.to_string()))?;
+            d_map
+                .insert("deleted", false)
+                .map_err(|e| SaltError::Crdt(e.to_string()))?;
+
+            if !initial_markdown.is_empty() {
+                let container = doc_text_container_name(&doc_id);
+                let text = entry.doc.get_text(container.as_str());
+                text.insert(0, initial_markdown)
+                    .map_err(|e| SaltError::Crdt(e.to_string()))?;
+            }
+
+            meta.updated_at_utc = now;
             write_meta_to_doc(&entry.doc, &meta)?;
             entry.doc.commit();
 
@@ -661,17 +1001,281 @@ SaltNote 是一款**永久免费开源、本地优先（Local-First）、零后�
                 .map_err(|e| SaltError::Crdt(e.to_string()))?;
             self.append_wal(page_id, &bytes)?;
             entry.dirty_since_export = true;
-            (meta, body.to_string(), entry.markdown_file.clone())
+
+            let docs = read_documents_from_doc(&entry.doc, &meta, false);
+            let projected = render_page_documents_markdown(&docs);
+            let combined = combine_documents_for_search(&docs);
+            let created_doc = PageDocumentSnapshot {
+                doc_id,
+                title: resolved_title,
+                body_markdown: initial_markdown.to_string(),
+                sort_order: next_sort,
+                created_at_utc: now,
+                updated_at_utc: now,
+                deleted: false,
+            };
+            (
+                created_doc,
+                meta,
+                projected,
+                combined,
+                entry.markdown_file.clone(),
+            )
         };
 
-        let md_file = self.project_markdown_file(&meta, &body_str, existing_file.as_deref())?;
+        let md_file =
+            self.project_markdown_file(&meta, &projected_body, existing_file.as_deref())?;
         if let Some(entry) = self.pages.write().get_mut(page_id) {
             entry.markdown_file = Some(md_file);
         }
         let _ = self.events_tx.send(DocChangeEvent::PageUpdated {
             page_id: page_id.to_string(),
             meta,
-            body_markdown: body_str,
+            body_markdown: search_body,
+        });
+        Ok(created_doc)
+    }
+
+    pub fn update_page_document_body(
+        &self,
+        page_id: &str,
+        doc_id: &str,
+        new_markdown: &str,
+    ) -> SaltResult<()> {
+        let target_doc_id = if doc_id.trim().is_empty() {
+            MAIN_DOC_ID
+        } else {
+            doc_id.trim()
+        };
+        let (meta, projected_body, search_body, existing_file) = {
+            let mut pages = self.pages.write();
+            let entry = pages
+                .get_mut(page_id)
+                .ok_or_else(|| SaltError::PageNotFound(page_id.to_string()))?;
+            let mut meta = read_meta_from_doc(&entry.doc, page_id)?;
+            let existing_docs = read_documents_from_doc(&entry.doc, &meta, false);
+            let Some(target) = existing_docs.iter().find(|d| d.doc_id == target_doc_id) else {
+                return Err(SaltError::InvalidInput(format!(
+                    "Document {target_doc_id} not found"
+                )));
+            };
+            let now = now_utc_ms();
+
+            let pre_vv = entry.doc.oplog_vv();
+            let container = doc_text_container_name(target_doc_id);
+            let text = entry.doc.get_text(container.as_str());
+            text.update(new_markdown, UpdateOptions::default())
+                .map_err(|e| SaltError::Crdt(e.to_string()))?;
+
+            let doc_meta_root = entry.doc.get_map("doc_meta");
+            let d_map = doc_meta_root
+                .ensure_mergeable_map(target_doc_id)
+                .map_err(|e| SaltError::Crdt(e.to_string()))?;
+            let existing_keys: std::collections::HashSet<String> = match d_map.get_deep_value() {
+                LoroValue::Map(m) => m.keys().cloned().collect(),
+                _ => std::collections::HashSet::new(),
+            };
+            if !existing_keys.contains("sort_order") {
+                d_map
+                    .insert("sort_order", target.sort_order)
+                    .map_err(|e| SaltError::Crdt(e.to_string()))?;
+            }
+            if !existing_keys.contains("created_at_utc") {
+                d_map
+                    .insert("created_at_utc", target.created_at_utc)
+                    .map_err(|e| SaltError::Crdt(e.to_string()))?;
+            }
+            if !existing_keys.contains("deleted") {
+                d_map
+                    .insert("deleted", false)
+                    .map_err(|e| SaltError::Crdt(e.to_string()))?;
+            }
+            d_map
+                .insert("updated_at_utc", now)
+                .map_err(|e| SaltError::Crdt(e.to_string()))?;
+
+            meta.updated_at_utc = now;
+            write_meta_to_doc(&entry.doc, &meta)?;
+            entry.doc.commit();
+
+            let bytes = entry
+                .doc
+                .export(ExportMode::updates(&pre_vv))
+                .map_err(|e| SaltError::Crdt(e.to_string()))?;
+            self.append_wal(page_id, &bytes)?;
+            entry.dirty_since_export = true;
+
+            let docs = read_documents_from_doc(&entry.doc, &meta, false);
+            let projected = render_page_documents_markdown(&docs);
+            let combined = combine_documents_for_search(&docs);
+            (meta, projected, combined, entry.markdown_file.clone())
+        };
+
+        let md_file =
+            self.project_markdown_file(&meta, &projected_body, existing_file.as_deref())?;
+        if let Some(entry) = self.pages.write().get_mut(page_id) {
+            entry.markdown_file = Some(md_file);
+        }
+        let _ = self.events_tx.send(DocChangeEvent::PageUpdated {
+            page_id: page_id.to_string(),
+            meta,
+            body_markdown: search_body,
+        });
+        Ok(())
+    }
+
+    pub fn rename_page_document(
+        &self,
+        page_id: &str,
+        doc_id: &str,
+        title: String,
+    ) -> SaltResult<()> {
+        let clean_title = title.trim().to_string();
+        if clean_title.is_empty() {
+            return Err(SaltError::InvalidInput("Document title cannot be empty".into()));
+        }
+        let (meta, projected_body, search_body, existing_file) = {
+            let mut pages = self.pages.write();
+            let entry = pages
+                .get_mut(page_id)
+                .ok_or_else(|| SaltError::PageNotFound(page_id.to_string()))?;
+            let mut meta = read_meta_from_doc(&entry.doc, page_id)?;
+            let existing_docs = read_documents_from_doc(&entry.doc, &meta, false);
+            let Some(target) = existing_docs.iter().find(|d| d.doc_id == doc_id) else {
+                return Err(SaltError::InvalidInput(format!(
+                    "Document {doc_id} not found"
+                )));
+            };
+            let now = now_utc_ms();
+
+            let pre_vv = entry.doc.oplog_vv();
+            let doc_meta_root = entry.doc.get_map("doc_meta");
+            let d_map = doc_meta_root
+                .ensure_mergeable_map(doc_id)
+                .map_err(|e| SaltError::Crdt(e.to_string()))?;
+            let existing_keys: std::collections::HashSet<String> = match d_map.get_deep_value() {
+                LoroValue::Map(m) => m.keys().cloned().collect(),
+                _ => std::collections::HashSet::new(),
+            };
+            if !existing_keys.contains("sort_order") {
+                d_map
+                    .insert("sort_order", target.sort_order)
+                    .map_err(|e| SaltError::Crdt(e.to_string()))?;
+            }
+            if !existing_keys.contains("created_at_utc") {
+                d_map
+                    .insert("created_at_utc", target.created_at_utc)
+                    .map_err(|e| SaltError::Crdt(e.to_string()))?;
+            }
+            if !existing_keys.contains("deleted") {
+                d_map
+                    .insert("deleted", false)
+                    .map_err(|e| SaltError::Crdt(e.to_string()))?;
+            }
+            d_map
+                .insert("title", clean_title.as_str())
+                .map_err(|e| SaltError::Crdt(e.to_string()))?;
+            d_map
+                .insert("updated_at_utc", now)
+                .map_err(|e| SaltError::Crdt(e.to_string()))?;
+
+            meta.updated_at_utc = now;
+            write_meta_to_doc(&entry.doc, &meta)?;
+            entry.doc.commit();
+
+            let bytes = entry
+                .doc
+                .export(ExportMode::updates(&pre_vv))
+                .map_err(|e| SaltError::Crdt(e.to_string()))?;
+            self.append_wal(page_id, &bytes)?;
+            entry.dirty_since_export = true;
+
+            let docs = read_documents_from_doc(&entry.doc, &meta, false);
+            let projected = render_page_documents_markdown(&docs);
+            let combined = combine_documents_for_search(&docs);
+            (meta, projected, combined, entry.markdown_file.clone())
+        };
+
+        let md_file =
+            self.project_markdown_file(&meta, &projected_body, existing_file.as_deref())?;
+        if let Some(entry) = self.pages.write().get_mut(page_id) {
+            entry.markdown_file = Some(md_file);
+        }
+        let _ = self.events_tx.send(DocChangeEvent::PageUpdated {
+            page_id: page_id.to_string(),
+            meta,
+            body_markdown: search_body,
+        });
+        Ok(())
+    }
+
+    pub fn delete_page_document(&self, page_id: &str, doc_id: &str) -> SaltResult<()> {
+        let (meta, projected_body, search_body, existing_file) = {
+            let mut pages = self.pages.write();
+            let entry = pages
+                .get_mut(page_id)
+                .ok_or_else(|| SaltError::PageNotFound(page_id.to_string()))?;
+            let mut meta = read_meta_from_doc(&entry.doc, page_id)?;
+            let existing_docs = read_documents_from_doc(&entry.doc, &meta, false);
+            if existing_docs.len() <= 1 {
+                return Err(SaltError::InvalidInput(
+                    "Cannot delete the last document of a page".into(),
+                ));
+            }
+            let Some(target) = existing_docs.iter().find(|d| d.doc_id == doc_id) else {
+                return Err(SaltError::InvalidInput(format!(
+                    "Document {doc_id} not found"
+                )));
+            };
+            let now = now_utc_ms();
+
+            let pre_vv = entry.doc.oplog_vv();
+            let doc_meta_root = entry.doc.get_map("doc_meta");
+            let d_map = doc_meta_root
+                .ensure_mergeable_map(doc_id)
+                .map_err(|e| SaltError::Crdt(e.to_string()))?;
+            let existing_keys: std::collections::HashSet<String> = match d_map.get_deep_value() {
+                LoroValue::Map(m) => m.keys().cloned().collect(),
+                _ => std::collections::HashSet::new(),
+            };
+            if !existing_keys.contains("sort_order") {
+                d_map
+                    .insert("sort_order", target.sort_order)
+                    .map_err(|e| SaltError::Crdt(e.to_string()))?;
+            }
+            d_map
+                .insert("deleted", true)
+                .map_err(|e| SaltError::Crdt(e.to_string()))?;
+            d_map
+                .insert("updated_at_utc", now)
+                .map_err(|e| SaltError::Crdt(e.to_string()))?;
+
+            meta.updated_at_utc = now;
+            write_meta_to_doc(&entry.doc, &meta)?;
+            entry.doc.commit();
+
+            let bytes = entry
+                .doc
+                .export(ExportMode::updates(&pre_vv))
+                .map_err(|e| SaltError::Crdt(e.to_string()))?;
+            self.append_wal(page_id, &bytes)?;
+            entry.dirty_since_export = true;
+
+            let docs = read_documents_from_doc(&entry.doc, &meta, false);
+            let projected = render_page_documents_markdown(&docs);
+            let combined = combine_documents_for_search(&docs);
+            (meta, projected, combined, entry.markdown_file.clone())
+        };
+
+        let md_file =
+            self.project_markdown_file(&meta, &projected_body, existing_file.as_deref())?;
+        if let Some(entry) = self.pages.write().get_mut(page_id) {
+            entry.markdown_file = Some(md_file);
+        }
+        let _ = self.events_tx.send(DocChangeEvent::PageUpdated {
+            page_id: page_id.to_string(),
+            meta,
+            body_markdown: search_body,
         });
         Ok(())
     }
@@ -967,12 +1571,35 @@ SaltNote 是一款**永久免费开源、本地优先（Local-First）、零后�
     /// Fuses a Salt Halo crystal's answer into the page body using semantic Callout syntax
     /// (converting glacier flashcard JSON into clean readable Markdown Q/A blocks) and marks the halo fused.
     pub fn fuse_halo_into_body(&self, page_id: &str, halo_id: &str) -> SaltResult<String> {
+        self.fuse_halo_into_document(page_id, halo_id, None)
+    }
+
+    /// Fuses a Salt Halo crystal's answer into the specified document (or the halo's origin doc / `"main"`).
+    pub fn fuse_halo_into_document(
+        &self,
+        page_id: &str,
+        halo_id: &str,
+        target_doc_id: Option<&str>,
+    ) -> SaltResult<String> {
         let snap = self.get_page_snapshot(page_id)?;
         let mut halo = snap
             .halos
             .into_iter()
             .find(|h| h.halo_id == halo_id)
             .ok_or_else(|| SaltError::InvalidInput(format!("Halo {halo_id} not found")))?;
+
+        let preferred_id = target_doc_id
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .or_else(|| halo.doc_id.as_deref().filter(|s| !s.is_empty()))
+            .unwrap_or(MAIN_DOC_ID);
+        let resolved_doc = snap
+            .documents
+            .iter()
+            .find(|d| d.doc_id == preferred_id)
+            .or_else(|| snap.documents.iter().find(|d| d.doc_id == MAIN_DOC_ID))
+            .or_else(|| snap.documents.first())
+            .ok_or_else(|| SaltError::InvalidInput("Page has no active documents".into()))?;
 
         let header = match halo.preset_id.as_str() {
             "builtin.amber_expand" => "[!salt-amber] 琥珀黄 · 概念扩充".to_string(),
@@ -1018,8 +1645,9 @@ SaltNote 是一款**永久免费开源、本地优先（Local-First）、零后�
             .join("\n");
 
         let fused_block = format!("\n\n> {header}\n>\n{quoted_body}\n");
-        let updated_body = format!("{}{}", snap.body_markdown.trim_end(), fused_block);
-        self.update_page_body(page_id, &updated_body)?;
+        let updated_body = format!("{}{}", resolved_doc.body_markdown.trim_end(), fused_block);
+        let doc_id_owned = resolved_doc.doc_id.clone();
+        self.update_page_document_body(page_id, &doc_id_owned, &updated_body)?;
 
         halo.fused = true;
         halo.collapsed = true;
@@ -1463,23 +2091,29 @@ SaltNote 是一款**永久免费开源、本地优先（Local-First）、零后�
         })
     }
 
-    /// Collects all asset relative paths referenced by active pages, Halo slices, and Inbox items,
-    /// returning `(rel_path, is_lightweight_mobile_priority)`.
+    /// Collects all asset relative paths referenced by active pages, Markdown docs, Halo slices,
+    /// and Inbox items, returning `(rel_path, is_lightweight_mobile_priority)`.
     pub fn collect_referenced_assets(&self) -> Vec<(String, bool)> {
         let mut map: BTreeMap<String, bool> = BTreeMap::new();
         {
             let pages = self.pages.read();
             for (page_id, entry) in pages.iter() {
-                if let Ok(meta) = read_meta_from_doc(&entry.doc, page_id) {
-                    if meta.is_deleted {
-                        continue;
-                    }
+                let Ok(meta) = read_meta_from_doc(&entry.doc, page_id) else {
+                    continue;
+                };
+                if meta.is_deleted {
+                    continue;
                 }
-                for c in read_canvases_from_doc(&entry.doc) {
+                for c in read_canvases_from_doc_all(&entry.doc, false) {
                     for img in c.images {
                         if !img.deleted && !img.asset_rel_path.is_empty() {
                             map.entry(img.asset_rel_path).or_insert(false);
                         }
+                    }
+                }
+                for doc in read_documents_from_doc(&entry.doc, &meta, false) {
+                    for rel in extract_markdown_asset_paths(&doc.body_markdown) {
+                        map.entry(rel).or_insert(false);
                     }
                 }
                 for h in read_halos_from_doc(&entry.doc) {
@@ -1538,30 +2172,56 @@ SaltNote 是一款**永久免费开源、本地优先（Local-First）、零后�
                 if meta.is_deleted {
                     continue;
                 }
-                let body = entry.doc.get_text("body").to_string();
-                let snippet: String = body
+                let docs = read_documents_from_doc(&entry.doc, &meta, false);
+                let primary_body = docs
+                    .iter()
+                    .find(|d| d.doc_id == MAIN_DOC_ID)
+                    .or_else(|| docs.first())
+                    .map(|d| d.body_markdown.as_str())
+                    .unwrap_or("");
+                let snippet: String = primary_body
                     .lines()
                     .map(str::trim)
                     .filter(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with("```"))
                     .take(2)
                     .collect::<Vec<_>>()
                     .join(" ");
-                let canvases = read_canvases_from_doc(&entry.doc);
-                let stroke_count: u32 = canvases
+                let canvases_all = read_canvases_from_doc_all(&entry.doc, false);
+                let mut stroke_count: u32 = 0;
+                let mut canvas_summaries = Vec::new();
+                for c in &canvases_all {
+                    let deleted: std::collections::HashSet<&str> = c
+                        .transforms
+                        .iter()
+                        .filter(|t| t.deleted)
+                        .map(|t| t.stroke_id.as_str())
+                        .collect();
+                    let active_strokes = c
+                        .strokes
+                        .iter()
+                        .filter(|s| !deleted.contains(s.stroke_id.as_str()))
+                        .count() as u32;
+                    stroke_count += active_strokes;
+                    if !c.is_inline {
+                        let active_images = c.images.iter().filter(|img| !img.deleted).count() as u32;
+                        canvas_summaries.push(PageCanvasSummary {
+                            canvas_id: c.canvas_id.clone(),
+                            title: c.title.clone(),
+                            sort_order: c.sort_order,
+                            stroke_count: active_strokes,
+                            image_count: active_images,
+                        });
+                    }
+                }
+                let doc_summaries: Vec<PageDocumentSummary> = docs
                     .iter()
-                    .map(|c| {
-                        let deleted: std::collections::HashSet<&str> = c
-                            .transforms
-                            .iter()
-                            .filter(|t| t.deleted)
-                            .map(|t| t.stroke_id.as_str())
-                            .collect();
-                        c.strokes
-                            .iter()
-                            .filter(|s| !deleted.contains(s.stroke_id.as_str()))
-                            .count() as u32
+                    .map(|d| PageDocumentSummary {
+                        doc_id: d.doc_id.clone(),
+                        title: d.title.clone(),
+                        sort_order: d.sort_order,
+                        updated_at_utc: d.updated_at_utc,
                     })
-                    .sum();
+                    .collect();
                 let card_count = read_cards_from_doc(&entry.doc)
                     .iter()
                     .filter(|c| !c.archived)
@@ -1572,6 +2232,8 @@ SaltNote 是一款**永久免费开源、本地优先（Local-First）、零后�
                     stroke_count,
                     card_count,
                     markdown_file: entry.markdown_file.clone().unwrap_or_default(),
+                    canvases: canvas_summaries,
+                    documents: doc_summaries,
                 });
             }
         }
@@ -1585,14 +2247,21 @@ SaltNote 是一款**永久免费开源、本地优先（Local-First）、零后�
             .get(page_id)
             .ok_or_else(|| SaltError::PageNotFound(page_id.to_string()))?;
         let meta = read_meta_from_doc(&entry.doc, page_id)?;
-        let body_markdown = entry.doc.get_text("body").to_string();
-        let canvases = read_canvases_from_doc(&entry.doc);
+        let documents = read_documents_from_doc(&entry.doc, &meta, false);
+        let body_markdown = documents
+            .iter()
+            .find(|d| d.doc_id == MAIN_DOC_ID)
+            .or_else(|| documents.first())
+            .map(|d| d.body_markdown.clone())
+            .unwrap_or_default();
+        let canvases = read_canvases_from_doc_all(&entry.doc, false);
         let halos = read_halos_from_doc(&entry.doc);
         let cards = read_cards_from_doc(&entry.doc);
         Ok(PageSnapshot {
             meta,
             body_markdown,
             canvases,
+            documents,
             halos,
             cards,
         })
@@ -1616,13 +2285,31 @@ SaltNote 是一款**永久免费开源、本地优先（Local-First）、零后�
 
     /// Canonical SHA-256 hash over normalized Loro document state for bit-level convergence verification.
     pub fn compute_page_state_hash(&self, page_id: &str) -> SaltResult<String> {
-        let snap = self.get_page_snapshot(page_id)?;
-        let logs = {
+        let (meta, canvases, documents, halos, cards, logs) = {
             let pages = self.pages.read();
             let entry = pages
                 .get(page_id)
                 .ok_or_else(|| SaltError::PageNotFound(page_id.to_string()))?;
-            read_review_logs_from_doc(&entry.doc)
+            let meta = read_meta_from_doc(&entry.doc, page_id)?;
+            let canvases = read_canvases_from_doc_all(&entry.doc, true);
+            let documents = read_documents_from_doc(&entry.doc, &meta, true);
+            let halos = read_halos_from_doc(&entry.doc);
+            let cards = read_cards_from_doc(&entry.doc);
+            let logs = read_review_logs_from_doc(&entry.doc);
+            (meta, canvases, documents, halos, cards, logs)
+        };
+        let body_markdown = documents
+            .iter()
+            .find(|d| d.doc_id == MAIN_DOC_ID)
+            .map(|d| d.body_markdown.clone())
+            .unwrap_or_default();
+        let snap = PageSnapshot {
+            meta,
+            body_markdown,
+            canvases,
+            documents,
+            halos,
+            cards,
         };
         let mut normalized = CanonicalPageState::from_snapshot(snap, logs);
         normalized.sort_deterministically();
@@ -1960,7 +2647,7 @@ SaltNote 是一款**永久免费开源、本地优先（Local-First）、零后�
             return Ok(VAULT_ROOT_DOC_ID.to_string());
         }
 
-        let (meta, body, cards, logs, old_file) = {
+        let (meta, projected_body, search_body, cards, logs, old_file) = {
             let mut pages = self.pages.write();
             let entry = pages
                 .entry(packet.page_id.clone())
@@ -1975,10 +2662,12 @@ SaltNote 是一款**永久免费开源、本地优先（Local-First）、零后�
                 .import(&packet.loro_bytes)
                 .map_err(|e| SaltError::Crdt(format!("Loro import failed: {e}")))?;
             let meta = read_meta_from_doc(&entry.doc, &packet.page_id)?;
-            let body = entry.doc.get_text("body").to_string();
+            let docs = read_documents_from_doc(&entry.doc, &meta, false);
+            let projected = render_page_documents_markdown(&docs);
+            let combined = combine_documents_for_search(&docs);
             let cards = read_cards_from_doc(&entry.doc);
             let logs = read_review_logs_from_doc(&entry.doc);
-            (meta, body, cards, logs, entry.markdown_file.clone())
+            (meta, projected, combined, cards, logs, entry.markdown_file.clone())
         };
 
         // Record remote delta locally with collision-free hash suffix so cold restarts reproduce full state
@@ -2009,7 +2698,7 @@ SaltNote 是一款**永久免费开源、本地优先（Local-First）、零后�
             return Ok(packet.page_id);
         }
 
-        let md_file = self.project_markdown_file(&meta, &body, old_file.as_deref())?;
+        let md_file = self.project_markdown_file(&meta, &projected_body, old_file.as_deref())?;
         if let Some(entry) = self.pages.write().get_mut(&packet.page_id) {
             entry.markdown_file = Some(md_file);
         }
@@ -2019,7 +2708,7 @@ SaltNote 是一款**永久免费开源、本地优先（Local-First）、零后�
         let _ = self.events_tx.send(DocChangeEvent::PageUpdated {
             page_id: packet.page_id.clone(),
             meta,
-            body_markdown: body,
+            body_markdown: search_body,
         });
         let _ = self.events_tx.send(DocChangeEvent::CardsUpdated {
             page_id: packet.page_id.clone(),
@@ -2055,7 +2744,8 @@ SaltNote 是一款**永久免费开源、本地优先（Local-First）、零后�
         let mut count = 0u32;
         for summary in self.list_pages() {
             let snap = self.get_page_snapshot(&summary.meta.page_id)?;
-            let content = render_markdown_with_frontmatter(&snap.meta, &snap.body_markdown);
+            let projected = render_page_documents_markdown(&snap.documents);
+            let content = render_markdown_with_frontmatter(&snap.meta, &projected);
             let filename = format_markdown_filename(&snap.meta);
             fs::write(target_pages.join(filename), content)
                 .map_err(|e| SaltError::Io(e.to_string()))?;
@@ -2310,42 +3000,93 @@ fn read_meta_from_doc(doc: &LoroDoc, fallback_id: &str) -> SaltResult<PageMeta> 
     })
 }
 
-fn read_canvases_from_doc(doc: &LoroDoc) -> Vec<CanvasSnapshot> {
-    let val = doc.get_map("canvas").get_deep_value();
-    let LoroValue::Map(root_map) = val else {
-        return Vec::new();
+fn doc_text_container_name(doc_id: &str) -> String {
+    if doc_id == MAIN_DOC_ID {
+        "body".to_string()
+    } else {
+        format!("doc_body_{doc_id}")
+    }
+}
+
+fn read_canvases_from_doc_all(doc: &LoroDoc, include_deleted: bool) -> Vec<CanvasSnapshot> {
+    let canvas_root = match doc.get_map("canvas").get_deep_value() {
+        LoroValue::Map(m) => m,
+        _ => Default::default(),
     };
+    let meta_root = match doc.get_map("canvas_meta").get_deep_value() {
+        LoroValue::Map(m) => m,
+        _ => Default::default(),
+    };
+
+    let mut all_ids: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for k in canvas_root.keys() {
+        all_ids.insert(k.clone());
+    }
+    for k in meta_root.keys() {
+        all_ids.insert(k.clone());
+    }
+    all_ids.insert(MAIN_CANVAS_ID.to_string());
+
     let mut out = Vec::new();
-    for (canvas_id, c_val) in root_map.iter() {
-        let LoroValue::Map(c_map) = c_val else {
-            continue;
+    for canvas_id in all_ids {
+        let is_inline = canvas_id.starts_with("inline-");
+        let meta_map = match meta_root.get(&canvas_id) {
+            Some(LoroValue::Map(m)) => Some(m),
+            _ => None,
         };
+        let title = meta_map
+            .and_then(|m| match m.get("title") {
+                Some(LoroValue::String(s)) => Some(s.to_string()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let sort_order = meta_map
+            .and_then(|m| match m.get("sort_order") {
+                Some(LoroValue::I64(n)) => Some(*n),
+                _ => None,
+            })
+            .unwrap_or_else(|| if canvas_id == MAIN_CANVAS_ID { 0 } else { 1 });
+        let created_at_utc = meta_map
+            .and_then(|m| match m.get("created_at_utc") {
+                Some(LoroValue::I64(n)) => Some(*n),
+                _ => None,
+            })
+            .unwrap_or(0);
+        let deleted = meta_map
+            .and_then(|m| match m.get("deleted") {
+                Some(LoroValue::Bool(b)) => Some(*b),
+                _ => None,
+            })
+            .unwrap_or(false);
+
         let mut strokes = Vec::new();
-        if let Some(LoroValue::Map(sm)) = c_map.get("strokes") {
-            for v in sm.values() {
-                if let LoroValue::String(s) = v {
-                    if let Ok(st) = serde_json::from_str::<DeltaStroke>(s) {
-                        strokes.push(st);
-                    }
-                }
-            }
-        }
         let mut transforms = Vec::new();
-        if let Some(LoroValue::Map(tm)) = c_map.get("transforms") {
-            for v in tm.values() {
-                if let LoroValue::String(s) = v {
-                    if let Ok(tr) = serde_json::from_str::<StrokeTransform>(s) {
-                        transforms.push(tr);
+        let mut images = Vec::new();
+        if let Some(LoroValue::Map(c_map)) = canvas_root.get(&canvas_id) {
+            if let Some(LoroValue::Map(sm)) = c_map.get("strokes") {
+                for v in sm.values() {
+                    if let LoroValue::String(s) = v {
+                        if let Ok(st) = serde_json::from_str::<DeltaStroke>(s) {
+                            strokes.push(st);
+                        }
                     }
                 }
             }
-        }
-        let mut images = Vec::new();
-        if let Some(LoroValue::Map(im)) = c_map.get("images") {
-            for v in im.values() {
-                if let LoroValue::String(s) = v {
-                    if let Ok(node) = serde_json::from_str::<CanvasImageNode>(s) {
-                        images.push(node);
+            if let Some(LoroValue::Map(tm)) = c_map.get("transforms") {
+                for v in tm.values() {
+                    if let LoroValue::String(s) = v {
+                        if let Ok(tr) = serde_json::from_str::<StrokeTransform>(s) {
+                            transforms.push(tr);
+                        }
+                    }
+                }
+            }
+            if let Some(LoroValue::Map(im)) = c_map.get("images") {
+                for v in im.values() {
+                    if let LoroValue::String(s) = v {
+                        if let Ok(node) = serde_json::from_str::<CanvasImageNode>(s) {
+                            images.push(node);
+                        }
                     }
                 }
             }
@@ -2354,14 +3095,216 @@ fn read_canvases_from_doc(doc: &LoroDoc) -> Vec<CanvasSnapshot> {
         transforms.sort_by(|a, b| a.stroke_id.cmp(&b.stroke_id));
         images.sort_by(|a, b| a.image_id.cmp(&b.image_id));
         out.push(CanvasSnapshot {
-            canvas_id: canvas_id.clone(),
+            canvas_id,
+            title,
+            sort_order,
+            created_at_utc,
+            is_inline,
+            deleted,
             strokes,
             transforms,
             images,
         });
     }
-    out.sort_by(|a, b| a.canvas_id.cmp(&b.canvas_id));
+
+    // Safety guard: never allow every standalone canvas to be deleted concurrently across offline devices.
+    if !out.iter().any(|c| !c.is_inline && !c.deleted) {
+        if let Some(main_c) = out.iter_mut().find(|c| c.canvas_id == MAIN_CANVAS_ID) {
+            main_c.deleted = false;
+        }
+    }
+
+    if !include_deleted {
+        out.retain(|c| !c.deleted);
+    }
+
+    out.sort_by(|a, b| {
+        a.is_inline
+            .cmp(&b.is_inline)
+            .then(a.deleted.cmp(&b.deleted))
+            .then(a.sort_order.cmp(&b.sort_order))
+            .then(a.created_at_utc.cmp(&b.created_at_utc))
+            .then(a.canvas_id.cmp(&b.canvas_id))
+    });
     out
+}
+
+fn read_documents_from_doc(
+    doc: &LoroDoc,
+    meta: &PageMeta,
+    include_deleted: bool,
+) -> Vec<PageDocumentSnapshot> {
+    let meta_root = match doc.get_map("doc_meta").get_deep_value() {
+        LoroValue::Map(m) => m,
+        _ => Default::default(),
+    };
+    let mut all_ids: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for k in meta_root.keys() {
+        all_ids.insert(k.clone());
+    }
+    all_ids.insert(MAIN_DOC_ID.to_string());
+
+    let mut out = Vec::new();
+    for doc_id in all_ids {
+        let d_map = match meta_root.get(&doc_id) {
+            Some(LoroValue::Map(m)) => Some(m),
+            _ => None,
+        };
+        let title = d_map
+            .and_then(|m| match m.get("title") {
+                Some(LoroValue::String(s)) => Some(s.to_string()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let sort_order = d_map
+            .and_then(|m| match m.get("sort_order") {
+                Some(LoroValue::I64(n)) => Some(*n),
+                _ => None,
+            })
+            .unwrap_or_else(|| if doc_id == MAIN_DOC_ID { 0 } else { 1 });
+        let created_at_utc = d_map
+            .and_then(|m| match m.get("created_at_utc") {
+                Some(LoroValue::I64(n)) => Some(*n),
+                _ => None,
+            })
+            .unwrap_or(meta.created_at_utc);
+        let updated_at_utc = d_map
+            .and_then(|m| match m.get("updated_at_utc") {
+                Some(LoroValue::I64(n)) => Some(*n),
+                _ => None,
+            })
+            .unwrap_or(meta.updated_at_utc);
+        let deleted = d_map
+            .and_then(|m| match m.get("deleted") {
+                Some(LoroValue::Bool(b)) => Some(*b),
+                _ => None,
+            })
+            .unwrap_or(false);
+
+        let container = doc_text_container_name(&doc_id);
+        let body_markdown = doc.get_text(container.as_str()).to_string();
+        out.push(PageDocumentSnapshot {
+            doc_id,
+            title,
+            body_markdown,
+            sort_order,
+            created_at_utc,
+            updated_at_utc,
+            deleted,
+        });
+    }
+
+    if !out.iter().any(|d| !d.deleted) {
+        if let Some(main_d) = out.iter_mut().find(|d| d.doc_id == MAIN_DOC_ID) {
+            main_d.deleted = false;
+        }
+    }
+
+    if !include_deleted {
+        out.retain(|d| !d.deleted);
+    }
+
+    out.sort_by(|a, b| {
+        a.deleted
+            .cmp(&b.deleted)
+            .then(a.sort_order.cmp(&b.sort_order))
+            .then(a.created_at_utc.cmp(&b.created_at_utc))
+            .then(a.doc_id.cmp(&b.doc_id))
+    });
+    out
+}
+
+pub fn combine_documents_for_search(docs: &[PageDocumentSnapshot]) -> String {
+    let mut parts = Vec::new();
+    for d in docs.iter().filter(|d| !d.deleted) {
+        if !d.title.trim().is_empty() {
+            parts.push(d.title.trim().to_string());
+        }
+        if !d.body_markdown.trim().is_empty() {
+            parts.push(d.body_markdown.clone());
+        }
+    }
+    parts.join("\n\n")
+}
+
+pub fn render_page_documents_markdown(docs: &[PageDocumentSnapshot]) -> String {
+    let active: Vec<&PageDocumentSnapshot> = docs.iter().filter(|d| !d.deleted).collect();
+    if active.is_empty() {
+        return String::new();
+    }
+    if active.len() == 1 {
+        return active[0].body_markdown.clone();
+    }
+    let mut out = active[0].body_markdown.clone();
+    for doc in &active[1..] {
+        let label = if doc.title.trim().is_empty() {
+            doc.doc_id.as_str()
+        } else {
+            doc.title.trim()
+        };
+        if !out.trim_end().is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str(&format!(
+            "---\n\n<!-- salt-doc: {} | {} -->\n\n{}",
+            doc.doc_id, label, doc.body_markdown
+        ));
+    }
+    out
+}
+
+pub fn extract_markdown_asset_paths(markdown: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let bytes = markdown.as_bytes();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b']' && bytes[i + 1] == b'(' {
+            let start = i + 2;
+            if let Some(rel_end) = markdown[start..].find(')') {
+                let raw = markdown[start..start + rel_end].trim();
+                let target = if let Some(after_lt) = raw.strip_prefix('<') {
+                    after_lt.split('>').next().unwrap_or("")
+                } else {
+                    raw.split_whitespace().next().unwrap_or("")
+                };
+                let unescaped = target
+                    .trim()
+                    .replace('\\', "/")
+                    .replace("%20", " ");
+                let cleaned = unescaped
+                    .trim_start_matches("./")
+                    .trim_start_matches('/');
+                if cleaned.starts_with("assets/") && validate_safe_asset_rel_path(cleaned).is_ok() {
+                    out.push(cleaned.to_string());
+                }
+                i = start + rel_end + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+fn normalize_ui_prefs(mut prefs: LocalUiPrefs) -> LocalUiPrefs {
+    let defaults = default_pen_palette_argb();
+    if prefs.pen_palette_argb.len() < 5 {
+        for idx in prefs.pen_palette_argb.len()..5 {
+            prefs.pen_palette_argb.push(defaults[idx]);
+        }
+    } else if prefs.pen_palette_argb.len() > 5 {
+        prefs.pen_palette_argb.truncate(5);
+    }
+    if prefs.recent_custom_colors_argb.len() > 8 {
+        prefs.recent_custom_colors_argb.truncate(8);
+    }
+    if prefs.recent_pages.len() > 20 {
+        prefs.recent_pages.truncate(20);
+    }
+    if prefs.recent_cards.len() > 20 {
+        prefs.recent_cards.truncate(20);
+    }
+    prefs
 }
 
 fn read_halos_from_doc(doc: &LoroDoc) -> Vec<HaloAnnotation> {
@@ -2671,6 +3614,7 @@ struct CanonicalPageState {
     meta: PageMeta,
     body_markdown: String,
     canvases: Vec<CanvasSnapshot>,
+    documents: Vec<PageDocumentSnapshot>,
     halos: Vec<HaloAnnotation>,
     cards: Vec<FlashCard>,
     review_logs: Vec<ReviewLog>,
@@ -2682,6 +3626,7 @@ impl CanonicalPageState {
             meta: snap.meta,
             body_markdown: snap.body_markdown,
             canvases: snap.canvases,
+            documents: snap.documents,
             halos: snap.halos,
             cards: snap.cards,
             review_logs,
@@ -2696,6 +3641,7 @@ impl CanonicalPageState {
             c.transforms.sort_by(|a, b| a.stroke_id.cmp(&b.stroke_id));
             c.images.sort_by(|a, b| a.image_id.cmp(&b.image_id));
         }
+        self.documents.sort_by(|a, b| a.doc_id.cmp(&b.doc_id));
         self.halos.sort_by(|a, b| a.halo_id.cmp(&b.halo_id));
         self.cards.sort_by(|a, b| a.card_id.cmp(&b.card_id));
         self.review_logs.sort_by(|a, b| {
@@ -3100,6 +4046,7 @@ mod tests {
             halo_id: "h-glacier".into(),
             page_id: meta.page_id.clone(),
             canvas_id: Some("main".into()),
+            doc_id: None,
             preset_id: "builtin.glacier_card".into(),
             anchor_bbox: None,
             anchor_text_offset: None,
@@ -3181,6 +4128,7 @@ mod tests {
             halo_id: "h1".into(),
             page_id: meta.page_id.clone(),
             canvas_id: Some("main".into()),
+            doc_id: None,
             preset_id: "builtin.amber_expand".into(),
             anchor_bbox: Some(RectF {
                 min_x: 10.0,
@@ -3569,6 +4517,212 @@ mod tests {
 
         store.remove_paired_peer("dev_tablet_1").unwrap();
         assert!(!store.is_peer_paired("abcdef1234567890abcdef1234567890"));
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn multi_canvas_and_multi_document_crud_and_guards() {
+        let base = std::env::temp_dir().join(format!("saltnote_multi_cd_{}", new_ulid()));
+        let store = VaultStore::open(&base, Some("MultiNode".into())).unwrap();
+        let meta = store
+            .create_page("Multi Container", PageMode::Study, false, vec![], "# Main Doc")
+            .unwrap();
+
+        // Cannot delete the last remaining canvas or document
+        assert!(store.delete_page_canvas(&meta.page_id, "main").is_err());
+        assert!(store.delete_page_document(&meta.page_id, "main").is_err());
+
+        // Add inline canvas (must remain isolated from standalone canvas count)
+        store
+            .add_stroke(&meta.page_id, "inline-block-1", &make_dummy_stroke("s-in", 10.0))
+            .unwrap();
+        assert!(store.delete_page_canvas(&meta.page_id, "inline-block-1").is_err());
+        assert!(store.delete_page_canvas(&meta.page_id, "main").is_err());
+
+        // Create second standalone canvas & rename both
+        let c2 = store
+            .create_page_canvas(&meta.page_id, Some("草稿画布".into()))
+            .unwrap();
+        assert!(c2.canvas_id.starts_with("cvs_"));
+        store
+            .rename_page_canvas(&meta.page_id, &c2.canvas_id, "演算区".into())
+            .unwrap();
+        store
+            .add_stroke(&meta.page_id, &c2.canvas_id, &make_dummy_stroke("s-c2", 20.0))
+            .unwrap();
+
+        // Create second document, update it, rename & fuse halo into it
+        let d2 = store
+            .create_page_document(&meta.page_id, Some("错题整理".into()), "## 错题 1\n")
+            .unwrap();
+        assert!(d2.doc_id.starts_with("doc_"));
+        store
+            .update_page_document_body(&meta.page_id, &d2.doc_id, "## 错题 1\n\n解法修正")
+            .unwrap();
+        store
+            .rename_page_document(&meta.page_id, &d2.doc_id, "二轮错题本".into())
+            .unwrap();
+
+        let halo = HaloAnnotation {
+            halo_id: "h-doc2".into(),
+            page_id: meta.page_id.clone(),
+            canvas_id: None,
+            doc_id: Some(d2.doc_id.clone()),
+            preset_id: "builtin.amber_expand".into(),
+            anchor_bbox: None,
+            anchor_text_offset: Some(0),
+            pin_x: None,
+            pin_y: None,
+            slice_cache_path: None,
+            slice_asset_rel_path: None,
+            context_excerpt: "解法修正".into(),
+            response_markdown: "补充分步解析".into(),
+            collapsed: false,
+            fused: false,
+            created_at_utc: now_utc_ms(),
+        };
+        store.upsert_halo(&halo).unwrap();
+        let fused_d2 = store
+            .fuse_halo_into_document(&meta.page_id, "h-doc2", Some(&d2.doc_id))
+            .unwrap();
+        assert!(fused_d2.contains("补充分步解析"));
+
+        let snap = store.get_page_snapshot(&meta.page_id).unwrap();
+        assert_eq!(snap.body_markdown, "# Main Doc");
+        assert_eq!(snap.documents.len(), 2);
+        assert_eq!(snap.documents[1].title, "二轮错题本");
+        assert!(snap.documents[1].body_markdown.contains("补充分步解析"));
+
+        let summary = store.list_pages().into_iter().find(|p| p.meta.page_id == meta.page_id).unwrap();
+        assert_eq!(summary.canvases.len(), 2);
+        assert_eq!(summary.documents.len(), 2);
+
+        // Delete secondary canvas & document (now allowed since primary remains)
+        store.delete_page_canvas(&meta.page_id, &c2.canvas_id).unwrap();
+        store.delete_page_document(&meta.page_id, &d2.doc_id).unwrap();
+        let after = store.get_page_snapshot(&meta.page_id).unwrap();
+        assert_eq!(after.canvases.iter().filter(|c| !c.is_inline).count(), 1);
+        assert_eq!(after.documents.len(), 1);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn multi_canvas_and_multi_document_two_device_crdt_convergence() {
+        let base = std::env::temp_dir().join(format!("saltnote_multi_sync_{}", new_ulid()));
+        let d1 = VaultStore::open(base.join("d1"), Some("Tablet".into())).unwrap();
+        let d2 = VaultStore::open(base.join("d2"), Some("Desktop".into())).unwrap();
+
+        let meta = d1
+            .create_page("Sync Multi", PageMode::Study, false, vec![], "Base Doc 1")
+            .unwrap();
+        let c2 = d1.create_page_canvas(&meta.page_id, Some("Canvas B".into())).unwrap();
+        let doc2 = d1
+            .create_page_document(&meta.page_id, Some("Doc B".into()), "Line 1\nLine 2\n")
+            .unwrap();
+
+        let v2_vvs = d2.export_page_version_vectors();
+        for pkt in d1.export_diff_packets_against(&v2_vvs).unwrap() {
+            d2.import_delta_packet_bytes(&serde_json::to_vec(&pkt).unwrap())
+                .unwrap();
+        }
+
+        // Offline concurrent edits on both devices across doc1, doc2, canvas1, canvas2
+        d1.update_page_document_body(&meta.page_id, "main", "Base Doc 1 + Tablet").unwrap();
+        d1.update_page_document_body(&meta.page_id, &doc2.doc_id, "Line 1 (Tablet)\nLine 2\n").unwrap();
+        d1.add_stroke(&meta.page_id, &c2.canvas_id, &make_dummy_stroke("st-tab", 15.0)).unwrap();
+
+        d2.update_page_document_body(&meta.page_id, &doc2.doc_id, "Line 1\nLine 2 (Desktop)\n").unwrap();
+        d2.add_stroke(&meta.page_id, "main", &make_dummy_stroke("st-pc-main", 25.0)).unwrap();
+        d2.add_stroke(&meta.page_id, &c2.canvas_id, &make_dummy_stroke("st-pc-c2", 35.0)).unwrap();
+
+        let vvs_d2 = d2.export_page_version_vectors();
+        for pkt in d1.export_diff_packets_against(&vvs_d2).unwrap() {
+            d2.import_delta_packet_bytes(&serde_json::to_vec(&pkt).unwrap()).unwrap();
+        }
+        let vvs_d1 = d1.export_page_version_vectors();
+        for pkt in d2.export_diff_packets_against(&vvs_d1).unwrap() {
+            d1.import_delta_packet_bytes(&serde_json::to_vec(&pkt).unwrap()).unwrap();
+        }
+
+        assert_eq!(
+            d1.compute_page_state_hash(&meta.page_id).unwrap(),
+            d2.compute_page_state_hash(&meta.page_id).unwrap()
+        );
+        let snap = d2.get_page_snapshot(&meta.page_id).unwrap();
+        assert_eq!(snap.documents.len(), 2);
+        assert!(snap.documents[1].body_markdown.contains("Tablet"));
+        assert!(snap.documents[1].body_markdown.contains("Desktop"));
+        let c2_snap = snap.canvases.iter().find(|c| c.canvas_id == c2.canvas_id).unwrap();
+        assert_eq!(c2_snap.strokes.len(), 2);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn collect_referenced_assets_includes_markdown_photos_after_inbox_delete() {
+        let base = std::env::temp_dir().join(format!("saltnote_md_asset_ref_{}", new_ulid()));
+        let store = VaultStore::open(&base, Some("AssetNode".into())).unwrap();
+
+        let photo = store
+            .capture_inbox_item(
+                InboxKind::PhotoNote,
+                Some("板书".into()),
+                Some(b"WEBP_PRIMARY_PAYLOAD"),
+                Some("webp"),
+                Some(b"WEBP_THUMB_PAYLOAD"),
+                0,
+                false,
+            )
+            .unwrap();
+        let rel = photo.payload.image_asset_rel_path.clone().unwrap();
+        let meta = store
+            .create_page("Notes", PageMode::Study, false, vec![], "")
+            .unwrap();
+        let doc2 = store
+            .create_page_document(&meta.page_id, Some("附页".into()), &format!("![板书]({rel})"))
+            .unwrap();
+        assert!(!doc2.doc_id.is_empty());
+
+        // Delete original inbox item: document's Markdown reference must keep asset in sync manifest!
+        store.delete_inbox_item(&photo.inbox_id).unwrap();
+        let refs = store.collect_referenced_assets();
+        assert!(
+            refs.iter().any(|(path, _)| path == &rel),
+            "Markdown embedded photo '{rel}' must still be referenced after inbox deletion"
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn local_ui_prefs_roundtrip_and_recent_visit_dedup() {
+        let base = std::env::temp_dir().join(format!("saltnote_ui_prefs_{}", new_ulid()));
+        let store = VaultStore::open(&base, Some("PrefsNode".into())).unwrap();
+
+        let initial = store.load_ui_prefs();
+        assert_eq!(initial.pen_palette_argb.len(), 5);
+
+        let mut custom = initial.clone();
+        custom.pen_palette_argb[0] = 0xFFFF6B6B;
+        custom.recent_custom_colors_argb = vec![0xFFFF6B6B, 0xFF00AAFF];
+        store.save_ui_prefs(&custom).unwrap();
+
+        store.record_page_visit("p1", Some("study"), Some("main"), Some("main")).unwrap();
+        store.record_page_visit("p2", Some("journal"), Some("cvs_2"), None).unwrap();
+        let prefs_after = store.record_page_visit("p1", None, None, Some("doc_2")).unwrap();
+        assert_eq!(prefs_after.recent_pages.len(), 2);
+        assert_eq!(prefs_after.recent_pages[0].page_id, "p1");
+        assert_eq!(prefs_after.recent_pages[0].last_mode.as_deref(), Some("study"));
+        assert_eq!(prefs_after.recent_pages[0].last_doc_id.as_deref(), Some("doc_2"));
+
+        store.record_card_visit("c1", "p1").unwrap();
+        store.record_card_visit("c2", "p2").unwrap();
+        let prefs_cards = store.record_card_visit("c1", "p1").unwrap();
+        assert_eq!(prefs_cards.recent_cards.len(), 2);
+        assert_eq!(prefs_cards.recent_cards[0].card_id, "c1");
+        assert_eq!(prefs_cards.pen_palette_argb[0], 0xFFFF6B6B);
 
         let _ = fs::remove_dir_all(&base);
     }

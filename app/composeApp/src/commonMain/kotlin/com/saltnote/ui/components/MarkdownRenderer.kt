@@ -1,7 +1,9 @@
 package com.saltnote.ui.components
 
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -9,9 +11,11 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -19,11 +23,15 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.AutoAwesome
+import androidx.compose.material.icons.rounded.BrokenImage
+import androidx.compose.material.icons.rounded.CloudSync
 import androidx.compose.material.icons.rounded.DocumentScanner
 import androidx.compose.material.icons.rounded.Info
 import androidx.compose.material.icons.rounded.Lightbulb
 import androidx.compose.material.icons.rounded.Style
 import androidx.compose.material.icons.rounded.Warning
+import androidx.compose.material.icons.rounded.ZoomIn
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -31,11 +39,17 @@ import androidx.compose.material3.OutlinedCard
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
@@ -43,16 +57,50 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextDecoration
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.saltnote.bridge.FlashcardDraftDto
 import com.saltnote.ui.i18n.LocalSaltStrings
+import com.saltnote.ui.platform.loadImageBitmapFromVault
 import com.saltnote.ui.theme.SaltHaloAmber
 import com.saltnote.ui.theme.SaltHaloGlacier
 import com.saltnote.ui.theme.SaltHaloMineral
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 
 private val markdownJson = Json { ignoreUnknownKeys = true }
+
+val LocalVaultPath = staticCompositionLocalOf<String?> { null }
+val LocalSyncVersion = staticCompositionLocalOf<Long> { 0L }
+val LocalInboxFallbackResolver = staticCompositionLocalOf<((String) -> String?)?> { null }
+val LocalOnOpenImageLightbox = staticCompositionLocalOf<((relPath: String, caption: String?) -> Unit)?> { null }
+
+private object VaultImageBitmapCache {
+    private const val MAX_ENTRIES = 24
+    private val map = LinkedHashMap<String, ImageBitmap>(MAX_ENTRIES, 0.75f, true)
+
+    fun get(key: String): ImageBitmap? = map[key]
+
+    fun put(key: String, bmp: ImageBitmap) {
+        map[key] = bmp
+        if (map.size > MAX_ENTRIES) {
+            val oldest = map.entries.firstOrNull()?.key
+            if (oldest != null) map.remove(oldest)
+        }
+    }
+}
+
+private sealed interface MarkdownImageState {
+    data object Loading : MarkdownImageState
+    data class Ready(
+        val bitmap: ImageBitmap,
+        val resolvedPath: String,
+        val isThumbFallback: Boolean,
+    ) : MarkdownImageState
+    data object Missing : MarkdownImageState
+}
 
 /**
  * Convenience composable for rendering a full Markdown + LaTeX string
@@ -273,9 +321,238 @@ private fun MarkdownBlocksColumn(
                     )
                 }
 
+                is MdBlock.Image -> {
+                    MarkdownImageBlock(
+                        alt = block.alt,
+                        rawPath = block.path,
+                        compact = compact,
+                    )
+                }
+
                 MdBlock.Divider -> HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
                 MdBlock.SpacerBlock -> Spacer(Modifier.height(2.dp))
             }
+        }
+    }
+}
+
+@Composable
+private fun MarkdownImageBlock(
+    alt: String,
+    rawPath: String,
+    compact: Boolean,
+) {
+    val strings = LocalSaltStrings.current
+    val vaultPath = LocalVaultPath.current
+    val syncVersion = LocalSyncVersion.current
+    val fallbackResolver = LocalInboxFallbackResolver.current
+    val onOpenLightbox = LocalOnOpenImageLightbox.current
+    val normPath = remember(rawPath) { normalizeVaultImageRelPath(rawPath) }
+
+    val imageState by produceState<MarkdownImageState>(
+        initialValue = run {
+            if (vaultPath != null && normPath != null) {
+                VaultImageBitmapCache.get("$vaultPath|$normPath")?.let { bmp ->
+                    MarkdownImageState.Ready(bmp, normPath, isThumbFallback = false)
+                } ?: MarkdownImageState.Loading
+            } else {
+                MarkdownImageState.Missing
+            }
+        },
+        key1 = vaultPath,
+        key2 = normPath,
+        key3 = syncVersion,
+    ) {
+        if (vaultPath == null || normPath == null) {
+            value = MarkdownImageState.Missing
+            return@produceState
+        }
+        val primaryKey = "$vaultPath|$normPath"
+        val cachedPrimary = VaultImageBitmapCache.get(primaryKey)
+        if (cachedPrimary != null) {
+            value = MarkdownImageState.Ready(cachedPrimary, normPath, isThumbFallback = false)
+            return@produceState
+        }
+        val primaryBmp = withContext(Dispatchers.IO) {
+            loadImageBitmapFromVault(vaultPath, normPath)
+        }
+        if (primaryBmp != null) {
+            VaultImageBitmapCache.put(primaryKey, primaryBmp)
+            value = MarkdownImageState.Ready(primaryBmp, normPath, isThumbFallback = false)
+            return@produceState
+        }
+        val fallbackRel = fallbackResolver?.invoke(normPath)?.let(::normalizeVaultImageRelPath)
+        if (fallbackRel != null) {
+            val fbKey = "$vaultPath|$fallbackRel"
+            val cachedFb = VaultImageBitmapCache.get(fbKey)
+            if (cachedFb != null) {
+                value = MarkdownImageState.Ready(cachedFb, fallbackRel, isThumbFallback = true)
+                return@produceState
+            }
+            val fbBmp = withContext(Dispatchers.IO) {
+                loadImageBitmapFromVault(vaultPath, fallbackRel)
+            }
+            if (fbBmp != null) {
+                VaultImageBitmapCache.put(fbKey, fbBmp)
+                value = MarkdownImageState.Ready(fbBmp, fallbackRel, isThumbFallback = true)
+                return@produceState
+            }
+        }
+        value = MarkdownImageState.Missing
+    }
+
+    val cleanAlt = alt.trim()
+    val caption = cleanAlt.takeIf { it.isNotBlank() && it != "Salt Inbox" }
+
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        when (val st = imageState) {
+            MarkdownImageState.Loading -> {
+                Surface(
+                    color = MaterialTheme.colorScheme.surfaceContainerLow,
+                    shape = RoundedCornerShape(12.dp),
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(112.dp),
+                ) {
+                    Row(
+                        modifier = Modifier.padding(16.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                        Text(
+                            text = strings.imageLoadingHint,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            }
+
+            is MarkdownImageState.Ready -> {
+                val aspect = (st.bitmap.width.toFloat() / st.bitmap.height.coerceAtLeast(1).toFloat())
+                    .coerceIn(0.35f, 3.5f)
+                Surface(
+                    color = MaterialTheme.colorScheme.surfaceContainerLow,
+                    shape = RoundedCornerShape(12.dp),
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.7f)),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(12.dp))
+                        .clickable(enabled = onOpenLightbox != null) {
+                            onOpenLightbox?.invoke(st.resolvedPath, caption)
+                        },
+                ) {
+                    Box(modifier = Modifier.fillMaxWidth()) {
+                        Image(
+                            bitmap = st.bitmap,
+                            contentDescription = cleanAlt.ifBlank { strings.capturePhoto },
+                            contentScale = ContentScale.Fit,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .aspectRatio(aspect, matchHeightConstraintsFirst = false)
+                                .heightIn(min = 96.dp, max = if (compact) 280.dp else 440.dp),
+                        )
+                        if (st.isThumbFallback) {
+                            Surface(
+                                color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.92f),
+                                shape = RoundedCornerShape(50),
+                                modifier = Modifier
+                                    .align(Alignment.TopStart)
+                                    .padding(8.dp),
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                                ) {
+                                    Icon(
+                                        Icons.Rounded.CloudSync,
+                                        contentDescription = null,
+                                        modifier = Modifier.size(13.dp),
+                                        tint = MaterialTheme.colorScheme.onSecondaryContainer,
+                                    )
+                                    Text(
+                                        text = strings.imageSyncingFallbackHint,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSecondaryContainer,
+                                    )
+                                }
+                            }
+                        }
+                        if (onOpenLightbox != null) {
+                            Surface(
+                                color = MaterialTheme.colorScheme.surface.copy(alpha = 0.78f),
+                                shape = RoundedCornerShape(50),
+                                modifier = Modifier
+                                    .align(Alignment.BottomEnd)
+                                    .padding(8.dp),
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.ZoomIn,
+                                    contentDescription = strings.tapToZoomImage,
+                                    tint = MaterialTheme.colorScheme.onSurface,
+                                    modifier = Modifier
+                                        .padding(6.dp)
+                                        .size(16.dp),
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+            MarkdownImageState.Missing -> {
+                Surface(
+                    color = MaterialTheme.colorScheme.surfaceContainerLow,
+                    shape = RoundedCornerShape(12.dp),
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Row(
+                        modifier = Modifier.padding(12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.BrokenImage,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.size(20.dp),
+                        )
+                        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                            Text(
+                                text = caption ?: strings.imageMissingHint,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurface,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            Text(
+                                text = if (caption != null) "${strings.imageMissingHint} · $rawPath" else rawPath,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        if (caption != null && imageState is MarkdownImageState.Ready) {
+            Text(
+                text = caption,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
         }
     }
 }
@@ -479,6 +756,7 @@ internal sealed interface MdBlock {
     data class CodeBlock(val lang: String, val code: String) : MdBlock
     data class MathBlock(val latex: String) : MdBlock
     data class Table(val headers: List<String>, val rows: List<List<String>>) : MdBlock
+    data class Image(val alt: String, val path: String) : MdBlock
     data object Divider : MdBlock
     data object SpacerBlock : MdBlock
 }
@@ -648,10 +926,84 @@ internal fun parseMarkdownBlocks(lines: List<String>): List<MdBlock> {
             continue
         }
 
-        result.add(MdBlock.Paragraph(trimmed))
+        result.addAll(splitParagraphAndImages(trimmed))
         i++
     }
     return result
+}
+
+internal fun normalizeVaultImageRelPath(raw: String): String? {
+    var cleaned = raw.trim()
+    if (cleaned.isEmpty()) return null
+    if (cleaned.startsWith("<")) {
+        val close = cleaned.indexOf('>')
+        if (close <= 1) return null
+        cleaned = cleaned.substring(1, close).trim()
+    } else {
+        val quoteIdx = listOf(cleaned.indexOf(" \""), cleaned.indexOf(" '"))
+            .filter { it >= 0 }
+            .minOrNull()
+        if (quoteIdx != null) {
+            cleaned = cleaned.substring(0, quoteIdx).trim()
+        }
+    }
+    cleaned = cleaned.replace('\\', '/').replace("%20", " ").trim()
+    while (cleaned.startsWith("./")) {
+        cleaned = cleaned.removePrefix("./")
+    }
+    cleaned = cleaned.trimStart('/')
+    if (cleaned.isEmpty()) return null
+    if (cleaned.contains("://") || cleaned.startsWith("data:", ignoreCase = true)) {
+        return null
+    }
+    val segments = cleaned.split('/')
+    if (segments.any { it.isEmpty() || it == "." || it == ".." }) {
+        return null
+    }
+    return cleaned
+}
+
+private fun splitParagraphAndImages(line: String): List<MdBlock> {
+    if (!line.contains("![")) {
+        return listOf(MdBlock.Paragraph(line))
+    }
+    val out = mutableListOf<MdBlock>()
+    var cursor = 0
+    val n = line.length
+    while (cursor < n) {
+        val imgStart = line.indexOf("![", cursor)
+        if (imgStart < 0) {
+            val tail = line.substring(cursor).trim()
+            if (tail.isNotEmpty()) out.add(MdBlock.Paragraph(tail))
+            break
+        }
+        val sep = line.indexOf("](", imgStart + 2)
+        if (sep < 0) {
+            val rest = line.substring(cursor).trim()
+            if (rest.isNotEmpty()) out.add(MdBlock.Paragraph(rest))
+            break
+        }
+        val closeParen = line.indexOf(')', sep + 2)
+        if (closeParen < 0) {
+            val rest = line.substring(cursor).trim()
+            if (rest.isNotEmpty()) out.add(MdBlock.Paragraph(rest))
+            break
+        }
+        val before = line.substring(cursor, imgStart).trim()
+        if (before.isNotEmpty()) {
+            out.add(MdBlock.Paragraph(before))
+        }
+        val alt = line.substring(imgStart + 2, sep).trim()
+        val target = line.substring(sep + 2, closeParen).trim()
+        if (target.isNotEmpty()) {
+            out.add(MdBlock.Image(alt = alt, path = target))
+        } else {
+            val rawSlice = line.substring(imgStart, closeParen + 1).trim()
+            if (rawSlice.isNotEmpty()) out.add(MdBlock.Paragraph(rawSlice))
+        }
+        cursor = closeParen + 1
+    }
+    return if (out.isEmpty()) listOf(MdBlock.Paragraph(line)) else out
 }
 
 private fun buildQuoteOrCallout(quoteLines: List<String>): MdBlock {

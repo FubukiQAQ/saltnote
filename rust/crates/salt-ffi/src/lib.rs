@@ -4,7 +4,7 @@ use salt_canvas::{
     build_render_stroke, extract_markdown_context, ingest_raw_stroke_bytes,
     prepare_image_asset_webp, render_canvas_slice_webp, tessellate_stroke, CanvasSpatialIndex,
 };
-use salt_crdt::VaultStore;
+use salt_crdt::{combine_documents_for_search, VaultStore, MAIN_DOC_ID};
 use salt_intel::IntelEngine;
 use salt_router::{
     parse_flashcard_drafts, HaloInferenceRequest, InboxEnrichmentRequest, SaltRouter,
@@ -17,9 +17,9 @@ use salt_sync::{
 use salt_types::{
     content_addressed_asset_rel_path, decode_raw_points_le, is_local_or_rfc1918_endpoint,
     new_ulid, now_utc_ms, redact_sensitive_text, AiProviderKind, BrushKind, CanvasImageNode,
-    CanvasSnapshot, FlashCard, HaloAnnotation, InboxItem, LocalSyncPrefs, PageMode, ProviderConfig,
-    RectF, ReviewLog, ReviewRating, RouterConfig, SaltError, SaltResult, StrokeTransform,
-    SyncNetworkPolicy, TranscriptStatus, VisionPolicy, WebDavConfig,
+    CanvasSnapshot, FlashCard, HaloAnnotation, InboxItem, LocalSyncPrefs, LocalUiPrefs, PageMode,
+    ProviderConfig, RectF, ReviewLog, ReviewRating, RouterConfig, SaltError, SaltResult,
+    StrokeTransform, SyncNetworkPolicy, TranscriptStatus, VisionPolicy, WebDavConfig,
 };
 use serde::Serialize;
 use std::collections::HashMap;
@@ -536,18 +536,120 @@ impl SaltEngine {
         let meta = self
             .vault
             .update_page_meta(&page_id, title, page_mode, is_private, tags)?;
-        if let Ok(snap) = self.vault.get_page_snapshot(&page_id) {
-            let _ = self.intel.index_page(&snap.meta, &snap.body_markdown);
-        }
+        self.reindex_page_in_intel(&page_id);
         Ok(serde_json::to_string(&meta).unwrap_or_else(|_| "{}".into()))
     }
 
     pub fn update_page_body(&self, page_id: String, markdown: String) -> Result<(), FfiError> {
         self.vault.update_page_body(&page_id, &markdown)?;
-        if let Ok(snap) = self.vault.get_page_snapshot(&page_id) {
-            let _ = self.intel.index_page(&snap.meta, &snap.body_markdown);
-        }
+        self.reindex_page_in_intel(&page_id);
         Ok(())
+    }
+
+    pub fn create_page_canvas(
+        &self,
+        page_id: String,
+        title: Option<String>,
+    ) -> Result<String, FfiError> {
+        let canvas = self.vault.create_page_canvas(&page_id, title)?;
+        Ok(serde_json::to_string(&canvas).unwrap_or_else(|_| "{}".into()))
+    }
+
+    pub fn rename_page_canvas(
+        &self,
+        page_id: String,
+        canvas_id: String,
+        title: String,
+    ) -> Result<(), FfiError> {
+        self.vault.rename_page_canvas(&page_id, &canvas_id, title)?;
+        Ok(())
+    }
+
+    pub fn delete_page_canvas(&self, page_id: String, canvas_id: String) -> Result<(), FfiError> {
+        self.vault.delete_page_canvas(&page_id, &canvas_id)?;
+        self.spatial_cache.write().remove(&(page_id, canvas_id));
+        Ok(())
+    }
+
+    pub fn create_page_document(
+        &self,
+        page_id: String,
+        title: Option<String>,
+        initial_markdown: String,
+    ) -> Result<String, FfiError> {
+        let doc = self
+            .vault
+            .create_page_document(&page_id, title, &initial_markdown)?;
+        self.reindex_page_in_intel(&page_id);
+        Ok(serde_json::to_string(&doc).unwrap_or_else(|_| "{}".into()))
+    }
+
+    pub fn update_page_document_body(
+        &self,
+        page_id: String,
+        doc_id: String,
+        markdown: String,
+    ) -> Result<(), FfiError> {
+        self.vault
+            .update_page_document_body(&page_id, &doc_id, &markdown)?;
+        self.reindex_page_in_intel(&page_id);
+        Ok(())
+    }
+
+    pub fn rename_page_document(
+        &self,
+        page_id: String,
+        doc_id: String,
+        title: String,
+    ) -> Result<(), FfiError> {
+        self.vault.rename_page_document(&page_id, &doc_id, title)?;
+        self.reindex_page_in_intel(&page_id);
+        Ok(())
+    }
+
+    pub fn delete_page_document(&self, page_id: String, doc_id: String) -> Result<(), FfiError> {
+        self.vault.delete_page_document(&page_id, &doc_id)?;
+        self.reindex_page_in_intel(&page_id);
+        Ok(())
+    }
+
+    pub fn get_ui_prefs_json(&self) -> String {
+        let prefs = self.vault.load_ui_prefs();
+        serde_json::to_string(&prefs).unwrap_or_else(|_| "{}".into())
+    }
+
+    pub fn save_ui_prefs_json(&self, prefs_json: String) -> Result<(), FfiError> {
+        let prefs: LocalUiPrefs =
+            serde_json::from_str(&prefs_json).map_err(|e| FfiError::InvalidInput {
+                detail: e.to_string(),
+            })?;
+        self.vault.save_ui_prefs(&prefs)?;
+        Ok(())
+    }
+
+    pub fn record_page_visit_json(
+        &self,
+        page_id: String,
+        mode: Option<String>,
+        canvas_id: Option<String>,
+        doc_id: Option<String>,
+    ) -> Result<String, FfiError> {
+        let updated = self.vault.record_page_visit(
+            &page_id,
+            mode.as_deref(),
+            canvas_id.as_deref(),
+            doc_id.as_deref(),
+        )?;
+        Ok(serde_json::to_string(&updated).unwrap_or_else(|_| "{}".into()))
+    }
+
+    pub fn record_card_visit_json(
+        &self,
+        card_id: String,
+        page_id: String,
+    ) -> Result<String, FfiError> {
+        let updated = self.vault.record_card_visit(&card_id, &page_id)?;
+        Ok(serde_json::to_string(&updated).unwrap_or_else(|_| "{}".into()))
     }
 
     pub fn delete_page(&self, page_id: String) -> Result<(), FfiError> {
@@ -871,6 +973,11 @@ impl SaltEngine {
             .cloned()
             .unwrap_or(CanvasSnapshot {
                 canvas_id: canvas_id.clone(),
+                title: String::new(),
+                sort_order: 0,
+                created_at_utc: 0,
+                is_inline: canvas_id.starts_with("inline-"),
+                deleted: false,
                 strokes: vec![],
                 transforms: vec![],
                 images: vec![],
@@ -928,6 +1035,7 @@ impl SaltEngine {
             halo_id: halo_id.clone(),
             page_id: page_id.clone(),
             canvas_id: Some(canvas_id),
+            doc_id: None,
             preset_id: preset.preset_id.clone(),
             anchor_bbox: Some(selection.padded_bbox),
             anchor_text_offset: None,
@@ -981,6 +1089,30 @@ impl SaltEngine {
         output_language_hint: Option<String>,
         callback: Box<dyn HaloStreamCallback>,
     ) -> Result<Arc<HaloCancelHandle>, FfiError> {
+        self.trigger_text_halo_in_doc(
+            page_id,
+            MAIN_DOC_ID.to_string(),
+            preset_id,
+            anchor_offset,
+            selected_text,
+            provider_id,
+            output_language_hint,
+            callback,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn trigger_text_halo_in_doc(
+        &self,
+        page_id: String,
+        doc_id: String,
+        preset_id: String,
+        anchor_offset: u32,
+        selected_text: String,
+        provider_id: Option<String>,
+        output_language_hint: Option<String>,
+        callback: Box<dyn HaloStreamCallback>,
+    ) -> Result<Arc<HaloCancelHandle>, FfiError> {
         let snap = self.vault.get_page_snapshot(&page_id)?;
         let presets = self.vault.load_halo_presets()?;
         let preset = presets
@@ -990,8 +1122,20 @@ impl SaltEngine {
                 detail: format!("Halo preset {preset_id} not found"),
             })?;
 
-        let context_markdown =
-            extract_markdown_context(&snap.body_markdown, Some(anchor_offset as usize));
+        let target_doc = snap
+            .documents
+            .iter()
+            .find(|d| d.doc_id == doc_id)
+            .or_else(|| snap.documents.iter().find(|d| d.doc_id == MAIN_DOC_ID))
+            .or_else(|| snap.documents.first());
+        let resolved_doc_id = target_doc
+            .map(|d| d.doc_id.clone())
+            .unwrap_or_else(|| MAIN_DOC_ID.to_string());
+        let doc_body = target_doc
+            .map(|d| d.body_markdown.as_str())
+            .unwrap_or(&snap.body_markdown);
+
+        let context_markdown = extract_markdown_context(doc_body, Some(anchor_offset as usize));
         let provider = self.resolve_provider(provider_id.as_deref(), false)?;
         let output_language = self.resolve_effective_output_language(output_language_hint.as_deref());
         SaltRouter::enforce_privacy_guard(snap.meta.is_private, &provider)?;
@@ -1001,6 +1145,7 @@ impl SaltEngine {
             halo_id,
             page_id: page_id.clone(),
             canvas_id: None,
+            doc_id: Some(resolved_doc_id),
             preset_id: preset.preset_id.clone(),
             anchor_bbox: None,
             anchor_text_offset: Some(anchor_offset),
@@ -1085,6 +1230,7 @@ impl SaltEngine {
             halo_id,
             page_id: page_id.clone(),
             canvas_id: None,
+            doc_id: None,
             preset_id: preset.preset_id.clone(),
             anchor_bbox: None,
             anchor_text_offset: Some(snap.body_markdown.chars().count() as u32),
@@ -1140,10 +1286,19 @@ impl SaltEngine {
     }
 
     pub fn fuse_halo_into_body(&self, page_id: String, halo_id: String) -> Result<String, FfiError> {
-        let updated = self.vault.fuse_halo_into_body(&page_id, &halo_id)?;
-        if let Ok(snap) = self.vault.get_page_snapshot(&page_id) {
-            let _ = self.intel.index_page(&snap.meta, &snap.body_markdown);
-        }
+        self.fuse_halo_into_document(page_id, halo_id, None)
+    }
+
+    pub fn fuse_halo_into_document(
+        &self,
+        page_id: String,
+        halo_id: String,
+        doc_id: Option<String>,
+    ) -> Result<String, FfiError> {
+        let updated = self
+            .vault
+            .fuse_halo_into_document(&page_id, &halo_id, doc_id.as_deref())?;
+        self.reindex_page_in_intel(&page_id);
         Ok(updated)
     }
 
@@ -1497,6 +1652,17 @@ impl SaltEngine {
 }
 
 impl SaltEngine {
+    fn reindex_page_in_intel(&self, page_id: &str) {
+        if let Ok(snap) = self.vault.get_page_snapshot(page_id) {
+            let search_body = if snap.documents.is_empty() {
+                snap.body_markdown.clone()
+            } else {
+                combine_documents_for_search(&snap.documents)
+            };
+            let _ = self.intel.index_page(&snap.meta, &search_body);
+        }
+    }
+
     fn ensure_lan_p2p_node(&self, enable_discovery: bool) -> Result<Arc<LanP2pNode>, FfiError> {
         let _guard = GLOBAL_RUNTIME.enter();
         let mut slot = self.p2p_node.lock();
@@ -2096,6 +2262,7 @@ mod tests {
             halo_id: "h-ffi-1".into(),
             page_id: meta.page_id.clone(),
             canvas_id: Some("main".into()),
+            doc_id: None,
             preset_id: "builtin.amber_expand".into(),
             anchor_bbox: Some(RectF { min_x: 0.0, min_y: 0.0, max_x: 50.0, max_y: 50.0 }),
             anchor_text_offset: None,

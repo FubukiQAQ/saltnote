@@ -14,8 +14,8 @@ android {
         applicationId = "com.saltnote.alpha"
         minSdk = 29
         targetSdk = 36
-        versionCode = 3
-        versionName = "0.2.0-alpha"
+        versionCode = 4
+        versionName = "0.3.0-alpha"
 
         ndk {
             abiFilters += listOf("arm64-v8a")

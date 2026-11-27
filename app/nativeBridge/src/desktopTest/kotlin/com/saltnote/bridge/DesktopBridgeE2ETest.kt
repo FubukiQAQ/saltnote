@@ -252,4 +252,65 @@ class DesktopBridgeE2ETest {
             pcDir.deleteRecursively()
         }
     }
+
+    @Test
+    fun multiCanvasMultiDocSearchAndUiPrefsRoundtripOverUniFfi() {
+        val tempVault = Files.createTempDirectory("saltnote_kt_v03_").toFile()
+        try {
+            val client = openSaltNoteClient(
+                vaultPath = tempVault.absolutePath,
+                deviceName = "Kotlin-v03-Test",
+                secretVault = InMemorySecretVault(),
+            )
+            val page = client.createPage("有机化学", "study", false, listOf("chem"), "# 第一部分")
+            val c2 = client.createPageCanvas(page.pageId, "合成路线草稿")
+            assertTrue(c2.canvasId.startsWith("cvs_"))
+            client.renamePageCanvas(page.pageId, c2.canvasId, "机理推导")
+
+            val d2 = client.createPageDocument(page.pageId, "反应机理附页", "傅克酰基化反应与亲电取代")
+            assertTrue(d2.docId.startsWith("doc_"))
+            client.updatePageDocumentBody(page.pageId, d2.docId, "傅克酰基化反应与重排抑制")
+            client.renamePageDocument(page.pageId, d2.docId, "重点机理")
+
+            val snap = client.getPageSnapshot(page.pageId)
+            assertEquals(2, snap.canvases.count { !it.isInline })
+            assertEquals(2, snap.documents.size)
+            assertEquals("机理推导", snap.canvases.first { it.canvasId == c2.canvasId }.title)
+            assertEquals("重点机理", snap.documents.first { it.docId == d2.docId }.title)
+            assertTrue(snap.documents.first { it.docId == d2.docId }.bodyMarkdown.contains("重排抑制"))
+
+            // FTS5 search must hit text inside secondary sub-document
+            val hits = client.searchNotes("重排抑制", 10)
+            assertTrue(hits.any { it.pageId == page.pageId })
+
+            // Local UI prefs & recent visits
+            val initialPrefs = client.getUiPrefs()
+            assertEquals(5, initialPrefs.penPaletteArgb.size)
+            val updatedPalette = initialPrefs.penPaletteArgb.toMutableList().apply {
+                this[1] = 0xFFFF6B6BL
+            }
+            client.saveUiPrefs(
+                initialPrefs.copy(
+                    penPaletteArgb = updatedPalette,
+                    recentCustomColorsArgb = listOf(0xFFFF6B6BL),
+                ),
+            )
+            client.recordPageVisit(page.pageId, "study", c2.canvasId, d2.docId)
+            val card = client.createFlashcard(page.pageId, null, "傅克反应催化剂？", "无水 AlCl3")
+            val prefsAfter = client.recordCardVisit(card.cardId, page.pageId)
+            assertEquals(0xFFFF6B6BL, prefsAfter.penPaletteArgb[1])
+            assertEquals(page.pageId, prefsAfter.recentPages.first().pageId)
+            assertEquals(d2.docId, prefsAfter.recentPages.first().lastDocId)
+            assertEquals(card.cardId, prefsAfter.recentCards.first().cardId)
+
+            // Deleting secondary canvas & doc leaves primary intact
+            client.deletePageCanvas(page.pageId, c2.canvasId)
+            client.deletePageDocument(page.pageId, d2.docId)
+            val summary = client.listPages().first { it.meta.pageId == page.pageId }
+            assertEquals(1, summary.canvases.size)
+            assertEquals(1, summary.documents.size)
+        } finally {
+            tempVault.deleteRecursively()
+        }
+    }
 }

@@ -190,7 +190,7 @@ fun FsrsReviewScreen(
                 onStopToday = {
                     state.microSessionPlan = null
                     state.isMicroSessionFinished = false
-                    state.selectedTab = if (isCompact) NavTab.Hub else NavTab.Notes
+                    state.selectedTab = NavTab.Home
                 },
                 modifier = Modifier.weight(1f),
             )
@@ -476,7 +476,7 @@ private fun MicroReviewWorkspace(
                         )
                     }
                     .clickable(enabled = !state.currentCardRevealed) {
-                        state.revealCurrentCard()
+                        state.revealCurrentCard(currentCard.toFsrsCardStateDto())
                     },
                 shape = MaterialTheme.shapes.extraLarge,
                 colors = CardDefaults.elevatedCardColors(
@@ -509,7 +509,10 @@ private fun MicroReviewWorkspace(
                                 horizontalArrangement = Arrangement.spacedBy(2.dp),
                             ) {
                                 IconButton(
-                                    onClick = { onEditCard(currentCard) },
+                                    onClick = {
+                                        state.recordCardVisit(currentCard.cardId, currentCard.pageId)
+                                        onEditCard(currentCard)
+                                    },
                                     modifier = Modifier.size(32.dp),
                                 ) {
                                     Icon(Icons.Rounded.Edit, strings.editCard, modifier = Modifier.size(17.dp))
@@ -531,6 +534,7 @@ private fun MicroReviewWorkspace(
                                 SaltAssistChip(
                                     onClick = {
                                         if (hasSliceOrContext) {
+                                            state.recordCardVisit(currentCard.cardId, currentCard.pageId)
                                             state.activeSlicePreviewCard = currentCard
                                         } else {
                                             state.jumpToCardAnchor(currentCard)
@@ -685,7 +689,7 @@ private fun MicroReviewWorkspace(
         ) {
             if (!state.currentCardRevealed) {
                 Button(
-                    onClick = { state.revealCurrentCard() },
+                    onClick = { state.revealCurrentCard(currentCard.toFsrsCardStateDto()) },
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(58.dp),

@@ -93,6 +93,35 @@ pub struct PageMeta {
     pub is_deleted: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PageCanvasSummary {
+    pub canvas_id: String,
+    pub title: String,
+    pub sort_order: i64,
+    pub stroke_count: u32,
+    pub image_count: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PageDocumentSummary {
+    pub doc_id: String,
+    pub title: String,
+    pub sort_order: i64,
+    pub updated_at_utc: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PageDocumentSnapshot {
+    pub doc_id: String,
+    pub title: String,
+    pub body_markdown: String,
+    pub sort_order: i64,
+    pub created_at_utc: i64,
+    pub updated_at_utc: i64,
+    #[serde(default)]
+    pub deleted: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PageSummary {
     pub meta: PageMeta,
@@ -100,6 +129,10 @@ pub struct PageSummary {
     pub stroke_count: u32,
     pub card_count: u32,
     pub markdown_file: String,
+    #[serde(default)]
+    pub canvases: Vec<PageCanvasSummary>,
+    #[serde(default)]
+    pub documents: Vec<PageDocumentSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,8 +140,56 @@ pub struct PageSnapshot {
     pub meta: PageMeta,
     pub body_markdown: String,
     pub canvases: Vec<CanvasSnapshot>,
+    #[serde(default)]
+    pub documents: Vec<PageDocumentSnapshot>,
     pub halos: Vec<HaloAnnotation>,
     pub cards: Vec<FlashCard>,
+}
+
+pub fn default_pen_palette_argb() -> Vec<u32> {
+    vec![0xFF191C1E, 0xFF1A657A, 0xFFC62828, 0xFF2E7D32, 0xFF6A1B9A]
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecentPageVisit {
+    pub page_id: String,
+    pub visited_at_utc: i64,
+    #[serde(default)]
+    pub last_mode: Option<String>,
+    #[serde(default)]
+    pub last_canvas_id: Option<String>,
+    #[serde(default)]
+    pub last_doc_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecentCardVisit {
+    pub card_id: String,
+    pub page_id: String,
+    pub visited_at_utc: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalUiPrefs {
+    #[serde(default = "default_pen_palette_argb")]
+    pub pen_palette_argb: Vec<u32>,
+    #[serde(default)]
+    pub recent_custom_colors_argb: Vec<u32>,
+    #[serde(default)]
+    pub recent_pages: Vec<RecentPageVisit>,
+    #[serde(default)]
+    pub recent_cards: Vec<RecentCardVisit>,
+}
+
+impl Default for LocalUiPrefs {
+    fn default() -> Self {
+        Self {
+            pen_palette_argb: default_pen_palette_argb(),
+            recent_custom_colors_argb: Vec::new(),
+            recent_pages: Vec::new(),
+            recent_cards: Vec::new(),
+        }
+    }
 }
 
 // ============================================================================
@@ -393,6 +474,16 @@ impl CanvasImageNode {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CanvasSnapshot {
     pub canvas_id: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub sort_order: i64,
+    #[serde(default)]
+    pub created_at_utc: i64,
+    #[serde(default)]
+    pub is_inline: bool,
+    #[serde(default)]
+    pub deleted: bool,
     pub strokes: Vec<DeltaStroke>,
     pub transforms: Vec<StrokeTransform>,
     pub images: Vec<CanvasImageNode>,
@@ -554,6 +645,8 @@ pub struct HaloAnnotation {
     pub halo_id: String,
     pub page_id: String,
     pub canvas_id: Option<String>,
+    #[serde(default)]
+    pub doc_id: Option<String>,
     pub preset_id: String,
     pub anchor_bbox: Option<RectF>,
     pub anchor_text_offset: Option<u32>,

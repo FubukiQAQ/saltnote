@@ -9,6 +9,11 @@ import com.saltnote.ui.components.CalloutKind
 import com.saltnote.ui.components.LanPairingCodec
 import com.saltnote.ui.components.MdBlock
 import com.saltnote.ui.components.StrokeGeometry
+import com.saltnote.ui.components.colorToHexString
+import com.saltnote.ui.components.colorToHsv
+import com.saltnote.ui.components.hsvToColor
+import com.saltnote.ui.components.normalizeVaultImageRelPath
+import com.saltnote.ui.components.parseHexColorOrNull
 import com.saltnote.ui.components.parseMarkdownBlocks
 import com.saltnote.ui.components.stripMathDelimiters
 import com.saltnote.ui.i18n.AppLanguage
@@ -245,5 +250,131 @@ class SaltUiComponentsTest {
         assertEquals("Inbox", stringsFor(AppLanguage.En).navInbox)
         assertEquals("盐池", stringsFor(AppLanguage.ZhCn).navInbox)
         assertEquals("鹽池", stringsFor(AppLanguage.ZhTw).navInbox)
+    }
+
+    @Test
+    fun markdownImageParserAndPathNormalizerHandleVaultAssetsSafely() {
+        val md = """
+            Intro paragraph
+            ![Receipt Photo](./assets/inbox/abc123.webp "Receipt")
+            Before ![Inline Clip](assets\photo%201.png) after
+            ![Traversal](../secret.png)
+            ![Remote](https://example.com/pic.png)
+        """.trimIndent()
+
+        val blocks = parseMarkdownBlocks(md.lines())
+        val images = blocks.filterIsInstance<MdBlock.Image>()
+        assertEquals(4, images.size)
+        assertEquals("Receipt Photo", images[0].alt)
+        assertEquals("assets/inbox/abc123.webp", normalizeVaultImageRelPath(images[0].path))
+        assertEquals("Inline Clip", images[1].alt)
+        assertEquals("assets/photo 1.png", normalizeVaultImageRelPath(images[1].path))
+        assertNull(normalizeVaultImageRelPath(images[2].path))
+        assertNull(normalizeVaultImageRelPath(images[3].path))
+
+        val paragraphs = blocks.filterIsInstance<MdBlock.Paragraph>()
+        assertTrue(paragraphs.any { it.text == "Intro paragraph" })
+        assertTrue(paragraphs.any { it.text == "Before" })
+        assertTrue(paragraphs.any { it.text == "after" })
+    }
+
+    @Test
+    fun customPenColorHsvAndHexRoundtripIsAccurate() {
+        val parsed = parseHexColorOrNull("  #1a657a  ")
+        assertNotNull(parsed)
+        assertEquals("#1A657A", colorToHexString(parsed!!))
+
+        val noHash = parseHexColorOrNull("c62828")
+        assertNotNull(noHash)
+        assertEquals("#C62828", colorToHexString(noHash!!))
+
+        assertNull(parseHexColorOrNull("#GGGGGG"))
+        assertNull(parseHexColorOrNull("#123"))
+
+        val (h, s, v) = colorToHsv(parsed)
+        val roundtrip = hsvToColor(h, s, v)
+        assertEquals("#1A657A", colorToHexString(roundtrip))
+    }
+
+    @Test
+    fun v03LocalizedStringsCoverAllLanguages() {
+        val languages = listOf(
+            AppLanguage.ZhCn,
+            AppLanguage.ZhTw,
+            AppLanguage.En,
+            AppLanguage.Ja,
+            AppLanguage.Ko,
+        )
+        languages.forEach { lang ->
+            val s = stringsFor(lang)
+            val required = listOf(
+                s.navHome,
+                s.welcomeGreetingMorning,
+                s.welcomeGreetingAfternoon,
+                s.welcomeGreetingEvening,
+                s.welcomeSubtitle,
+                s.recentNotesTitle,
+                s.recentNotesEmpty,
+                s.recentCardsTitle,
+                s.recentCardsEmpty,
+                s.newInboxTitle,
+                s.newInboxEmpty,
+                s.quickCaptureTitle,
+                s.viewAllNotes,
+                s.viewAllCards,
+                s.viewAllInbox,
+                s.consumeIntoRecentNote,
+                s.openWorkspace,
+                s.flipCardHint,
+                s.toggleSidebarDesc,
+                s.moreActionsDesc,
+                s.largeScreenMode,
+                s.exitLargeScreenMode,
+                s.focusMode,
+                s.exitFocusMode,
+                s.collapseToolbarDesc,
+                s.expandToolbarDesc,
+                s.brushSettingsDesc,
+                s.layoutEditOnly,
+                s.layoutSplit,
+                s.layoutPreviewOnly,
+                s.escToExitHint,
+                s.customColorTitle,
+                s.customColorHint,
+                s.hexColorLabel,
+                s.hexInvalidError,
+                s.defaultPaletteLabel,
+                s.curatedPaletteLabel,
+                s.recentColorsLabel,
+                s.resetDefaultPalette,
+                s.applyColor,
+                s.defaultMainCanvasTitle,
+                s.defaultMainDocTitle,
+                s.newCanvas,
+                s.newDocument,
+                s.renameCanvas,
+                s.renameDocument,
+                s.deleteCanvas,
+                s.deleteDocument,
+                s.deleteCanvasConfirm,
+                s.deleteDocumentConfirm,
+                s.cannotDeleteLastCanvas,
+                s.cannotDeleteLastDoc,
+                s.canvasesSection,
+                s.documentsSection,
+                s.nameLabel,
+                s.imageLoadingHint,
+                s.imageSyncingFallbackHint,
+                s.imageMissingHint,
+                s.tapToZoomImage,
+            )
+            assertTrue(
+                required.all { it.isNotBlank() },
+                "All v0.3 strings must be non-blank for language $lang",
+            )
+        }
+        assertEquals("Home", stringsFor(AppLanguage.En).navHome)
+        assertEquals("首页", stringsFor(AppLanguage.ZhCn).navHome)
+        assertEquals("首頁", stringsFor(AppLanguage.ZhTw).navHome)
     }
 }

@@ -297,6 +297,7 @@ data class SaltStrings(
     val hideSecretDesc: String,
     val connectionFailed: String,
     val inboxStrings: SaltInboxStrings,
+    val v03Strings: SaltV03Strings,
 ) {
     val navInbox: String get() = inboxStrings.navInbox
     val hubTitle: String get() = inboxStrings.hubTitle
@@ -378,7 +379,440 @@ data class SaltStrings(
     val pairRemovedToast: String get() = inboxStrings.pairRemovedToast
     val pairTokenRequiredToast: String get() = inboxStrings.pairTokenRequiredToast
     val inboxThumbFallbackToast: String get() = inboxStrings.inboxThumbFallbackToast
+
+    // v0.3-alpha forwarding properties
+    val navHome: String get() = v03Strings.navHome
+    val welcomeGreetingMorning: String get() = v03Strings.welcomeGreetingMorning
+    val welcomeGreetingAfternoon: String get() = v03Strings.welcomeGreetingAfternoon
+    val welcomeGreetingEvening: String get() = v03Strings.welcomeGreetingEvening
+    val welcomeSubtitle: String get() = v03Strings.welcomeSubtitle
+    val recentNotesTitle: String get() = v03Strings.recentNotesTitle
+    val recentNotesEmpty: String get() = v03Strings.recentNotesEmpty
+    val recentCardsTitle: String get() = v03Strings.recentCardsTitle
+    val recentCardsEmpty: String get() = v03Strings.recentCardsEmpty
+    val newInboxTitle: String get() = v03Strings.newInboxTitle
+    val newInboxEmpty: String get() = v03Strings.newInboxEmpty
+    val quickCaptureTitle: String get() = v03Strings.quickCaptureTitle
+    val viewAllNotes: String get() = v03Strings.viewAllNotes
+    val viewAllCards: String get() = v03Strings.viewAllCards
+    val viewAllInbox: String get() = v03Strings.viewAllInbox
+    val consumeIntoRecentNote: String get() = v03Strings.consumeIntoRecentNote
+    val openWorkspace: String get() = v03Strings.openWorkspace
+    val flipCardHint: String get() = v03Strings.flipCardHint
+    val toggleSidebarDesc: String get() = v03Strings.toggleSidebarDesc
+    val moreActionsDesc: String get() = v03Strings.moreActionsDesc
+    val largeScreenMode: String get() = v03Strings.largeScreenMode
+    val exitLargeScreenMode: String get() = v03Strings.exitLargeScreenMode
+    val focusMode: String get() = v03Strings.focusMode
+    val exitFocusMode: String get() = v03Strings.exitFocusMode
+    val collapseToolbarDesc: String get() = v03Strings.collapseToolbarDesc
+    val expandToolbarDesc: String get() = v03Strings.expandToolbarDesc
+    val brushSettingsDesc: String get() = v03Strings.brushSettingsDesc
+    val layoutEditOnly: String get() = v03Strings.layoutEditOnly
+    val layoutSplit: String get() = v03Strings.layoutSplit
+    val layoutPreviewOnly: String get() = v03Strings.layoutPreviewOnly
+    val escToExitHint: String get() = v03Strings.escToExitHint
+    val customColorTitle: String get() = v03Strings.customColorTitle
+    val customColorHint: String get() = v03Strings.customColorHint
+    val hexColorLabel: String get() = v03Strings.hexColorLabel
+    val hexInvalidError: String get() = v03Strings.hexInvalidError
+    val defaultPaletteLabel: String get() = v03Strings.defaultPaletteLabel
+    val curatedPaletteLabel: String get() = v03Strings.curatedPaletteLabel
+    val recentColorsLabel: String get() = v03Strings.recentColorsLabel
+    val resetDefaultPalette: String get() = v03Strings.resetDefaultPalette
+    val applyColor: String get() = v03Strings.applyColor
+    val defaultMainCanvasTitle: String get() = v03Strings.defaultMainCanvasTitle
+    val defaultMainDocTitle: String get() = v03Strings.defaultMainDocTitle
+    val newCanvas: String get() = v03Strings.newCanvas
+    val newDocument: String get() = v03Strings.newDocument
+    val renameCanvas: String get() = v03Strings.renameCanvas
+    val renameDocument: String get() = v03Strings.renameDocument
+    val deleteCanvas: String get() = v03Strings.deleteCanvas
+    val deleteDocument: String get() = v03Strings.deleteDocument
+    val deleteCanvasConfirm: String get() = v03Strings.deleteCanvasConfirm
+    val deleteDocumentConfirm: String get() = v03Strings.deleteDocumentConfirm
+    val cannotDeleteLastCanvas: String get() = v03Strings.cannotDeleteLastCanvas
+    val cannotDeleteLastDoc: String get() = v03Strings.cannotDeleteLastDoc
+    val canvasesSection: String get() = v03Strings.canvasesSection
+    val documentsSection: String get() = v03Strings.documentsSection
+    val nameLabel: String get() = v03Strings.nameLabel
+    val imageLoadingHint: String get() = v03Strings.imageLoadingHint
+    val imageSyncingFallbackHint: String get() = v03Strings.imageSyncingFallbackHint
+    val imageMissingHint: String get() = v03Strings.imageMissingHint
+    val tapToZoomImage: String get() = v03Strings.tapToZoomImage
 }
+
+data class SaltV03Strings(
+    val navHome: String,
+    val welcomeGreetingMorning: String,
+    val welcomeGreetingAfternoon: String,
+    val welcomeGreetingEvening: String,
+    val welcomeSubtitle: String,
+    val recentNotesTitle: String,
+    val recentNotesEmpty: String,
+    val recentCardsTitle: String,
+    val recentCardsEmpty: String,
+    val newInboxTitle: String,
+    val newInboxEmpty: String,
+    val quickCaptureTitle: String,
+    val viewAllNotes: String,
+    val viewAllCards: String,
+    val viewAllInbox: String,
+    val consumeIntoRecentNote: String,
+    val openWorkspace: String,
+    val flipCardHint: String,
+    val toggleSidebarDesc: String,
+    val moreActionsDesc: String,
+    val largeScreenMode: String,
+    val exitLargeScreenMode: String,
+    val focusMode: String,
+    val exitFocusMode: String,
+    val collapseToolbarDesc: String,
+    val expandToolbarDesc: String,
+    val brushSettingsDesc: String,
+    val layoutEditOnly: String,
+    val layoutSplit: String,
+    val layoutPreviewOnly: String,
+    val escToExitHint: String,
+    val customColorTitle: String,
+    val customColorHint: String,
+    val hexColorLabel: String,
+    val hexInvalidError: String,
+    val defaultPaletteLabel: String,
+    val curatedPaletteLabel: String,
+    val recentColorsLabel: String,
+    val resetDefaultPalette: String,
+    val applyColor: String,
+    val defaultMainCanvasTitle: String,
+    val defaultMainDocTitle: String,
+    val newCanvas: String,
+    val newDocument: String,
+    val renameCanvas: String,
+    val renameDocument: String,
+    val deleteCanvas: String,
+    val deleteDocument: String,
+    val deleteCanvasConfirm: String,
+    val deleteDocumentConfirm: String,
+    val cannotDeleteLastCanvas: String,
+    val cannotDeleteLastDoc: String,
+    val canvasesSection: String,
+    val documentsSection: String,
+    val nameLabel: String,
+    val imageLoadingHint: String,
+    val imageSyncingFallbackHint: String,
+    val imageMissingHint: String,
+    val tapToZoomImage: String,
+)
+
+private val ZhCnV03Strings = SaltV03Strings(
+    navHome = "首页",
+    welcomeGreetingMorning = "早安，开始今天的学习与记录",
+    welcomeGreetingAfternoon = "午安，继续沉淀你的想法",
+    welcomeGreetingEvening = "晚安，整理回顾今日收获",
+    welcomeSubtitle = "本地优先 · 无干扰双模记录 · 碎片记忆闭环",
+    recentNotesTitle = "最近访问的笔记",
+    recentNotesEmpty = "暂无访问记录，点击上方「新建」开始创作",
+    recentCardsTitle = "复习卡",
+    recentCardsEmpty = "暂无记忆卡片，用冰川蓝随手圈或手动创建一张吧",
+    newInboxTitle = "盐池新添内容",
+    newInboxEmpty = "盐池暂无待处理内容，随手拍照或语音即可入池",
+    quickCaptureTitle = "快速记录",
+    viewAllNotes = "全部笔记",
+    viewAllCards = "进入复习",
+    viewAllInbox = "前往盐池",
+    consumeIntoRecentNote = "融入最近笔记",
+    openWorkspace = "打开工作区",
+    flipCardHint = "轻触翻转查看答案",
+    toggleSidebarDesc = "展开 / 收起笔记列表",
+    moreActionsDesc = "更多操作",
+    largeScreenMode = "大屏模式",
+    exitLargeScreenMode = "退出大屏",
+    focusMode = "专注模式",
+    exitFocusMode = "退出专注",
+    collapseToolbarDesc = "收起工具栏",
+    expandToolbarDesc = "展开工具栏",
+    brushSettingsDesc = "粗细与防误触设置",
+    layoutEditOnly = "纯编辑",
+    layoutSplit = "双栏分屏",
+    layoutPreviewOnly = "纯阅读",
+    escToExitHint = "按 Esc 退出大屏",
+    customColorTitle = "自定义笔色",
+    customColorHint = "单击当前选中色槽可随时定制，自动保存至本机",
+    hexColorLabel = "Hex 颜色值",
+    hexInvalidError = "请输入 6 位十六进制颜色，如 #1A657A",
+    defaultPaletteLabel = "默认色组",
+    curatedPaletteLabel = "精选色板",
+    recentColorsLabel = "最近自定义",
+    resetDefaultPalette = "恢复默认色板",
+    applyColor = "应用颜色",
+    defaultMainCanvasTitle = "主画布",
+    defaultMainDocTitle = "主文档",
+    newCanvas = "新建画布",
+    newDocument = "新建文档",
+    renameCanvas = "重命名画布",
+    renameDocument = "重命名文档",
+    deleteCanvas = "删除画布",
+    deleteDocument = "删除文档",
+    deleteCanvasConfirm = "确定要删除当前画布及其笔迹吗？",
+    deleteDocumentConfirm = "确定要删除当前文档及其正文吗？",
+    cannotDeleteLastCanvas = "至少保留一份画布",
+    cannotDeleteLastDoc = "至少保留一份文档",
+    canvasesSection = "画布",
+    documentsSection = "文档",
+    nameLabel = "名称",
+    imageLoadingHint = "正在加载图片…",
+    imageSyncingFallbackHint = "原图同步中，当前展示缩略图",
+    imageMissingHint = "图片暂未同步或路径不存在",
+    tapToZoomImage = "点击查看大图",
+)
+
+private val ZhTwV03Strings = SaltV03Strings(
+    navHome = "首頁",
+    welcomeGreetingMorning = "早安，開始今天的學習與記錄",
+    welcomeGreetingAfternoon = "午安，繼續沉澱你的想法",
+    welcomeGreetingEvening = "晚安，整理回顧今日收穫",
+    welcomeSubtitle = "本地優先 · 無干擾雙模記錄 · 碎片記憶閉環",
+    recentNotesTitle = "最近造訪的筆記",
+    recentNotesEmpty = "尚無造訪紀錄，點擊上方「新增」開始創作",
+    recentCardsTitle = "複習卡",
+    recentCardsEmpty = "尚無記憶卡片，用冰川藍隨手圈或手動建立一張吧",
+    newInboxTitle = "鹽池新添內容",
+    newInboxEmpty = "鹽池暫無待處理內容，隨手拍照或語音即可入池",
+    quickCaptureTitle = "快速記錄",
+    viewAllNotes = "全部筆記",
+    viewAllCards = "進入複習",
+    viewAllInbox = "前往鹽池",
+    consumeIntoRecentNote = "融入最近筆記",
+    openWorkspace = "開啟工作區",
+    flipCardHint = "輕觸翻轉查看答案",
+    toggleSidebarDesc = "展開 / 收合筆記列表",
+    moreActionsDesc = "更多操作",
+    largeScreenMode = "大螢幕模式",
+    exitLargeScreenMode = "退出大螢幕",
+    focusMode = "專注模式",
+    exitFocusMode = "退出專注",
+    collapseToolbarDesc = "收合工具列",
+    expandToolbarDesc = "展開工具列",
+    brushSettingsDesc = "粗細與防誤觸設定",
+    layoutEditOnly = "純編輯",
+    layoutSplit = "雙欄分割",
+    layoutPreviewOnly = "純閱讀",
+    escToExitHint = "按 Esc 退出大螢幕",
+    customColorTitle = "自訂筆色",
+    customColorHint = "單擊目前選中色槽可隨時自訂，自動儲存至本機",
+    hexColorLabel = "Hex 色碼",
+    hexInvalidError = "請輸入 6 位十六進位色碼，如 #1A657A",
+    defaultPaletteLabel = "預設色組",
+    curatedPaletteLabel = "精選色板",
+    recentColorsLabel = "最近自訂",
+    resetDefaultPalette = "恢復預設色板",
+    applyColor = "套用顏色",
+    defaultMainCanvasTitle = "主畫布",
+    defaultMainDocTitle = "主文件",
+    newCanvas = "新增畫布",
+    newDocument = "新增文件",
+    renameCanvas = "重新命名畫布",
+    renameDocument = "重新命名文件",
+    deleteCanvas = "刪除畫布",
+    deleteDocument = "刪除文件",
+    deleteCanvasConfirm = "確定要刪除目前畫布及其筆跡嗎？",
+    deleteDocumentConfirm = "確定要刪除目前文件及其內文嗎？",
+    cannotDeleteLastCanvas = "至少保留一份畫布",
+    cannotDeleteLastDoc = "至少保留一份文件",
+    canvasesSection = "畫布",
+    documentsSection = "文件",
+    nameLabel = "名稱",
+    imageLoadingHint = "正在載入圖片…",
+    imageSyncingFallbackHint = "原圖同步中，目前顯示縮圖",
+    imageMissingHint = "圖片尚未同步或路徑不存在",
+    tapToZoomImage = "點擊檢視大圖",
+)
+
+private val EnV03Strings = SaltV03Strings(
+    navHome = "Home",
+    welcomeGreetingMorning = "Good morning — ready to study & create",
+    welcomeGreetingAfternoon = "Good afternoon — keep your ideas flowing",
+    welcomeGreetingEvening = "Good evening — review and wrap up today",
+    welcomeSubtitle = "Local-First · Distraction-Free Dual Mode · Spaced Recall",
+    recentNotesTitle = "Recent Notes",
+    recentNotesEmpty = "No recent notes yet — create your first note above",
+    recentCardsTitle = "Flashcards",
+    recentCardsEmpty = "No flashcards yet — circle content with Glacier pen or add one",
+    newInboxTitle = "New in Salt Inbox",
+    newInboxEmpty = "Inbox is clear — snap a board or record a quick voice memo",
+    quickCaptureTitle = "Quick Capture",
+    viewAllNotes = "All Notes",
+    viewAllCards = "Open Review",
+    viewAllInbox = "Open Inbox",
+    consumeIntoRecentNote = "Insert to Recent",
+    openWorkspace = "Open Workspace",
+    flipCardHint = "Tap card to reveal answer",
+    toggleSidebarDesc = "Toggle notes sidebar",
+    moreActionsDesc = "More actions",
+    largeScreenMode = "Large Screen",
+    exitLargeScreenMode = "Exit Fullscreen",
+    focusMode = "Focus Mode",
+    exitFocusMode = "Exit Focus",
+    collapseToolbarDesc = "Collapse toolbar",
+    expandToolbarDesc = "Expand toolbar",
+    brushSettingsDesc = "Stroke width & palm rejection",
+    layoutEditOnly = "Edit",
+    layoutSplit = "Split",
+    layoutPreviewOnly = "Preview",
+    escToExitHint = "Press Esc to exit",
+    customColorTitle = "Custom Pen Color",
+    customColorHint = "Tap the active swatch anytime to customize and persist locally",
+    hexColorLabel = "Hex Color",
+    hexInvalidError = "Enter a 6-digit hex color like #1A657A",
+    defaultPaletteLabel = "Defaults",
+    curatedPaletteLabel = "Curated Palette",
+    recentColorsLabel = "Recent Custom",
+    resetDefaultPalette = "Reset Defaults",
+    applyColor = "Apply Color",
+    defaultMainCanvasTitle = "Main Canvas",
+    defaultMainDocTitle = "Main Doc",
+    newCanvas = "New Canvas",
+    newDocument = "New Document",
+    renameCanvas = "Rename Canvas",
+    renameDocument = "Rename Document",
+    deleteCanvas = "Delete Canvas",
+    deleteDocument = "Delete Document",
+    deleteCanvasConfirm = "Delete this canvas and all its strokes?",
+    deleteDocumentConfirm = "Delete this document and its Markdown content?",
+    cannotDeleteLastCanvas = "At least one canvas is required",
+    cannotDeleteLastDoc = "At least one document is required",
+    canvasesSection = "Canvases",
+    documentsSection = "Documents",
+    nameLabel = "Name",
+    imageLoadingHint = "Loading image…",
+    imageSyncingFallbackHint = "Syncing full image — showing thumbnail",
+    imageMissingHint = "Image unavailable or still syncing",
+    tapToZoomImage = "Tap to zoom",
+)
+
+private val JaV03Strings = EnV03Strings.copy(
+    navHome = "ホーム",
+    welcomeGreetingMorning = "おはようございます",
+    welcomeGreetingAfternoon = "こんにちは",
+    welcomeGreetingEvening = "こんばんは",
+    welcomeSubtitle = "ローカル優先 · デュアルモードノート · 隙間復習",
+    recentNotesTitle = "最近開いたノート",
+    recentNotesEmpty = "最近のノートはありません",
+    recentCardsTitle = "復習カード",
+    recentCardsEmpty = "カードはまだありません",
+    newInboxTitle = "受信箱の新着",
+    newInboxEmpty = "受信箱に未処理の項目はありません",
+    quickCaptureTitle = "クイック記録",
+    viewAllNotes = "すべて表示",
+    viewAllCards = "復習へ",
+    viewAllInbox = "受信箱へ",
+    consumeIntoRecentNote = "最近のノートへ挿入",
+    openWorkspace = "ワークスペースを開く",
+    flipCardHint = "タップして答えを表示",
+    toggleSidebarDesc = "サイドバー切替",
+    moreActionsDesc = "その他の操作",
+    largeScreenMode = "大画面モード",
+    exitLargeScreenMode = "大画面を終了",
+    focusMode = "集中モード",
+    exitFocusMode = "集中を終了",
+    collapseToolbarDesc = "ツールバーを折りたたむ",
+    expandToolbarDesc = "ツールバーを展開",
+    brushSettingsDesc = "太さと誤タッチ防止",
+    layoutEditOnly = "編集",
+    layoutSplit = "分割",
+    layoutPreviewOnly = "プレビュー",
+    escToExitHint = "Esc で終了",
+    customColorTitle = "カスタムペン色",
+    customColorHint = "選択中の色をタップするとカスタマイズできます",
+    hexColorLabel = "Hex カラー",
+    hexInvalidError = "#1A657A のような 6 桁の 16 進数で入力してください",
+    defaultPaletteLabel = "デフォルト",
+    curatedPaletteLabel = "おすすめカラー",
+    recentColorsLabel = "最近のカスタム色",
+    resetDefaultPalette = "デフォルトに戻す",
+    applyColor = "色を適用",
+    defaultMainCanvasTitle = "メインキャンバス",
+    defaultMainDocTitle = "メイン文書",
+    newCanvas = "新規キャンバス",
+    newDocument = "新規文書",
+    renameCanvas = "キャンバス名を変更",
+    renameDocument = "文書名を変更",
+    deleteCanvas = "キャンバスを削除",
+    deleteDocument = "文書を削除",
+    deleteCanvasConfirm = "このキャンバスを削除しますか？",
+    deleteDocumentConfirm = "この文書を削除しますか？",
+    cannotDeleteLastCanvas = "少なくとも1つのキャンバスが必要です",
+    cannotDeleteLastDoc = "少なくとも1つの文書が必要です",
+    canvasesSection = "キャンバス",
+    documentsSection = "文書",
+    nameLabel = "名前",
+    imageLoadingHint = "画像を読み込み中…",
+    imageSyncingFallbackHint = "元画像を同期中（サムネイル表示中）",
+    imageMissingHint = "画像が未同期または見つかりません",
+    tapToZoomImage = "タップして拡大",
+)
+
+private val KoV03Strings = EnV03Strings.copy(
+    navHome = "홈",
+    welcomeGreetingMorning = "좋은 아침입니다",
+    welcomeGreetingAfternoon = "안녕하세요",
+    welcomeGreetingEvening = "오늘 하루를 정리해 보세요",
+    welcomeSubtitle = "로컬 우선 · 듀얼 모드 노트 · 틈새 복습",
+    recentNotesTitle = "최근 방문한 노트",
+    recentNotesEmpty = "최근 방문한 노트가 없습니다",
+    recentCardsTitle = "복습 카드",
+    recentCardsEmpty = "아직 카드가 없습니다",
+    newInboxTitle = "인박스 새 항목",
+    newInboxEmpty = "인박스에 대기 중인 항목이 없습니다",
+    quickCaptureTitle = "빠른 기록",
+    viewAllNotes = "전체 노트",
+    viewAllCards = "복습 열기",
+    viewAllInbox = "인박스 열기",
+    consumeIntoRecentNote = "최근 노트에 삽입",
+    openWorkspace = "작업 공간 열기",
+    flipCardHint = "눌러서 정답 보기",
+    toggleSidebarDesc = "목록 패널 전환",
+    moreActionsDesc = "더보기",
+    largeScreenMode = "대화면 모드",
+    exitLargeScreenMode = "대화면 종료",
+    focusMode = "집중 모드",
+    exitFocusMode = "집중 종료",
+    collapseToolbarDesc = "도구 모음 접기",
+    expandToolbarDesc = "도구 모음 펼치기",
+    brushSettingsDesc = "굵기 및 손바닥 방지",
+    layoutEditOnly = "편집",
+    layoutSplit = "분할",
+    layoutPreviewOnly = "미리보기",
+    escToExitHint = "Esc 키로 종료",
+    customColorTitle = "사용자 지정 펜 색상",
+    customColorHint = "선택된 색상을 다시 누르면 색상을 편집할 수 있습니다",
+    hexColorLabel = "Hex 색상",
+    hexInvalidError = "#1A657A 형식의 6자리 색상을 입력하세요",
+    defaultPaletteLabel = "기본 색상",
+    curatedPaletteLabel = "추천 팔레트",
+    recentColorsLabel = "최근 사용자 지정",
+    resetDefaultPalette = "기본값 복원",
+    applyColor = "색상 적용",
+    defaultMainCanvasTitle = "기본 캔버스",
+    defaultMainDocTitle = "기본 문서",
+    newCanvas = "새 캔버스",
+    newDocument = "새 문서",
+    renameCanvas = "캔버스 이름 변경",
+    renameDocument = "문서 이름 변경",
+    deleteCanvas = "캔버스 삭제",
+    deleteDocument = "문서 삭제",
+    deleteCanvasConfirm = "현재 캔버스를 삭제할까요?",
+    deleteDocumentConfirm = "현재 문서를 삭제할까요?",
+    cannotDeleteLastCanvas = "최소 1개의 캔버스가 필요합니다",
+    cannotDeleteLastDoc = "최소 1개의 문서가 필요합니다",
+    canvasesSection = "캔버스",
+    documentsSection = "문서",
+    nameLabel = "이름",
+    imageLoadingHint = "이미지 불러오는 중…",
+    imageSyncingFallbackHint = "원본 동기화 중 · 썸네일 표시",
+    imageMissingHint = "이미지가 아직 동기화되지 않았습니다",
+    tapToZoomImage = "눌러서 크게 보기",
+)
 
 data class SaltInboxStrings(
     val navInbox: String,
@@ -1034,6 +1468,7 @@ private val ZhCnStrings = SaltStrings(
     hideSecretDesc = "隐藏密钥",
     connectionFailed = "连接失败",
     inboxStrings = ZhCnInboxStrings,
+    v03Strings = ZhCnV03Strings,
 )
 
 private val ZhTwStrings = ZhCnStrings.copy(
@@ -1231,6 +1666,7 @@ private val ZhTwStrings = ZhCnStrings.copy(
     hideSecretDesc = "隱藏金鑰",
     connectionFailed = "連線失敗",
     inboxStrings = ZhTwInboxStrings,
+    v03Strings = ZhTwV03Strings,
 )
 
 private val EnStrings = SaltStrings(
@@ -1457,6 +1893,7 @@ private val EnStrings = SaltStrings(
     hideSecretDesc = "Hide Key",
     connectionFailed = "Connection failed",
     inboxStrings = EnInboxStrings,
+    v03Strings = EnV03Strings,
 )
 
 private val JaStrings = EnStrings.copy(
@@ -1564,6 +2001,7 @@ private val JaStrings = EnStrings.copy(
     testConnectionAction = "接続テスト",
     testingAction = "テスト中…",
     inboxStrings = JaInboxStrings,
+    v03Strings = JaV03Strings,
 )
 
 private val KoStrings = EnStrings.copy(
@@ -1645,6 +2083,7 @@ private val KoStrings = EnStrings.copy(
     testConnectionAction = "연결 테스트",
     testingAction = "테스트 중…",
     inboxStrings = KoInboxStrings,
+    v03Strings = KoV03Strings,
 )
 
 fun stringsFor(lang: AppLanguage): SaltStrings = when (lang) {

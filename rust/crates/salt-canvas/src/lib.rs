@@ -787,6 +787,11 @@ mod tests {
 
         let snap = CanvasSnapshot {
             canvas_id: "main".into(),
+            title: "Main".into(),
+            sort_order: 0,
+            created_at_utc: 0,
+            is_inline: false,
+            deleted: false,
             strokes: vec![stroke.clone()],
             transforms: vec![],
             images: vec![],
@@ -835,6 +840,11 @@ mod tests {
         }
         let snap = CanvasSnapshot {
             canvas_id: "stress-10k".into(),
+            title: "Stress".into(),
+            sort_order: 0,
+            created_at_utc: 0,
+            is_inline: false,
+            deleted: false,
             strokes,
             transforms: vec![],
             images: vec![],
